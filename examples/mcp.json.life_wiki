@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "mailbox": {
+      "command": "uv",
+      "args": [
+        "run",
+        "C:/Users/User/Desktop/VSCcode/claude-mailbox/server.py"
+      ],
+      "env": {
+        "CLAUDE_MAILBOX_NAME": "wiki"
+      }
+    }
+  }
+}
