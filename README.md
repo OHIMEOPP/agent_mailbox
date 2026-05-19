@@ -90,47 +90,57 @@ claude mcp add mailbox \
 
 ## Watcher 腳本（event-driven 喚醒）
 
-`mailbox-watch.py` 是配套 background polling 腳本：用 OS subprocess 每 5 秒查 SQLite，有未讀訊息即 exit 1，讓 Claude Code harness 喚醒 agent。
+`mailbox-watch.py` 是配套 background polling 腳本：每 5 秒查 SQLite，有新 mail 就喚醒 agent。兩種 mode：
+
+### Stream-mode（推薦 / default）
+
+`--monitor` flag，watcher **不死**：每封新 mail 印一行 stdout，**繼續 polling**。配 Claude Code **Monitor tool**（`persistent: true`）每行 stdout = 一個 notification。
 
 ```bash
-py mailbox-watch.py <instance-name>                  # 例：wiki / koatag
-py mailbox-watch.py wiki --tick 5 --max 720 --db ... # 可調旗標
+py C:/Users/User/Desktop/VSCcode/claude-mailbox/mailbox-watch.py <name> --monitor
 ```
 
-**為什麼不用 `/loop` / `ScheduleWakeup`：** 那兩個在 agent-turn 層級，每 tick 會重讀整段 prompt context（< 5min 必 cache miss）。watcher 是 OS 子行程，~0 token 成本，且只在「真有訊息」時 wake 一次（event-driven）。
+Agent 收完不用 restart watcher，下封 mail 自動接。
 
-**部署：** 推薦放 `~/.claude/tools/mailbox-watch.py`（global），讓所有專案的 user-level CLAUDE.md 用同一條啟動指令。或直接從 repo 路徑跑也可以。
+### Exit-mode（legacy）
 
-**1 小時自殺：** 預設 `--max 720` × `--tick 5` = 3600s 後自動退出，避免殭屍程序。
+不帶 `--monitor`：第一次見 unread 就 `exit 0`。配 Bash `run_in_background: true` 用，靠 task-completion notification 喚醒。**Gap 風險**：exit 後到下次 restart 之間 mail queued。建議只當 fallback。
+
+```bash
+py C:/Users/User/Desktop/VSCcode/claude-mailbox/mailbox-watch.py <name>
+```
+
+可選參數：`--tick` (預設 5s) / `--max` (exit-mode only，0 = 無 TTL，default) / `--db`.
+
+**為什麼不用 `/loop` / `ScheduleWakeup`：** 那兩個在 agent-turn 層級，每 tick 重讀整段 prompt context（< 5min 必 cache miss）。Watcher 是 OS 子行程，~0 token 成本。
+
+## Bridge — Discord ↔ mailbox
+
+`mailbox-discord-bridge.py` 跑在 docker container `mailbox-bridge`（port 1904），由 `discordBot/docker-compose.yml` 起。**單向**：Discord DM → mailbox（INSERT row）。反向（mailbox → Discord）目前**不走 bridge**，要透過 node-red `POST :1901/agent-notify` 走 discordBot（schema 看 [snapshot 內 memory-reference_agent_discord_notify.md](snapshot/memory-reference_agent_discord_notify.md)）。
+
+## 周邊工具
+
+- `mailbox-dump.py` — 撈 mailbox 紀錄；wiki session 有 slash command `/mblog` / `/觀看紀錄`
+- `mailbox-whitelist.py` — Discord 來源信任名單 CLI（trusted/approved/pending），see [discord-stranger-chat](../discord-stranger-chat/) 設計
 
 ## 自動檢查信箱（hook）
 
-因為 Claude Code 是 turn-based，**不會主動 poll**。在每個專案 `.claude/settings.json` 加 `SessionStart` hook 自動提醒：
+**2026-05-19 移除**: 原本有 `~/.claude/hooks/ensure-mailbox-watcher.ps1` + `~/.claude/settings.json` 兩個 hook entry，每次 SessionStart / UserPromptSubmit 偵測 watcher 是否在跑、不在就提示 agent 起。Monitor stream-mode 後 watcher 持續活著，提示變成常駐 noise → 移除。
 
-```json
-{
-  "hooks": {
-    "SessionStart": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "echo '[mailbox] 開 session 前先呼叫 mcp__mailbox__inbox 看有無未讀'"
-          }
-        ]
-      }
-    ]
-  }
-}
-```
+歷史 wiring 看 [snapshot/global-settings-json-hooks.md](snapshot/global-settings-json-hooks.md)。
 
-或更積極的，把這條規則寫進 CLAUDE.md：
+## Global config snapshot
+
+`~/.claude/CLAUDE.md` / `~/.claude/settings.json` / `~/.claude/projects/<id>/memory/*` 這些 harness 規定位置的檔案，跟 mailbox 相關段落 snapshot 進 [snapshot/](snapshot/)，新電腦 clone 此 repo 即可對著 snapshot 重建 global config。
+
+## Mailbox 規則（per session CLAUDE.md）
 
 ```markdown
 ## Mailbox 規則
-- Session 開始時：先 call `mcp__mailbox__inbox()` 查未讀
+- Session 開始時：whoami → Monitor watcher 起來 → 先 call `mcp__mailbox__inbox()` 查未讀
 - 任務需要委派給其他專案時：call `mcp__mailbox__send(to=..., body=...)`
 - 看完訊息後 call `mark_read(ids=[...])`
+- 寄 Discord DM 給 user 不用 mailbox（單向 bridge）— 走 `POST :1901/agent-notify` schema task/detail
 ```
 
 ## 限制

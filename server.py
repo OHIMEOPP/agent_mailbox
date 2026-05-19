@@ -34,7 +34,7 @@ if not NAME:
 DB_PATH = Path(
     os.environ.get(
         "CLAUDE_MAILBOX_DB",
-        str(Path.home() / ".claude-mailbox.db"),
+        str(Path.home() / ".claude" / "mailbox" / "mailbox.db"),
     )
 )
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -45,7 +45,11 @@ DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 def _connect() -> sqlite3.Connection:
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode = WAL")
+    # DELETE mode (rollback journal) instead of WAL — WAL needs mmap on the
+    # .db-shm shared-memory file which Docker Desktop on Windows can't satisfy
+    # for bind-mounts, causing "disk I/O error" on container writes. Our
+    # message volume is tiny so the concurrency penalty is irrelevant.
+    conn.execute("PRAGMA journal_mode = DELETE")
     conn.execute("PRAGMA busy_timeout = 5000")
     return conn
 
