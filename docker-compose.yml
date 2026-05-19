@@ -41,19 +41,21 @@ services:
       # Cache pip downloads in mounted volume so container recreate doesn't re-fetch.
       - PIP_CACHE_DIR=/data/.pip-cache
     volumes:
-      # bridge script read-only (so host edits propagate via container restart)
-      - ./mailbox-discord-bridge.py:/app/bridge.py:ro
+      # bridge package mounted read-only at /app/bridge (run via `python -m bridge`).
+      # Host edits propagate on container restart.
+      - ./bridge:/app/bridge:ro
       # mount the ENTIRE mailbox directory (not just .db) — SQLite WAL mode needs
       # .db + .db-wal + .db-shm visible together to avoid split-brain
       - C:/Users/User/.claude/mailbox:/data
-    # Install discord.py at startup. If DISCORD_BOT_TOKEN is set, bridge.py
-    # will spawn the gateway client thread to receive DMs. If not set, the
-    # client is skipped (HTTP /from-discord webhook path still works).
+    working_dir: /app
+    # Install discord.py at startup. If DISCORD_BOT_TOKEN is set, bridge will
+    # spawn the gateway client thread to receive DMs. If not set, the client
+    # is skipped (HTTP /from-discord webhook path still works).
     # Pin a major version to avoid surprise breaks; allow patch upgrades.
     command:
       - "bash"
       - "-c"
-      - "pip install --quiet 'discord.py>=2.7,<3' && exec python /app/bridge.py --db /data/mailbox.db --bind 0.0.0.0 --port 1904"
+      - "pip install --quiet 'discord.py>=2.7,<3' && exec python -m bridge --db /data/mailbox.db --bind 0.0.0.0 --port 1904"
     networks:
       - animesite_other-networks-main
 
