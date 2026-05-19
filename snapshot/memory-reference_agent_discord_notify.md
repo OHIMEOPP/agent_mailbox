@@ -1,18 +1,26 @@
 ---
 name: reference-agent-discord-notify
-description: Agent 透過 node-red /agent-notify endpoint 即時推送 Discord DM 給 user 的 pattern + UTF-8 編碼陷阱
+description: Agent 透過 bridge :1904 (primary) 或 node-red :1901 (legacy) endpoint 即時推送 Discord DM 給 user 的 pattern + UTF-8 編碼陷阱 + 檔案附件 multipart
 metadata: 
   node_type: memory
   type: reference
   originSessionId: 95503142-1415-4a46-bb0a-250d2760c1d9
 ---
 
-User 設了 node-red flow (port 1901 / container `discordBot` / tab `agent通知`) 接 agent → user Discord DM (channel ID `1284054699594485814`，直接對話非群組)。重要 round close / error 可即時推送 user 不必等 mailbox round-trip。
+User 設了 Discord outbound endpoint 接 agent → user Discord DM (channel ID `1284054699594485814`，直接對話非群組)。重要 round close / error 可即時推送 user 不必等 mailbox round-trip。
 
-## Endpoint
+## Endpoints
+
+### 主：bridge `:1904/agent-notify` (Python, 2026-05-19+)
+本 repo `claude-mailbox/bridge/` 提供，走 Discord REST API。新 deployment default 用這條。
+
+### Legacy：node-red `:1901/agent-notify`
+過去主要 endpoint，2026-05-19 起 bridge 接管 outbound。仍可並存但 gateway 不能同時連 Discord。
+
+## 文字 DM endpoint
 
 ```
-POST http://localhost:1901/agent-notify
+POST http://localhost:1904/agent-notify
 Content-Type: application/json; charset=utf-8
 
 Body:
@@ -20,9 +28,32 @@ Body:
   "agent": "wiki | koatag | koatag-frontend",
   "task": "<title>",
   "status": "done | fail | warn | info",  // 預設 info
-  "detail": "<text，可空>"
+  "detail": "<text，可空>",
+  "channel": "<discord channel id，可省略走預設 trusted DM>"
 }
 ```
+
+## 附件 endpoint (2026-05-19+)
+
+```
+POST http://localhost:1904/agent-notify-file
+Content-Type: multipart/form-data
+
+Parts:
+  payload_json   = JSON body 同上 (agent/task/status/detail/channel?)
+  files[0]       = file binary (filename header 保留)
+  files[1]       = ... (多檔可選)
+```
+
+CLI 包裝 (host 端讀檔，container 不需 mount 路徑):
+```
+py "C:/Users/User/Desktop/VSCcode/claude-mailbox/mailbox-send-file.py" \
+   --task "..." --detail "..." \
+   --files A.png B.pdf \
+   [--channel <id>]
+```
+
+Discord 限制 25 MB / 檔 (Nitro 50/500), 一封多檔總 size 累加.
 
 ## Status → icon
 
@@ -46,7 +77,7 @@ Body:
 import urllib.request, json
 body = {'agent': 'wiki', 'task': '中文標題', 'status': 'done', 'detail': '中文 detail'}
 req = urllib.request.Request(
-    'http://localhost:1901/agent-notify',
+    'http://localhost:1904/agent-notify',
     data=json.dumps(body, ensure_ascii=False).encode('utf-8'),
     method='POST',
     headers={'Content-Type': 'application/json; charset=utf-8'},
@@ -58,7 +89,7 @@ urllib.request.urlopen(req, timeout=8)
 
 ```powershell
 $body = @{ agent='wiki'; task='中文'; status='done'; detail='中文' } | ConvertTo-Json
-Invoke-RestMethod -Uri http://localhost:1901/agent-notify `
+Invoke-RestMethod -Uri http://localhost:1904/agent-notify `
     -Method POST -ContentType 'application/json; charset=utf-8' `
     -Body ([System.Text.Encoding]::UTF8.GetBytes($body))
 ```
@@ -67,7 +98,7 @@ Invoke-RestMethod -Uri http://localhost:1901/agent-notify `
 
 ```bash
 echo '{"agent":"wiki","task":"中文","status":"done"}' > /tmp/n.json
-curl -X POST http://localhost:1901/agent-notify -H "Content-Type: application/json; charset=utf-8" -d @/tmp/n.json
+curl -X POST http://localhost:1904/agent-notify -H "Content-Type: application/json; charset=utf-8" -d @/tmp/n.json
 ```
 
 ## ❌ Anti-pattern：curl inline 中文
