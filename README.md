@@ -1,18 +1,113 @@
 # Claude Code Mailbox
 
-跨 Claude Code instance 的非同步訊息佇列，透過 MCP 實作。
+跨 Claude Code instance 的非同步訊息佇列 + Discord 橋接 + 對使用者推送通知，三件套統一的家。
 
-## Quick refs
+**為什麼存在**：Claude Code 是 turn-based agent — 一個 session 不會主動知道另一個 session（或外部 Discord 使用者）想跟它說什麼。Mailbox 提供共享 SQLite + per-instance watcher，讓不同 agent / user 互通的訊息流被 event-driven 喚醒，而不是每個 session 各自輪詢。
 
-- [HOW-TO-START-WATCHER.md](HOW-TO-START-WATCHER.md) — Session 開頭怎麼啟動 watcher（Monitor stream-mode + Bash fallback + 多裝置）
-- [HOW-TO-USE-MAILBOX.md](HOW-TO-USE-MAILBOX.md) — 收信 / mark read / 三種 reply channel（agent↔agent / user-discord / stranger-chat）+ schema 陷阱
+---
+
+## 🚀 Cold-start checklist（agent 視角：被 user 指示用 mailbox 時讀這段）
+
+### 情境 A：「**開 watcher**」/「啟動 watcher」/「session start」
+
+跑這 4 步：
+
+1. **驗證 repo 在預期位置**
+   ```bash
+   ls C:/Users/User/Desktop/VSCcode/claude-mailbox/mailbox-watch.py
+   ```
+   不存在 → 先 `git clone https://github.com/OHIMEOPP/agent_mailbox.git C:/Users/User/Desktop/VSCcode/claude-mailbox`
+
+2. **驗證 DB 目錄**
+   ```bash
+   ls C:/Users/User/.claude/mailbox/mailbox.db
+   ```
+   不存在 → server.py 第一次跑時會自動 mkdir + create；通常已存在
+
+3. **問自己是誰**：呼叫 `mcp__mailbox__whoami()` 拿 `name` 欄位（如 `wiki` / `koatag` / `koatag-frontend` / `stranger-conv`）
+
+4. **啟動 watcher**：用 Monitor tool（preferred）— 完整模板看 [HOW-TO-START-WATCHER.md](HOW-TO-START-WATCHER.md)。一行版：
+   ```yaml
+   tool: Monitor
+   command:     py "C:/Users/User/Desktop/VSCcode/claude-mailbox/mailbox-watch.py" <NAME> --monitor
+   persistent:  true
+   timeout_ms:  3600000
+   ```
+
+5. 回 user 一句「mailbox watcher 已啟動（stream-mode）」
+
+### 情境 B：「**DM 我**」/「回我」/「告訴 user X」/「寄 Discord」
+
+User 在 Discord 跟你溝通 — 你要 **推送回 Discord DM**。Mailbox SQLite INSERT 對 Discord **沒效**（bridge 單向），必須走 node-red endpoint：
+
+```python
+import urllib.request, json
+body = {
+    "agent": "wiki",          # 你的 instance 名
+    "task": "<短標題>",        # Discord 顯示第一行
+    "status": "info",         # info(📋) / done(✅) / fail(❌) / warn(⚠️)
+    "detail": "<本文>",        # Discord 顯示第二行起
+}
+req = urllib.request.Request(
+    "http://localhost:1901/agent-notify",
+    data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+    method="POST",
+    headers={"Content-Type": "application/json; charset=utf-8"},
+)
+urllib.request.urlopen(req, timeout=8)
+```
+
+**Schema 陷阱**：欄位必為 `agent` / `task` / `status` / `detail`，**送 `message` 會被 silently drop**，Discord 只看到 icon + agent 名沒內容。三種 reply channel 全配方 + e2e 範例：[HOW-TO-USE-MAILBOX.md](HOW-TO-USE-MAILBOX.md)。
+
+### 情境 C：「**寄訊息給 koatag**」/「告訴 wiki X」/「轉給另一個 agent」
+
+走 mailbox MCP（peer 的 watcher 會即時喚醒對方）：
+
+```python
+mcp__mailbox__send(to="koatag", body="<text>")
+```
+
+或 SQL INSERT 同表（一樣會被 peer watcher 看到）：
+```python
+db.execute(
+    "INSERT INTO messages(from_name, to_name, body, sent_at) VALUES(?,?,?,strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+    (your_name, "koatag", body)
+)
+```
+
+### 情境 D：「**有沒有新訊息**」/「看 inbox」
+
+```python
+mcp__mailbox__inbox(unread_only=True)
+# 或：
+mcp__mailbox__inbox(unread_only=False, limit=20)
+```
+
+處理完**一定要 mark_read**（否則下次 session 重啟 watcher 會把舊 mail 重新喚醒）：
+```python
+mcp__mailbox__mark_read(ids=[123, 124])
+```
+
+詳見 [HOW-TO-USE-MAILBOX.md](HOW-TO-USE-MAILBOX.md) §Receiving + §Marking as read。
+
+---
+
+## 詳細 docs
+
+| Doc | 場景 |
+|---|---|
+| [HOW-TO-START-WATCHER.md](HOW-TO-START-WATCHER.md) | 啟動 watcher 完整 quick ref：Monitor stream-mode + Bash fallback + heartbeat verify + 多裝置適配 |
+| [HOW-TO-USE-MAILBOX.md](HOW-TO-USE-MAILBOX.md) | 收信 → mark read → 3 種 reply channel 全配方 + agent-notify schema 陷阱 + CJK 編碼陷阱 + e2e Python 範例 |
+| [snapshot/](snapshot/) | 全域 config 鏡像（`~/.claude/CLAUDE.md` mailbox 段 / `settings.json` 退役 hook / memory 全集），新裝置可參考重建 |
+
+---
 
 ## 運作原理
 
-每個 Claude Code instance 各自 spawn 自己的 stdio MCP server，**但共讀寫同一個 SQLite 檔**：
+每個 Claude Code instance spawn 自己的 stdio MCP server，**共讀寫同一個 SQLite 檔**：
 
 ```
-            ~/.claude-mailbox.db (SQLite, WAL mode)
+            C:\Users\User\.claude\mailbox\mailbox.db
                     ▲      ▲
        ┌────────────┘      └────────────┐
        │                                │
@@ -25,9 +120,13 @@
   name=wiki                       name=koatag
 ```
 
-無 daemon，無 server process 要顧。每次 Claude 開 session 時 spawn 子行程，session 結束就退出。
+無 daemon — 每次 Claude session 開啟時 spawn 子行程，session 結束就退出。Watcher 是另一個 OS 子行程，配 Monitor tool stream-mode 持續喚醒 agent。
 
-## 工具（5 個）
+外加 Docker `mailbox-bridge` container（port 1904，one-way Discord → mailbox）+ node-red `discordBot` container（port 1901，mailbox → Discord via `agent-notify` endpoint）形成 Discord ↔ agent ↔ peer-agent 三向通道。
+
+---
+
+## MCP 工具（5 個）
 
 | Tool | 用途 |
 |---|---|
@@ -37,29 +136,35 @@
 | `peers()` | 列出曾連線過的 instance |
 | `whoami()` | 確認自己是誰、DB 在哪 |
 
-## 安裝
+## Bridge / 周邊工具
+
+- `mailbox-discord-bridge.py` — Docker container `mailbox-bridge`（port 1904）。**單向**：Discord DM → mailbox INSERT。反向走 node-red `agent-notify`（見上面情境 B）
+- `mailbox-dump.py` — 撈 mailbox 歷史；wiki session 有 slash command `/mblog` 跟 `/觀看紀錄` 包好
+- `mailbox-whitelist.py` — Discord 來源信任名單 CLI（trusted / approved / pending），see [discord-stranger-chat](https://github.com/OHIMEOPP/discord-stranger-chat) 設計
+
+---
+
+## 安裝（新裝置首次設定）
 
 需要 [uv](https://docs.astral.sh/uv/) — Python script 用 PEP 723 內嵌依賴宣告，`uv run` 自動裝 `mcp` 套件。
 
-不需要 pip install，不需要 venv。
+```bash
+git clone https://github.com/OHIMEOPP/agent_mailbox.git C:/Users/User/Desktop/VSCcode/claude-mailbox
+mkdir -p C:/Users/User/.claude/mailbox    # DB 目錄
+```
 
-## 註冊到 Claude Code
+不需 pip install，不需 venv。
 
-每個專案各自設定，給自己一個獨特名稱。
+### 註冊 MCP 到 Claude Code
 
-### 方法 A：專案 `.mcp.json`
-
-複製 `examples/mcp.json.life_wiki`（或 `mcp.json.koatag`）到專案根目錄並改名為 `.mcp.json`，調整 `CLAUDE_MAILBOX_NAME`：
+每個專案各自設定，給自己一個獨特名稱：
 
 ```json
 {
   "mcpServers": {
     "mailbox": {
       "command": "uv",
-      "args": [
-        "run",
-        "C:/Users/User/Desktop/VSCcode/claude-mailbox/server.py"
-      ],
+      "args": ["run", "C:/Users/User/Desktop/VSCcode/claude-mailbox/server.py"],
       "env": {
         "CLAUDE_MAILBOX_NAME": "wiki"
       }
@@ -68,99 +173,19 @@
 }
 ```
 
-### 方法 B：`claude mcp add` CLI
+複製到專案根目錄改名 `.mcp.json`，改 NAME。範本看 `examples/mcp.json.{life_wiki,koatag}`。
 
-```bash
-claude mcp add mailbox \
-  --scope project \
-  -e CLAUDE_MAILBOX_NAME=wiki \
-  -- uv run "C:/Users/User/Desktop/VSCcode/claude-mailbox/server.py"
-```
+或 CLI：`claude mcp add mailbox --scope project -e CLAUDE_MAILBOX_NAME=wiki -- uv run "<path>/server.py"`
 
-### 方法 C：全域註冊（所有專案共用，但 NAME 會固定）
+### Bridge container（Discord 整合需要）
 
-`~/.claude.json` 或 `claude mcp add --scope user`。**不建議**，因為 NAME 固定就無法區分專案。
+`discordBot` 跟 `mailbox-bridge` 兩個 container 起來，bridge 會 mount 此 repo 的 `mailbox-discord-bridge.py`。看 `discordBot/docker-compose.yml`。
 
-## 使用方式
+---
 
-啟動 Claude Code 後，會看到工具 `mcp__mailbox__send`、`mcp__mailbox__inbox` 等。
+## DB
 
-### 發信
-> 「請呼叫 mailbox.send 給 koatag，內容是『請看 docker-compose.yml 並摘要服務清單』」
-
-### 收信
-> 「檢查 mailbox 是否有未讀訊息」
-
-→ Claude 會 call `inbox()`，看到訊息後處理，可能再 call `send()` 回覆。
-
-## Watcher 腳本（event-driven 喚醒）
-
-`mailbox-watch.py` 是配套 background polling 腳本：每 5 秒查 SQLite，有新 mail 就喚醒 agent。兩種 mode：
-
-### Stream-mode（推薦 / default）
-
-`--monitor` flag，watcher **不死**：每封新 mail 印一行 stdout，**繼續 polling**。配 Claude Code **Monitor tool**（`persistent: true`）每行 stdout = 一個 notification。
-
-```bash
-py C:/Users/User/Desktop/VSCcode/claude-mailbox/mailbox-watch.py <name> --monitor
-```
-
-Agent 收完不用 restart watcher，下封 mail 自動接。
-
-### Exit-mode（legacy）
-
-不帶 `--monitor`：第一次見 unread 就 `exit 0`。配 Bash `run_in_background: true` 用，靠 task-completion notification 喚醒。**Gap 風險**：exit 後到下次 restart 之間 mail queued。建議只當 fallback。
-
-```bash
-py C:/Users/User/Desktop/VSCcode/claude-mailbox/mailbox-watch.py <name>
-```
-
-可選參數：`--tick` (預設 5s) / `--max` (exit-mode only，0 = 無 TTL，default) / `--db`.
-
-**為什麼不用 `/loop` / `ScheduleWakeup`：** 那兩個在 agent-turn 層級，每 tick 重讀整段 prompt context（< 5min 必 cache miss）。Watcher 是 OS 子行程，~0 token 成本。
-
-## Bridge — Discord ↔ mailbox
-
-`mailbox-discord-bridge.py` 跑在 docker container `mailbox-bridge`（port 1904），由 `discordBot/docker-compose.yml` 起。**單向**：Discord DM → mailbox（INSERT row）。反向（mailbox → Discord）目前**不走 bridge**，要透過 node-red `POST :1901/agent-notify` 走 discordBot（schema 看 [snapshot 內 memory-reference_agent_discord_notify.md](snapshot/memory-reference_agent_discord_notify.md)）。
-
-## 周邊工具
-
-- `mailbox-dump.py` — 撈 mailbox 紀錄；wiki session 有 slash command `/mblog` / `/觀看紀錄`
-- `mailbox-whitelist.py` — Discord 來源信任名單 CLI（trusted/approved/pending），see [discord-stranger-chat](../discord-stranger-chat/) 設計
-
-## 自動檢查信箱（hook）
-
-**2026-05-19 移除**: 原本有 `~/.claude/hooks/ensure-mailbox-watcher.ps1` + `~/.claude/settings.json` 兩個 hook entry，每次 SessionStart / UserPromptSubmit 偵測 watcher 是否在跑、不在就提示 agent 起。Monitor stream-mode 後 watcher 持續活著，提示變成常駐 noise → 移除。
-
-歷史 wiring 看 [snapshot/global-settings-json-hooks.md](snapshot/global-settings-json-hooks.md)。
-
-## Global config snapshot
-
-`~/.claude/CLAUDE.md` / `~/.claude/settings.json` / `~/.claude/projects/<id>/memory/*` 這些 harness 規定位置的檔案，跟 mailbox 相關段落 snapshot 進 [snapshot/](snapshot/)，新電腦 clone 此 repo 即可對著 snapshot 重建 global config。
-
-## Mailbox 規則（per session CLAUDE.md）
-
-```markdown
-## Mailbox 規則
-- Session 開始時：whoami → Monitor watcher 起來 → 先 call `mcp__mailbox__inbox()` 查未讀
-- 任務需要委派給其他專案時：call `mcp__mailbox__send(to=..., body=...)`
-- 看完訊息後 call `mark_read(ids=[...])`
-- 寄 Discord DM 給 user 不用 mailbox（單向 bridge）— 走 `POST :1901/agent-notify` schema task/detail
-```
-
-## 限制
-
-- ❌ **不是即時 push** — 收信端要主動觸發 `inbox()` 才看得到
-- ❌ 不能中斷對方正在執行的任務
-- ✅ 跨專案、跨 session 可以非同步傳資料
-- ✅ 可跨機器（DB 放共享磁碟即可）
-
-## DB 位置
-
-預設 `~/.claude-mailbox.db`（Windows 上 = `C:\Users\User\.claude-mailbox.db`）。
-
-要改：在 `.mcp.json` 的 `env` 加 `CLAUDE_MAILBOX_DB`：
-
+預設 `C:\Users\User\.claude\mailbox\mailbox.db`。要改用 `CLAUDE_MAILBOX_DB` env override:
 ```json
 "env": {
   "CLAUDE_MAILBOX_NAME": "wiki",
@@ -168,7 +193,7 @@ py C:/Users/User/Desktop/VSCcode/claude-mailbox/mailbox-watch.py <name>
 }
 ```
 
-## DB schema
+### Schema
 
 ```sql
 CREATE TABLE messages (
@@ -186,24 +211,49 @@ CREATE TABLE peers (
 );
 ```
 
-要直接看訊息：
+直接看訊息：`sqlite3 ~/.claude/mailbox/mailbox.db "SELECT * FROM messages ORDER BY id DESC LIMIT 10"`
 
-```bash
-sqlite3 ~/.claude-mailbox.db "SELECT * FROM messages ORDER BY id DESC LIMIT 10"
-```
+### Journal mode
+
+`PRAGMA journal_mode = DELETE`（rollback journal）。原本是 WAL 但 Docker Desktop on Windows 對 `.db-shm` mmap 跨 bind-mount 有 bug → "disk I/O error"，訊息量不大切 DELETE 影響忽略。
+
+---
+
+## 限制
+
+- ❌ **不是即時 push** — 收信端要靠 watcher exit/stream 才被喚醒；沒 watcher 就只能 user 講話時順便 `inbox()`
+- ❌ 不能中斷對方正在執行的任務
+- ✅ 跨專案、跨 session 非同步傳資料
+- ✅ 可跨機器（DB 放共享磁碟即可，但 SQLite WAL 跨網路 FS 有限制 → 建議單機多 instance）
+
+---
 
 ## 除錯
 
 ### server 起不來
-- 看 Claude Code 啟動 log（`claude --debug` 或 IDE extension 的 output panel）
-- 手動測：`uv run C:/Users/User/Desktop/VSCcode/claude-mailbox/server.py`，會等 stdio 輸入；按 Ctrl+C 退出代表 server 啟動成功
-- 環境變數 `CLAUDE_MAILBOX_NAME` 必設，沒設會 RuntimeError
+- `claude --debug` 看 stdio log
+- 手動：`uv run C:/Users/User/Desktop/VSCcode/claude-mailbox/server.py`，會等 stdio 輸入，Ctrl+C 退出代表 server OK
+- `CLAUDE_MAILBOX_NAME` 必設，沒設 RuntimeError
 
 ### 訊息送不到
-- `whoami()` 看自己 NAME 對不對
+- `whoami()` 看自己 NAME
 - `peers()` 看對方有沒有連過（連過才會出現在表內）
-- `sqlite3 ~/.claude-mailbox.db ".tables"` 確認 DB 建好了
+- `sqlite3 ~/.claude/mailbox/mailbox.db ".tables"` 確認 DB 建好
 
-### 兩台機器共用 DB
-- DB 放網路共享磁碟（SMB/NFS）
-- ⚠️ SQLite WAL 模式跨網路檔案系統行為有限制；偶爾鎖死。建議單機多 instance。
+### Watcher 沒喚醒
+- 確認 watcher process 活著：`Get-CimInstance Win32_Process -Filter "Name='python.exe'"` Cmdlet match `mailbox-watch.py`
+- 確認 heartbeat：`SELECT last_seen_at FROM peers WHERE name='<NAME>'` 應 5 秒內
+- 死了重啟看 [HOW-TO-START-WATCHER.md](HOW-TO-START-WATCHER.md)
+
+### Discord DM 沒收到
+- Bridge container 健康：`docker ps | grep mailbox-bridge`，`Up`
+- 確認用的是 `agent-notify` 不是 mailbox INSERT（後者**不會**到 Discord）
+- agent-notify response 看到 `<icon> **[wiki]**` **沒下文** → schema 用錯了（應是 `task` + `detail` 不是 `message`）
+
+---
+
+## Hooks（已退役）
+
+2026-05-19 移除 `~/.claude/hooks/ensure-mailbox-watcher.ps1` + `~/.claude/settings.json` 兩個 hook entry。Monitor stream-mode watcher 持續活著，hook 提示變常駐 noise。
+
+歷史 wiring 看 [snapshot/global-settings-json-hooks.md](snapshot/global-settings-json-hooks.md)，要復原自行加回去。

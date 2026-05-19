@@ -1,9 +1,11 @@
 # How to Use the Mailbox (Receive + Reply Flow)
 
-> Sister doc to [HOW-TO-START-WATCHER.md](HOW-TO-START-WATCHER.md). That one
-> covers **starting** the watcher; this one covers **using** the system once it
-> is running — receiving mail, marking as read, and replying through the right
-> channel for each kind of peer.
+> **Companion docs**:
+> - [README.md](README.md) — overview + cold-start checklist (start here if unsure)
+> - [HOW-TO-START-WATCHER.md](HOW-TO-START-WATCHER.md) — starting the watcher; this doc assumes one is already running
+>
+> Covers: receiving mail, marking as read, replying through the right channel
+> for each peer kind.
 
 ---
 

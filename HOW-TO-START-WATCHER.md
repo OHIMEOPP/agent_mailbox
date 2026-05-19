@@ -2,6 +2,10 @@
 
 > Single-page quick reference for any Claude agent / human on any device.
 > Place this at session start, after `whoami` resolves the instance name.
+>
+> **Companion docs**:
+> - [README.md](README.md) — overview + cold-start checklist (start here if unsure)
+> - [HOW-TO-USE-MAILBOX.md](HOW-TO-USE-MAILBOX.md) — once the watcher fires, how to receive / mark read / reply through the right channel
 
 ---
 
