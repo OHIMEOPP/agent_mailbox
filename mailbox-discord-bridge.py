@@ -56,6 +56,18 @@ TRUSTED_USER = os.environ.get('TRUSTED_DISCORD_USER', 'ohimeopp').lower()
 # (different concerns; keeps bind-mount surface small for stranger-side tooling)
 WHITELIST_DB = os.environ.get('WHITELIST_DB', '/data/whitelist.db')
 
+# === Discord outbound (REST API; coexists with node-red gateway) ============
+# Set DISCORD_BOT_TOKEN to enable the bridge's own /agent-notify endpoint.
+# Same bot token can be used in parallel with node-red because Discord's
+# single-connection limit applies to the GATEWAY websocket only — REST API
+# (which we use here) is stateless and tolerates multiple concurrent clients.
+DISCORD_BOT_TOKEN = os.environ.get('DISCORD_BOT_TOKEN', '')
+DISCORD_API_BASE = os.environ.get('DISCORD_API_BASE', 'https://discord.com/api/v10')
+# Default DM channel for the trusted user (ohimeopp). Override via env.
+DISCORD_DEFAULT_CHANNEL = os.environ.get('DISCORD_DEFAULT_CHANNEL', '1284065900659740773')
+# status -> icon mapping; identical to node-red /agent-notify flow.
+NOTIFY_ICON = {'done': '✅', 'fail': '❌', 'warn': '⚠️', 'info': '📋'}
+
 
 def _agent_recently_active(db_path, agent_name, within_seconds):
     """Return True if agent's watcher has written a heartbeat in the window.
@@ -282,6 +294,51 @@ import re
 ALLOW_DENY_RE = re.compile(r'^(allow|deny)\s+(\S+)\s*$', re.IGNORECASE)
 
 
+def _format_notify_message(agent, task, status, detail):
+    """Format payload identically to node-red /agent-notify flow.
+    Discord renders:
+        {icon} **[{agent}]** {task}
+        {detail}
+    Multi-line detail is preserved; blank task is allowed.
+    """
+    icon = NOTIFY_ICON.get((status or 'info').lower(), NOTIFY_ICON['info'])
+    head = f"{icon} **[{agent}]**"
+    if task:
+        head += f" {task}"
+    if detail:
+        return f"{head}\n{detail}"
+    return head
+
+
+def _discord_send_dm(channel_id, content):
+    """POST to Discord REST API, no gateway connection needed.
+    Returns (ok: bool, status_code: int, body: str).
+    """
+    if not DISCORD_BOT_TOKEN:
+        return (False, 0, 'no_token')
+    if not channel_id:
+        return (False, 0, 'no_channel')
+    url = f"{DISCORD_API_BASE}/channels/{channel_id}/messages"
+    payload = json.dumps({'content': content}, ensure_ascii=False).encode('utf-8')
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        method='POST',
+        headers={
+            'Authorization': f'Bot {DISCORD_BOT_TOKEN}',
+            'Content-Type': 'application/json',
+            'User-Agent': 'mailbox-bridge-py/1.0',
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return (True, resp.status, resp.read().decode('utf-8', 'replace')[:200])
+    except urllib.error.HTTPError as e:
+        return (False, e.code, e.read().decode('utf-8', 'replace')[:200])
+    except Exception as e:
+        return (False, 0, f'{type(e).__name__}: {e}')
+
+
 def make_handler(db_path):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):
@@ -293,7 +350,58 @@ def make_handler(db_path):
             self.end_headers()
             self.wfile.write(json.dumps(payload, ensure_ascii=False).encode('utf-8'))
 
+        def _read_json_body(self):
+            length = int(self.headers.get('Content-Length', 0))
+            raw = self.rfile.read(length).decode('utf-8')
+            return json.loads(raw)
+
+        def _handle_agent_notify(self):
+            """Python equivalent of node-red /agent-notify, using Discord REST.
+
+            Request JSON (same schema as node-red endpoint):
+                agent:   str  (required, instance name, e.g. "wiki")
+                task:    str  (optional, short title)
+                status:  str  (info|done|fail|warn; defaults to info)
+                detail:  str  (optional, body text)
+                channel: str  (optional, Discord channel_id; defaults to
+                              DISCORD_DEFAULT_CHANNEL = trusted user's DM)
+
+            Returns rendered DM as text (matches node-red response shape so
+            agents using existing schema-check logic still get the same hint).
+            """
+            try:
+                body = self._read_json_body()
+            except Exception as e:
+                return self._json(400, {'ok': False, 'error': f'parse_fail: {e}'})
+
+            agent = (body.get('agent') or '').strip()
+            if not agent:
+                return self._json(400, {'ok': False, 'error': 'missing_agent'})
+            task = (body.get('task') or '').strip()
+            status = (body.get('status') or 'info').strip().lower()
+            detail = body.get('detail') or ''
+            channel = (body.get('channel') or DISCORD_DEFAULT_CHANNEL).strip()
+
+            content = _format_notify_message(agent, task, status, detail)
+            ok, code, resp_body = _discord_send_dm(channel, content)
+
+            if ok:
+                sys.stdout.write(f"[bridge] agent-notify OK agent={agent} ch={channel} task={task[:40]!r}\n")
+                # Plain-text response so existing client code (which checks for
+                # "<icon> **[wiki]**" prefix) keeps working without parsing JSON.
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/plain; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(content.encode('utf-8'))
+                return
+
+            sys.stdout.write(f"[bridge] agent-notify FAIL agent={agent} code={code} body={resp_body!r}\n")
+            return self._json(502, {'ok': False, 'error': 'discord_send_fail',
+                                    'discord_status': code, 'discord_body': resp_body})
+
         def do_POST(self):
+            if self.path == '/agent-notify':
+                return self._handle_agent_notify()
             if self.path != '/from-discord':
                 return self._json(404, {'ok': False, 'error': 'unknown_path'})
             try:
