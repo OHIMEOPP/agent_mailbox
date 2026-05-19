@@ -215,8 +215,8 @@ NOTIFY_URL = os.environ.get("CLAUDE_NOTIFY_URL", "http://localhost:1901/agent-no
 | Response | 純文字渲染 DM | 純文字渲染 DM（成功時）/ JSON error（失敗時）|
 
 **怎麼啟用 1904 outbound**：
-1. 在 `discordBot/.env` 加 `DISCORD_BOT_TOKEN=<token>` + `DISCORD_DEFAULT_CHANNEL=<trusted DM channel id>`
-2. `cd discordBot && docker compose up -d --force-recreate mailbox-bridge`
+1. 複製模板：`cp claude-mailbox/.env.example claude-mailbox/.env`，填入 `DISCORD_BOT_TOKEN=<token>` + `DISCORD_DEFAULT_CHANNEL=<trusted DM channel id>`
+2. `cd claude-mailbox && docker compose up -d --force-recreate`
 3. 測：`curl -sS -X POST http://localhost:1904/agent-notify -H 'Content-Type: application/json' -d '{"agent":"test","task":"hi","status":"info","detail":"from bridge"}'`
 4. Discord 看到 DM → 切換 agent 端：`CLAUDE_NOTIFY_URL=http://localhost:1904/agent-notify`
 5. 切後 verify 穩定一週 → 評估是否完全停用 node-red `/agent-notify` flow
@@ -313,15 +313,21 @@ memory 是 reference + feedback 行為紀律，agent 看了會知道：
 
 ### Step 5 — Bridge container（Discord 整合需要）
 
-如果新裝置要接 Discord（agent ↔ user DM / stranger chat），起 `discordBot` 跟 `mailbox-bridge` 兩個 container：
+如果新裝置要接 Discord（agent ↔ user DM / stranger chat），需要兩個 container 各從各的 repo 起：
 
 ```bash
+# 1. discordBot (node-red, port 1901) — Discord gateway + outbound flow
 git clone <discordBot repo> C:/Users/User/Desktop/VSCcode/discordBot
 cd C:/Users/User/Desktop/VSCcode/discordBot
 docker compose up -d
+
+# 2. mailbox-bridge (Python, port 1904) — 本 repo
+cd C:/Users/User/Desktop/VSCcode/claude-mailbox
+cp .env.example .env    # 編輯填 DISCORD_BOT_TOKEN（可選，沒填 outbound /agent-notify 仍可運作但會回 no_token）
+docker compose up -d
 ```
 
-`mailbox-bridge` container mount 本 repo 的 `mailbox-discord-bridge.py`（看 `docker-compose.yml` volumes 段路徑要對得上你的 clone 位置）。
+兩個 compose 共用 external network `animesite_other-networks-main`（事先 `docker network create animesite_other-networks-main` 一次性建立）。
 
 ### Step 6 — 驗證
 

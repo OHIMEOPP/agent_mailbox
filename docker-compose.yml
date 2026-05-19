@@ -1,0 +1,50 @@
+# Mailbox infra docker-compose (lives in claude-mailbox repo — canonical home).
+#
+# Currently only the bridge runs as a container. The MCP server and watcher
+# are per-Claude-session subprocesses (no daemon). Adding more components
+# (e.g. a future stand-alone Discord listener replacing node-red) belongs
+# in this file.
+#
+# Reads `.env` next to this file. See `.env.example` for required vars.
+#
+# Apply changes:
+#   cd C:/Users/User/Desktop/VSCcode/claude-mailbox
+#   docker compose up -d                          # start
+#   docker compose up -d --force-recreate         # apply config / .env changes
+#   docker compose down                           # stop
+#
+# Network: shares `animesite_other-networks-main` (external) with the
+# discordBot node-red container so the bridge can reach discordBot:1880
+# for forwarding `agent-notify` calls (legacy path; bridge :1904/agent-notify
+# is the new path).
+
+services:
+  mailbox-bridge:
+    image: python:3.12-alpine
+    container_name: mailbox-bridge
+    restart: always
+    ports:
+      - "1904:1904"
+    environment:
+      - TZ=Asia/Taipei
+      # network has 4 node-red containers (manager / other / errorWarn / discordBot);
+      # service name "nodered" can DNS-collide, so use the discordBot container name explicitly
+      - NOTIFY_URL=http://discordBot:1880/agent-notify
+      # Discord REST API outbound (optional). When DISCORD_BOT_TOKEN is set
+      # the bridge serves /agent-notify on :1904 alongside node-red :1901
+      # (same bot token works on both: REST is stateless, gateway is singleton).
+      - DISCORD_BOT_TOKEN=${DISCORD_BOT_TOKEN:-}
+      - DISCORD_DEFAULT_CHANNEL=${DISCORD_DEFAULT_CHANNEL:-1284065900659740773}
+    volumes:
+      # bridge script read-only (so host edits propagate via container restart)
+      - ./mailbox-discord-bridge.py:/app/bridge.py:ro
+      # mount the ENTIRE mailbox directory (not just .db) — SQLite WAL mode needs
+      # .db + .db-wal + .db-shm visible together to avoid split-brain
+      - C:/Users/User/.claude/mailbox:/data
+    command: ["python", "/app/bridge.py", "--db", "/data/mailbox.db", "--bind", "0.0.0.0", "--port", "1904"]
+    networks:
+      - animesite_other-networks-main
+
+networks:
+  animesite_other-networks-main:
+    external: true
