@@ -1,11 +1,12 @@
 """HTTP server on :1904 — exposes:
 
-- POST /from-discord   legacy webhook for node-red's discordMessage flow
-- POST /agent-notify   Python equivalent of node-red /agent-notify (REST DM)
-- GET  /healthz        liveness ping
-
-Body of both POST endpoints feeds through the same inbound / notify modules.
+- POST /from-discord       legacy webhook for node-red's discordMessage flow
+- POST /agent-notify       text-only DM (JSON body: agent/task/status/detail)
+- POST /agent-notify-file  DM with attachments (multipart/form-data)
+- GET  /healthz            liveness ping
 """
+import cgi
+import io
 import json
 import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -87,9 +88,82 @@ def make_handler(db_path):
             return self._json(502, {'ok': False, 'error': 'discord_send_fail',
                                     'discord_status': code, 'discord_body': resp_body})
 
+        def _handle_agent_notify_file(self):
+            """multipart/form-data variant of /agent-notify.
+
+            Form fields:
+              payload_json   JSON string with {agent, task, status, detail, channel?}
+              files[N]       one or more file parts (filename header preserved)
+            """
+            ctype = self.headers.get('Content-Type', '')
+            if not ctype.startswith('multipart/form-data'):
+                return self._json(400, {'ok': False,
+                                        'error': 'expected multipart/form-data'})
+            try:
+                # cgi.FieldStorage handles multipart parsing
+                fs = cgi.FieldStorage(
+                    fp=self.rfile,
+                    headers=self.headers,
+                    environ={'REQUEST_METHOD': 'POST',
+                             'CONTENT_TYPE': ctype},
+                    keep_blank_values=True,
+                )
+            except Exception as e:
+                return self._json(400, {'ok': False, 'error': f'multipart_parse: {e}'})
+
+            if 'payload_json' not in fs:
+                return self._json(400, {'ok': False, 'error': 'missing payload_json'})
+            try:
+                body = json.loads(fs.getfirst('payload_json'))
+            except Exception as e:
+                return self._json(400, {'ok': False, 'error': f'payload_json_parse: {e}'})
+
+            agent = (body.get('agent') or '').strip()
+            if not agent:
+                return self._json(400, {'ok': False, 'error': 'missing_agent'})
+            task = (body.get('task') or '').strip()
+            status = (body.get('status') or 'info').strip().lower()
+            detail = body.get('detail') or ''
+            channel = (body.get('channel') or DISCORD_DEFAULT_CHANNEL).strip()
+
+            attachments = []
+            for key in fs.keys():
+                if not key.startswith('files['):
+                    continue
+                item = fs[key]
+                items = item if isinstance(item, list) else [item]
+                for it in items:
+                    if not getattr(it, 'filename', None):
+                        continue
+                    attachments.append((it.filename, it.file.read()))
+            if not attachments:
+                return self._json(400, {'ok': False,
+                                        'error': 'no_files',
+                                        'hint': 'expected one or more files[N] parts'})
+
+            content = format_notify_message(agent, task, status, detail)
+            ok, code, resp_body = discord_send_dm(channel, content, attachments=attachments)
+
+            if ok:
+                sizes = ", ".join(f"{fn}({len(b)}B)" for fn, b in attachments)
+                sys.stdout.write(f"[http] agent-notify-file OK agent={agent} ch={channel} "
+                                 f"files=[{sizes}] task={task[:40]!r}\n")
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/plain; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(content.encode('utf-8'))
+                return
+
+            sys.stdout.write(f"[http] agent-notify-file FAIL agent={agent} code={code} "
+                             f"body={resp_body!r}\n")
+            return self._json(502, {'ok': False, 'error': 'discord_send_fail',
+                                    'discord_status': code, 'discord_body': resp_body})
+
         def do_POST(self):
             if self.path == '/agent-notify':
                 return self._handle_agent_notify()
+            if self.path == '/agent-notify-file':
+                return self._handle_agent_notify_file()
             if self.path == '/from-discord':
                 return self._handle_from_discord()
             return self._json(404, {'ok': False, 'error': 'unknown_path'})

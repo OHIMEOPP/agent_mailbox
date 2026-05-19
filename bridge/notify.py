@@ -11,6 +11,7 @@ Two purposes:
    here (_format_notify_message, _discord_send_dm) implement the work.
 """
 import json
+import os
 import sys
 import urllib.error
 import urllib.request
@@ -103,32 +104,72 @@ def format_notify_message(agent, task, status, detail):
     return head
 
 
-def discord_send_dm(channel_id, content):
+def discord_send_dm(channel_id, content, attachments=None):
     """POST to Discord REST API. Returns (ok, status_code, body).
 
     No gateway connection needed. Same bot token can be in use by a separate
     gateway client elsewhere — REST API is stateless.
+
+    attachments: optional list of (filename, bytes) tuples. When present the
+    request is sent as multipart/form-data per Discord API v10 spec, with
+    payload_json + files[N] parts. None / empty = plain JSON POST.
     """
     if not DISCORD_BOT_TOKEN:
         return (False, 0, 'no_token')
     if not channel_id:
         return (False, 0, 'no_channel')
+
     url = f"{DISCORD_API_BASE}/channels/{channel_id}/messages"
-    payload = json.dumps({'content': content}, ensure_ascii=False).encode('utf-8')
-    req = urllib.request.Request(
-        url,
-        data=payload,
-        method='POST',
-        headers={
-            'Authorization': f'Bot {DISCORD_BOT_TOKEN}',
-            'Content-Type': 'application/json',
-            'User-Agent': 'mailbox-bridge-py/1.0',
-        },
-    )
+    base_headers = {
+        'Authorization': f'Bot {DISCORD_BOT_TOKEN}',
+        'User-Agent': 'mailbox-bridge-py/1.0',
+    }
+
+    if not attachments:
+        payload = json.dumps({'content': content}, ensure_ascii=False).encode('utf-8')
+        req = urllib.request.Request(
+            url, data=payload, method='POST',
+            headers={**base_headers, 'Content-Type': 'application/json'},
+        )
+    else:
+        # multipart/form-data: payload_json + files[N] parts
+        boundary = '----mailboxbridge' + os.urandom(8).hex()
+        body_chunks = []
+        payload = {
+            'content': content,
+            'attachments': [
+                {'id': i, 'filename': fn}
+                for i, (fn, _) in enumerate(attachments)
+            ],
+        }
+        body_chunks.append(f'--{boundary}\r\n'.encode())
+        body_chunks.append(b'Content-Disposition: form-data; name="payload_json"\r\n')
+        body_chunks.append(b'Content-Type: application/json\r\n\r\n')
+        body_chunks.append(json.dumps(payload, ensure_ascii=False).encode('utf-8'))
+        body_chunks.append(b'\r\n')
+        for i, (filename, content_bytes) in enumerate(attachments):
+            body_chunks.append(f'--{boundary}\r\n'.encode())
+            body_chunks.append(
+                f'Content-Disposition: form-data; name="files[{i}]"; filename="{filename}"\r\n'.encode('utf-8')
+            )
+            body_chunks.append(b'Content-Type: application/octet-stream\r\n\r\n')
+            body_chunks.append(content_bytes)
+            body_chunks.append(b'\r\n')
+        body_chunks.append(f'--{boundary}--\r\n'.encode())
+        data = b''.join(body_chunks)
+        req = urllib.request.Request(
+            url, data=data, method='POST',
+            headers={
+                **base_headers,
+                'Content-Type': f'multipart/form-data; boundary={boundary}',
+                'Content-Length': str(len(data)),
+            },
+        )
+
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=30) as resp:
             return (True, resp.status, resp.read().decode('utf-8', 'replace')[:200])
     except urllib.error.HTTPError as e:
-        return (False, e.code, e.read().decode('utf-8', 'replace')[:200])
+        return (False, e.code, e.read().decode('utf-8', 'replace')[:300])
     except Exception as e:
         return (False, 0, f'{type(e).__name__}: {e}')
