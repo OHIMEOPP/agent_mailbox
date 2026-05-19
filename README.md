@@ -38,10 +38,13 @@
 
 ### 情境 B：「**DM 我**」/「回我」/「告訴 user X」/「寄 Discord」
 
-User 在 Discord 跟你溝通 — 你要 **推送回 Discord DM**。Mailbox SQLite INSERT 對 Discord **沒效**（bridge 單向），必須走 node-red endpoint：
+> 前提：你的部署有 Discord outbound endpoint（reference deployment 是 `http://localhost:1901/agent-notify`）。沒部署 Discord 整合的環境跳過此情境，看 §Core vs optional 確認。
+
+User 在 Discord 跟你溝通 — 推送回 Discord DM 走 outbound endpoint。Mailbox SQLite INSERT 對 Discord **沒效**（inbound bridge 只接 Discord → mailbox 方向），必須 POST：
 
 ```python
-import urllib.request, json
+import os, urllib.request, json
+NOTIFY_URL = os.environ.get("CLAUDE_NOTIFY_URL", "http://localhost:1901/agent-notify")
 body = {
     "agent": "wiki",          # 你的 instance 名
     "task": "<短標題>",        # Discord 顯示第一行
@@ -49,7 +52,7 @@ body = {
     "detail": "<本文>",        # Discord 顯示第二行起
 }
 req = urllib.request.Request(
-    "http://localhost:1901/agent-notify",
+    NOTIFY_URL,
     data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
     method="POST",
     headers={"Content-Type": "application/json; charset=utf-8"},
@@ -122,61 +125,80 @@ mcp__mailbox__mark_read(ids=[123, 124])
 
 無 daemon — 每次 Claude session 開啟時 spawn 子行程，session 結束就退出。Watcher 是另一個 OS 子行程，配 Monitor tool stream-mode 持續喚醒 agent。
 
-### Discord 整合：兩個 port，分工不對稱
+### Core vs optional：先區分 mandatory 跟 add-on
+
+| 元件 | 必要性 | 角色 |
+|---|---|---|
+| **SQLite DB** `~/.claude/mailbox/mailbox.db` | **CORE** — 沒這個 mailbox 不存在 | 訊息持久層 |
+| **MCP server** `server.py` (per Claude session spawn) | **CORE** — 沒這個 agent 拿不到 mailbox 工具 | 工具 RPC |
+| **Watcher** `mailbox-watch.py` (per agent instance run) | **CORE** — 沒這個 agent 不會被新 mail 喚醒 | Event-driven wake |
+| **Discord inbound bridge** `mailbox-discord-bridge.py` | **OPTIONAL** — 只 agent ↔ agent 通訊不需要 | 使用者 Discord DM → mailbox INSERT |
+| **Discord outbound endpoint** (e.g. node-red agent-notify) | **OPTIONAL** — 只 agent ↔ agent 通訊不需要 | mailbox / agent → 使用者 Discord DM |
+
+只要 agent ↔ agent 互寄（譬如 wiki ↔ koatag 內部協作），**只需 CORE 三件**。Discord 整合是 plugin。
+
+### Discord 整合（OPTIONAL）：怎麼跟外界 user 通訊
+
+如果新裝置要接 Discord，需要兩個 service：
 
 ```
-Discord (user)              Discord (user)
-   │                            ▲
-   │ 收到使用者 DM               │ 推送 DM 給使用者
-   │ POST /from-discord         │ POST /agent-notify
-   ▼                            │
-┌──────────────────┐    ┌─────────────────────┐
-│ mailbox-bridge   │    │ discordBot          │
-│ Python container │    │ node-red container  │
-│ port 1904        │    │ port 1901           │
-│ (inbound only)   │    │ (outbound + 其他 flow)│
-└──────────────────┘    └─────────────────────┘
-   │                            ▲
-   │ INSERT row                 │ 讀 JSON body 包成 Discord message
-   ▼                            │
-┌──────────────────────────────────────────┐
-│  mailbox.db (SQLite, ~/.claude/mailbox/) │
-└──────────────────────────────────────────┘
-   ▲                            ▲
-   │ poll                       │ 不會走（agent 直接打 1901）
-   │
-┌──────────────────┐
-│ mailbox-watch.py │
-│ Monitor task     │
-│ stream-mode      │
-└──────────────────┘
-   │ stdout MAIL line
-   ▼
-┌──────────────────┐
-│ Claude agent     │  ← agent 直接打 1901 寄 DM；mailbox 只當 inbound 緩衝
-│ (this session)   │
-└──────────────────┘
+                ┌──────────────────────────────────────────┐
+                │ Discord (user 端)                         │
+                └─────┬──────────────────────────────▲─────┘
+                      │                              │
+                      │ user 寫 DM                    │ agent 推 DM
+            ┌─────────▼──────────┐    ┌──────────────┴─────────────┐
+INBOUND  ─→ │ <DISCORD_INBOUND>  │    │ <DISCORD_OUTBOUND>          │ ←─ OUTBOUND
+            │ e.g. mailbox-bridge│    │ e.g. node-red agent-notify  │
+            │ POST /from-discord │    │ POST /agent-notify          │
+            └─────────┬──────────┘    └──────────────▲─────────────┘
+                      │ INSERT                       │ 讀 JSON 包 DM 送
+                      ▼                              │
+                ┌────────────────────────────────────┴───┐
+                │  mailbox.db (SQLite, CORE)              │
+                └─────┬──────────────────────────────────┘
+                      │ poll
+                      ▼
+                ┌──────────────────┐
+                │ mailbox-watch.py │ ←─ CORE, 任何 agent 都跑這個
+                │ Monitor stream   │
+                └─────┬────────────┘
+                      │ stdout MAIL line / 喚醒 agent
+                      ▼
+                ┌──────────────────┐
+                │ Claude agent     │
+                └──────────────────┘
 ```
 
-**為什麼分兩個 port**（歷史 + 角色不同）：
+#### 我這台機器 (reference deployment) 的具體配置
 
-| Port | Container | 角色 | 誰打 |
-|---|---|---|---|
-| **1904** | `mailbox-bridge` (Python) | **Inbound**：Discord 把使用者 DM 推這裡 → bridge INSERT mailbox SQLite | Discord bot（自動）|
-| **1901** | `discordBot` (node-red) | **Outbound**：agent 推這裡 → node-red 包成 Discord message 送出。也兼跑其他 node-red flow（YouTube response 等）| Agent（手動 POST）|
+| 角色 | URL | 實作 |
+|---|---|---|
+| `<DISCORD_INBOUND>` | `http://localhost:1904/from-discord` | `mailbox-bridge` Python container（本 repo 的 `mailbox-discord-bridge.py`），起在 `discordBot/docker-compose.yml` |
+| `<DISCORD_OUTBOUND>` | `http://localhost:1901/agent-notify` | `discordBot` node-red container（包多個 flow 共用）|
 
-**Agent 視角只需懂兩件事**：
-- 收信：watcher 自動，從 SQLite 拿，**不用知道 1904** 存在
-- 送信給 user Discord：直接打 `POST :1901/agent-notify`
+**其他裝置不一定長這樣** — 你可以：
+- 完全不部署 Discord 整合（純 agent ↔ agent，CORE 已足夠）
+- 用自己的 inbound 機制（不用 Python bridge，自己寫個 webhook 直接 INSERT SQLite 也行）
+- 把 outbound 接其他平台（Slack / Telegram / Webhook URL — 只要那 endpoint 接 `{agent, task, status, detail}` JSON 並回應 Discord-style DM 就行）
+- 不同 port、不同 host
 
-1904 是「使用者 → mailbox」這一段的內部實作細節，agent 永遠不會主動連 1904。寫進 README 是讓 ops 知道整套部署有哪些容器，不是給 agent 操作用的。
+**新裝置 setup 時要 set 自己的 URL**：建議用 env var 或 project `.mcp.json` 注入，不要 hardcode `localhost:1901`。譬如 agent 端寫：
+```python
+NOTIFY_URL = os.environ.get("CLAUDE_NOTIFY_URL", "http://localhost:1901/agent-notify")
+```
 
-**為什麼不合併成一個 port**：
-- 1904 的 Python bridge daemon 只做 1 件事（SQLite INSERT）— 簡單、獨立可重啟
-- 1901 的 node-red 跑了多個 flow（agent-notify、YouTube、其他通知），加 Discord inbound 進 node-red 也行但 flow 會臃腫
-- 早期決策保留至今；可以合併但 ROI 低
+#### 對你說的兩個常見誤解
 
-> **TL;DR for new agents**：你只 care **mailbox** (SQLite, 從 watcher 看到) + **1901** (POST `agent-notify` 送 DM)。**1904 跟你無關**，就是 Discord 把 user 訊息塞進 mailbox 的後門。
+> **「Agent 不用 care 1904 存在」** — 我之前說錯了
+
+正確：agent **不主動 POST** 1904（那是 Discord bot 在打），但 **1904 沒人在跑 = user DM 不會進 mailbox**，agent 也就**收不到**。所以 1904（或同等的 inbound endpoint）必須**有人在跑**才能 work。Agent 對 1904 的依賴是 indirect 但 mandatory（前提你要 Discord 整合）。
+
+> **「為什麼分兩個 port」**
+
+不是必要分。我這台這樣分純粹是歷史：1904 的 Python bridge 寫好早，獨立 daemon；1901 的 node-red 後來起，順手加 outbound flow。Logical 上可以合併成一個 endpoint 兩個 handler，但已 working 沒動機改。**別台機器你想合併成一個 service 跑 inbound + outbound 完全可以**。
+
+> **TL;DR for new agents**: agent 需 care 的 surface 是 **mailbox SQLite**（收信，CORE）+ **outbound endpoint**（送 user DM，OPTIONAL）。Inbound 由運維部署，agent 端不主動呼叫但**仰賴它存在**。Port 號是 reference deployment 細節，新裝置自己決定。
 
 ---
 
