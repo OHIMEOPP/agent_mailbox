@@ -73,6 +73,16 @@ def fetch_unread(conn: sqlite3.Connection, name: str, since_id: int) -> list:
     ))
 
 
+def fetch_unread_all(conn: sqlite3.Connection, since_id: int) -> list:
+    """Same as fetch_unread but across every to_name (supervisor mode)."""
+    return list(conn.execute(
+        "SELECT id, from_name, to_name, sent_at, substr(body, 1, 200) "
+        "FROM messages WHERE read_at IS NULL AND id > ? "
+        "ORDER BY id",
+        (since_id,),
+    ))
+
+
 def run_exit_mode(args) -> int:
     """Legacy: exit code 0 on first sight of unread mail."""
     start = time.time()
@@ -110,25 +120,34 @@ def run_monitor_mode(args) -> int:
 
     Tracks last_id (monotonic SQLite rowid) so re-announcing is avoided even
     if the agent is slow to mark_read. Each tick:
-      1. heartbeat peers
+      1. heartbeat peers (own name only — peer rows are touched by their own
+         watchers, supervisor mode doesn't impersonate)
       2. SELECT unread with id > last_id
+         - default: filtered by to_name = our name
+         - --watch-all: any to_name (supervisor mode for wiki)
       3. for each row: print line, advance last_id
     """
     last_id = 0
+    watch_all = bool(args.watch_all)
 
     # On startup, baseline last_id to the current max so we don't re-announce
-    # already-present unread mail (that's a one-shot inbox dump the agent has
-    # probably handled). If we want to surface backlog, the agent can call
-    # mailbox-dump directly.
+    # already-present unread mail. In watch-all mode baseline against the
+    # whole messages table so historical mail to other peers doesn't replay.
     try:
         conn = sqlite3.connect(args.db)
-        row = conn.execute(
-            "SELECT COALESCE(MAX(id), 0) FROM messages WHERE to_name=?",
-            (args.name,),
-        ).fetchone()
+        if watch_all:
+            row = conn.execute(
+                "SELECT COALESCE(MAX(id), 0) FROM messages"
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT COALESCE(MAX(id), 0) FROM messages WHERE to_name=?",
+                (args.name,),
+            ).fetchone()
         last_id = row[0] if row else 0
         conn.close()
-        print(f"[watcher] monitor-mode start name={args.name} "
+        mode_label = "WATCH-ALL" if watch_all else f"name={args.name}"
+        print(f"[watcher] monitor-mode start {mode_label} "
               f"tick={args.tick}s baseline_id={last_id}",
               file=sys.stderr)
     except sqlite3.Error as e:
@@ -138,16 +157,25 @@ def run_monitor_mode(args) -> int:
         try:
             conn = sqlite3.connect(args.db)
             heartbeat(conn, args.name)
-            rows = fetch_unread(conn, args.name, last_id)
+            if watch_all:
+                rows = fetch_unread_all(conn, last_id)
+            else:
+                rows = fetch_unread(conn, args.name, last_id)
             conn.close()
         except sqlite3.Error as e:
             print(f"[watcher] db error: {e}", file=sys.stderr)
             time.sleep(args.tick)
             continue
 
-        for mid, sender, sent, preview in rows:
-            safe_preview = (preview or "").replace("\r", " ").replace("\n", " | ")
-            print(f"MAIL id={mid} from={sender} sent={sent} preview={safe_preview}")
+        for row in rows:
+            if watch_all:
+                mid, sender, recipient, sent, preview = row
+                safe_preview = (preview or "").replace("\r", " ").replace("\n", " | ")
+                print(f"MAIL id={mid} from={sender} to={recipient} sent={sent} preview={safe_preview}")
+            else:
+                mid, sender, sent, preview = row
+                safe_preview = (preview or "").replace("\r", " ").replace("\n", " | ")
+                print(f"MAIL id={mid} from={sender} sent={sent} preview={safe_preview}")
             last_id = mid
 
         time.sleep(args.tick)
@@ -164,6 +192,10 @@ def main() -> int:
                    help="exit-mode only: max ticks before self-kill "
                         "(0 = infinite, default)")
     p.add_argument('--db', default=DB, help="path to mailbox SQLite db")
+    p.add_argument('--watch-all', action='store_true',
+                   help="supervisor mode: fire on ANY recipient's new mail "
+                        "(not just to_name=<NAME>). Output adds 'to=<peer>' "
+                        "field per line. Used by wiki to oversee whole mailbox.")
     args = p.parse_args()
 
     if args.monitor:
