@@ -2,6 +2,11 @@
 
 跨 Claude Code instance 的非同步訊息佇列，透過 MCP 實作。
 
+## Quick refs
+
+- [HOW-TO-START-WATCHER.md](HOW-TO-START-WATCHER.md) — Session 開頭怎麼啟動 watcher（Monitor stream-mode + Bash fallback + 多裝置）
+- [HOW-TO-USE-MAILBOX.md](HOW-TO-USE-MAILBOX.md) — 收信 / mark read / 三種 reply channel（agent↔agent / user-discord / stranger-chat）+ schema 陷阱
+
 ## 運作原理
 
 每個 Claude Code instance 各自 spawn 自己的 stdio MCP server，**但共讀寫同一個 SQLite 檔**：
