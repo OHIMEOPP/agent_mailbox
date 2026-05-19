@@ -122,7 +122,61 @@ mcp__mailbox__mark_read(ids=[123, 124])
 
 無 daemon — 每次 Claude session 開啟時 spawn 子行程，session 結束就退出。Watcher 是另一個 OS 子行程，配 Monitor tool stream-mode 持續喚醒 agent。
 
-外加 Docker `mailbox-bridge` container（port 1904，one-way Discord → mailbox）+ node-red `discordBot` container（port 1901，mailbox → Discord via `agent-notify` endpoint）形成 Discord ↔ agent ↔ peer-agent 三向通道。
+### Discord 整合：兩個 port，分工不對稱
+
+```
+Discord (user)              Discord (user)
+   │                            ▲
+   │ 收到使用者 DM               │ 推送 DM 給使用者
+   │ POST /from-discord         │ POST /agent-notify
+   ▼                            │
+┌──────────────────┐    ┌─────────────────────┐
+│ mailbox-bridge   │    │ discordBot          │
+│ Python container │    │ node-red container  │
+│ port 1904        │    │ port 1901           │
+│ (inbound only)   │    │ (outbound + 其他 flow)│
+└──────────────────┘    └─────────────────────┘
+   │                            ▲
+   │ INSERT row                 │ 讀 JSON body 包成 Discord message
+   ▼                            │
+┌──────────────────────────────────────────┐
+│  mailbox.db (SQLite, ~/.claude/mailbox/) │
+└──────────────────────────────────────────┘
+   ▲                            ▲
+   │ poll                       │ 不會走（agent 直接打 1901）
+   │
+┌──────────────────┐
+│ mailbox-watch.py │
+│ Monitor task     │
+│ stream-mode      │
+└──────────────────┘
+   │ stdout MAIL line
+   ▼
+┌──────────────────┐
+│ Claude agent     │  ← agent 直接打 1901 寄 DM；mailbox 只當 inbound 緩衝
+│ (this session)   │
+└──────────────────┘
+```
+
+**為什麼分兩個 port**（歷史 + 角色不同）：
+
+| Port | Container | 角色 | 誰打 |
+|---|---|---|---|
+| **1904** | `mailbox-bridge` (Python) | **Inbound**：Discord 把使用者 DM 推這裡 → bridge INSERT mailbox SQLite | Discord bot（自動）|
+| **1901** | `discordBot` (node-red) | **Outbound**：agent 推這裡 → node-red 包成 Discord message 送出。也兼跑其他 node-red flow（YouTube response 等）| Agent（手動 POST）|
+
+**Agent 視角只需懂兩件事**：
+- 收信：watcher 自動，從 SQLite 拿，**不用知道 1904** 存在
+- 送信給 user Discord：直接打 `POST :1901/agent-notify`
+
+1904 是「使用者 → mailbox」這一段的內部實作細節，agent 永遠不會主動連 1904。寫進 README 是讓 ops 知道整套部署有哪些容器，不是給 agent 操作用的。
+
+**為什麼不合併成一個 port**：
+- 1904 的 Python bridge daemon 只做 1 件事（SQLite INSERT）— 簡單、獨立可重啟
+- 1901 的 node-red 跑了多個 flow（agent-notify、YouTube、其他通知），加 Discord inbound 進 node-red 也行但 flow 會臃腫
+- 早期決策保留至今；可以合併但 ROI 低
+
+> **TL;DR for new agents**：你只 care **mailbox** (SQLite, 從 watcher 看到) + **1901** (POST `agent-notify` 送 DM)。**1904 跟你無關**，就是 Discord 把 user 訊息塞進 mailbox 的後門。
 
 ---
 
@@ -138,7 +192,7 @@ mcp__mailbox__mark_read(ids=[123, 124])
 
 ## Bridge / 周邊工具
 
-- `mailbox-discord-bridge.py` — Docker container `mailbox-bridge`（port 1904）。**單向**：Discord DM → mailbox INSERT。反向走 node-red `agent-notify`（見上面情境 B）
+- `mailbox-discord-bridge.py` — Docker container `mailbox-bridge`（port 1904）。**Inbound only**：Discord DM → mailbox INSERT。Agent **不直接 call** 這個 port，是 Discord bot 自動推進來。看完整 e2e 流程圖：[Discord 整合：兩個 port，分工不對稱](#discord-整合兩個-port分工不對稱)
 - `mailbox-dump.py` — 撈 mailbox 歷史；wiki session 有 slash command `/mblog` 跟 `/觀看紀錄` 包好
 - `mailbox-whitelist.py` — Discord 來源信任名單 CLI（trusted / approved / pending），see [discord-stranger-chat](https://github.com/OHIMEOPP/discord-stranger-chat) 設計
 
