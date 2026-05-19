@@ -294,6 +294,90 @@ import re
 ALLOW_DENY_RE = re.compile(r'^(allow|deny)\s+(\S+)\s*$', re.IGNORECASE)
 
 
+def process_discord_inbound(content, author, author_id, channel, to_name_hint, db_path):
+    """Shared handler for a Discord-sourced message.
+
+    Called by:
+    - HTTP /from-discord webhook (legacy path, posted by node-red flow)
+    - discord.py on_message handler (direct gateway, 2026-05-19+)
+
+    Returns (status_code, response_dict) so HTTP handler can serialize, and
+    discord.py side can log + decide whether to ack.
+    """
+    content = (content or '').strip()
+    if not content:
+        return (400, {'ok': False, 'error': 'empty_content'})
+
+    author = author or 'discord-user'
+    is_trusted = author.lower() == TRUSTED_USER
+    to_name = to_name_hint or 'wiki'
+
+    # === Stranger gate ===
+    if not is_trusted:
+        if _is_whitelisted(author):
+            to_name = 'stranger-conv'
+        else:
+            pid = _queue_pending(author, content, author_id, channel)
+            sys.stdout.write(f"[bridge] stranger DM queued pending #{pid} from {author!r} "
+                             f"(id={author_id} ch={channel}): {content[:80]!r}\n")
+            _notify_stranger_pending(author, content)
+            return (202, {'ok': True, 'pending': pid, 'note': 'awaiting approval'})
+
+    # === Trusted-user inline commands (allow/deny) ===
+    if is_trusted:
+        m = ALLOW_DENY_RE.match(content)
+        if m:
+            action, target = m.group(1).lower(), m.group(2)
+            if action == 'allow':
+                count, err = _approve_user(target, db_path)
+            else:
+                count, err = _deny_user(target)
+            sys.stdout.write(f"[bridge] cmd {action} {target} -> count={count} err={err}\n")
+            _notify_command_result(action, target, count, err)
+            return (200, {'ok': err is None, 'cmd': action, 'target': target,
+                          'count': count, 'error': err})
+
+    # === Trusted-user @prefix routing override ===
+    if is_trusted:
+        for prefix in ('@koatag-frontend ', '@koatag ', '@stranger-conv '):
+            if content.lower().startswith(prefix.lower()):
+                to_name = prefix[1:-1]
+                content = content[len(prefix):]
+                break
+
+    # === Build from_name ===
+    if to_name == 'stranger-conv' and channel:
+        from_name = f'user-discord ({author}) ch={channel}'
+    elif author != 'discord-user':
+        from_name = f'user-discord ({author})'
+    else:
+        from_name = 'user-discord'
+
+    # === INSERT ===
+    try:
+        conn = sqlite3.connect(db_path)
+        cur = conn.execute(
+            'INSERT INTO messages (from_name, to_name, body) VALUES (?, ?, ?)',
+            (from_name, to_name, content),
+        )
+        mid = cur.lastrowid
+        conn.commit()
+        conn.close()
+    except sqlite3.Error as e:
+        return (500, {'ok': False, 'error': f'db: {e}'})
+
+    sys.stdout.write(f"[bridge] msg #{mid} {from_name} -> {to_name} "
+                     f"(ch={channel}): {content[:80]!r}\n")
+
+    # === Offline detection ===
+    if not _agent_recently_active(db_path, to_name, OFFLINE_THRESHOLD_SECONDS):
+        sys.stdout.write(f"[bridge] {to_name} appears offline "
+                         f"(>{OFFLINE_THRESHOLD_SECONDS}s), notifying user\n")
+        _notify_offline(mid, to_name)
+
+    return (200, {'ok': True, 'id': mid, 'to': to_name})
+
+
 def _format_notify_message(agent, task, status, detail):
     """Format payload identically to node-red /agent-notify flow.
     Discord renders:
@@ -405,93 +489,19 @@ def make_handler(db_path):
             if self.path != '/from-discord':
                 return self._json(404, {'ok': False, 'error': 'unknown_path'})
             try:
-                length = int(self.headers.get('Content-Length', 0))
-                raw = self.rfile.read(length).decode('utf-8')
-                body = json.loads(raw)
+                body = self._read_json_body()
             except Exception as e:
                 return self._json(400, {'ok': False, 'error': f'parse_fail: {e}'})
 
-            content = (body.get('content') or '').strip()
-            if not content:
-                return self._json(400, {'ok': False, 'error': 'empty_content'})
-
-            author = body.get('author') or 'discord-user'
-            author_id = body.get('author_id') or None  # Phase 3: stable across username changes
-            channel = body.get('channel') or ''        # Discord DM channel id (needed for replies)
-            is_trusted = author.lower() == TRUSTED_USER
-            to_name = body.get('to_name') or 'wiki'
-
-            # === Stranger gate: anyone except TRUSTED_USER goes through whitelist ===
-            if not is_trusted:
-                if _is_whitelisted(author):
-                    # Approved — route to stranger-conv (override any to_name + ignore @prefix
-                    # so strangers can't spoof routing to wiki / koatag / koatag-frontend)
-                    to_name = 'stranger-conv'
-                else:
-                    # Not approved — queue in pending table, notify wiki, do NOT write mailbox
-                    pid = _queue_pending(author, content, author_id, channel)
-                    sys.stdout.write(f"[bridge] stranger DM queued pending #{pid} from {author!r} (id={author_id} ch={channel}): {content[:80]!r}\n")
-                    _notify_stranger_pending(author, content)
-                    return self._json(202, {'ok': True, 'pending': pid, 'note': 'awaiting approval'})
-
-            # === Trusted-user inline commands (intercept before mailbox write) ===
-            # `allow <username>` / `deny <username>` from TRUSTED → run whitelist action,
-            # ack via Discord, DO NOT write to mailbox.
-            if is_trusted:
-                m = ALLOW_DENY_RE.match(content)
-                if m:
-                    action, target = m.group(1).lower(), m.group(2)
-                    if action == 'allow':
-                        count, err = _approve_user(target, db_path)
-                    else:
-                        count, err = _deny_user(target)
-                    sys.stdout.write(f"[bridge] cmd {action} {target} → count={count} err={err}\n")
-                    _notify_command_result(action, target, count, err)
-                    return self._json(200, {
-                        'ok': err is None, 'cmd': action, 'target': target,
-                        'count': count, 'error': err,
-                    })
-
-            # === Trusted-user @prefix routing override ===
-            # Only honored for TRUSTED_USER; strangers' @prefix is ignored above.
-            if is_trusted:
-                for prefix in ('@koatag-frontend ', '@koatag ', '@stranger-conv '):
-                    if content.lower().startswith(prefix.lower()):
-                        to_name = prefix[1:-1]
-                        content = content[len(prefix):]
-                        break
-
-            # Stranger-conv replies need to know the Discord channel to send back to.
-            # Embed it in from_name as "user-discord (X) ch=12345" so the receiving agent
-            # can parse it without a DB lookup. Trusted user (you, ohimeopp) replies via
-            # wiki always go to the hardcoded user-DM channel, so no need to embed there.
-            if to_name == 'stranger-conv' and channel:
-                from_name = f'user-discord ({author}) ch={channel}'
-            elif author != 'discord-user':
-                from_name = f'user-discord ({author})'
-            else:
-                from_name = 'user-discord'
-
-            try:
-                conn = sqlite3.connect(db_path)
-                cur = conn.execute(
-                    'INSERT INTO messages (from_name, to_name, body) VALUES (?, ?, ?)',
-                    (from_name, to_name, content),
-                )
-                mid = cur.lastrowid
-                conn.commit()
-                conn.close()
-            except sqlite3.Error as e:
-                return self._json(500, {'ok': False, 'error': f'db: {e}'})
-
-            sys.stdout.write(f"[bridge] msg #{mid} {from_name} -> {to_name} (ch={channel}): {content[:80]!r}\n")
-
-            # Offline-detection: if target agent hasn't read mail recently, notify Discord
-            if not _agent_recently_active(db_path, to_name, OFFLINE_THRESHOLD_SECONDS):
-                sys.stdout.write(f"[bridge] {to_name} appears offline (>{OFFLINE_THRESHOLD_SECONDS}s), notifying user\n")
-                _notify_offline(mid, to_name)
-
-            return self._json(200, {'ok': True, 'id': mid, 'to': to_name})
+            status, resp = process_discord_inbound(
+                content=body.get('content'),
+                author=body.get('author'),
+                author_id=body.get('author_id'),
+                channel=body.get('channel') or '',
+                to_name_hint=body.get('to_name'),
+                db_path=db_path,
+            )
+            return self._json(status, resp)
 
         def do_GET(self):
             if self.path == '/healthz':
@@ -501,6 +511,64 @@ def make_handler(db_path):
     return Handler
 
 
+def _start_discord_gateway(db_path):
+    """Run a discord.py client in a daemon thread; on_message DMs feed
+    process_discord_inbound(). Requires DISCORD_BOT_TOKEN and message_content
+    intent enabled in the Discord developer portal for the bot. The node-red
+    gateway must be disconnected — Discord enforces single-gateway-per-token.
+    """
+    try:
+        import discord  # noqa: F401
+    except ImportError:
+        sys.stdout.write("[bridge] discord.py not installed; gateway inbound disabled\n")
+        return False
+    if not DISCORD_BOT_TOKEN:
+        sys.stdout.write("[bridge] DISCORD_BOT_TOKEN unset; gateway inbound disabled\n")
+        return False
+
+    import threading
+
+    def _run():
+        import discord
+        intents = discord.Intents.default()
+        intents.message_content = True
+        intents.dm_messages = True
+
+        class Bot(discord.Client):
+            async def on_ready(self):
+                sys.stdout.write(f"[bridge] discord gateway online as {self.user} "
+                                 f"(id={self.user.id})\n")
+
+            async def on_message(self, message):
+                if message.author.id == self.user.id:
+                    return  # ignore self
+                # Only DMs; ignore guild channels
+                if not isinstance(message.channel, discord.DMChannel):
+                    return
+                status, resp = process_discord_inbound(
+                    content=message.content,
+                    author=message.author.name,
+                    author_id=str(message.author.id),
+                    channel=str(message.channel.id),
+                    to_name_hint=None,
+                    db_path=db_path,
+                )
+                if status >= 400:
+                    sys.stdout.write(f"[bridge] gateway on_message handled with status "
+                                     f"{status}: {resp}\n")
+
+        try:
+            bot = Bot(intents=intents)
+            bot.run(DISCORD_BOT_TOKEN, log_handler=None)
+        except Exception as e:
+            sys.stdout.write(f"[bridge] discord gateway crashed: "
+                             f"{type(e).__name__}: {e}\n")
+
+    t = threading.Thread(target=_run, name="discord-gateway", daemon=True)
+    t.start()
+    return True
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--port', type=int, default=DEFAULT_PORT)
@@ -508,11 +576,16 @@ def main():
     p.add_argument('--bind', default='0.0.0.0',
                    help="bind addr; 0.0.0.0 lets Docker reach via host.docker.internal "
                         "(127.0.0.1 only would block container)")
+    p.add_argument('--no-gateway', action='store_true',
+                   help="disable discord.py gateway client even if token + lib present")
     args = p.parse_args()
 
     if not os.path.exists(args.db):
         sys.stderr.write(f"[bridge] FATAL: mailbox db not found: {args.db}\n")
         return 1
+
+    if not args.no_gateway:
+        _start_discord_gateway(args.db)
 
     handler = make_handler(args.db)
     srv = HTTPServer((args.bind, args.port), handler)
