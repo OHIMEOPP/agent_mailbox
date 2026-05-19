@@ -1,14 +1,10 @@
-# Mailbox infra docker-compose (lives in claude-mailbox repo — canonical home).
-#
-# Currently only the bridge runs as a container. The MCP server and watcher
-# are per-Claude-session subprocesses (no daemon). Adding more components
-# (e.g. a future stand-alone Discord listener replacing node-red) belongs
-# in this file.
+# Discord bridge service. Lives entirely in claude-mailbox/bridge/ since
+# 2026-05-19 — Python package + .env + compose all colocated.
 #
 # Reads `.env` next to this file. See `.env.example` for required vars.
 #
-# Apply changes:
-#   cd C:/Users/User/Desktop/VSCcode/claude-mailbox
+# Apply changes (cwd must be this directory so .env is auto-loaded):
+#   cd C:/Users/User/Desktop/VSCcode/claude-mailbox/bridge
 #   docker compose up -d                          # start
 #   docker compose up -d --force-recreate         # apply config / .env changes
 #   docker compose down                           # stop
@@ -41,9 +37,9 @@ services:
       # Cache pip downloads in mounted volume so container recreate doesn't re-fetch.
       - PIP_CACHE_DIR=/data/.pip-cache
     volumes:
-      # bridge package mounted read-only at /app/bridge (run via `python -m bridge`).
-      # Host edits propagate on container restart.
-      - ./bridge:/app/bridge:ro
+      # This directory IS the bridge package — mount it at /app/bridge so
+      # `python -m bridge` can import it. Host edits propagate on restart.
+      - .:/app/bridge:ro
       # mount the ENTIRE mailbox directory (not just .db) — SQLite WAL mode needs
       # .db + .db-wal + .db-shm visible together to avoid split-brain
       - C:/Users/User/.claude/mailbox:/data
