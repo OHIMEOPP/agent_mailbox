@@ -144,18 +144,53 @@ mcp__mailbox__mark_read(ids=[123, 124])
 
 ---
 
-## 安裝（新裝置首次設定）
+## 新裝置首次設定（fresh device bootstrap）
 
-需要 [uv](https://docs.astral.sh/uv/) — Python script 用 PEP 723 內嵌依賴宣告，`uv run` 自動裝 `mcp` 套件。
+> 這個 repo 是 mailbox 的 canonical home，但 Claude harness 規定某些檔必須放在
+> `~/.claude/` 才會自動載入。所以 first-time setup 需要兩面：clone repo 到 dev
+> 目錄 + 把 snapshot 內的 `~/.claude/` 鏡像安裝到新機器對應位置。
+
+### Step 1 — 安裝 `uv` + clone repo + 建 DB 目錄
+
+需要 [uv](https://docs.astral.sh/uv/)（Python script 用 PEP 723 內嵌依賴宣告，`uv run` 自動裝 `mcp` 套件，不需 pip install / venv）。
 
 ```bash
 git clone https://github.com/OHIMEOPP/agent_mailbox.git C:/Users/User/Desktop/VSCcode/claude-mailbox
-mkdir -p C:/Users/User/.claude/mailbox    # DB 目錄
+mkdir -p C:/Users/User/.claude/mailbox
 ```
 
-不需 pip install，不需 venv。
+### Step 2 — 安裝 `~/.claude/CLAUDE.md` 的 mailbox 段
 
-### 註冊 MCP 到 Claude Code
+```bash
+# 把 snapshot 內容追加到 user-level CLAUDE.md（如果該檔不存在，先 create 空檔）
+cat C:/Users/User/Desktop/VSCcode/claude-mailbox/snapshot/global-claude-md-mailbox-section.md >> C:/Users/User/.claude/CLAUDE.md
+```
+
+或手動：開 `snapshot/global-claude-md-mailbox-section.md`，把「## Mailbox 通訊」段複製進 `~/.claude/CLAUDE.md`。內容會指 agent 來讀本 README 的 cold-start checklist。
+
+### Step 3 — 安裝 memory files（per-project，可選）
+
+如果新裝置上跑 wiki / koatag 等專案，把對應 memory snapshot 複製進該專案的 memory dir：
+
+```bash
+# 例：life_wiki project 的 memory 路徑（projectId 是專案絕對路徑換 - 編碼後）
+PROJECT_ID="C--Users-User-Desktop-VSCcode-life-wiki"
+MEMORY_DIR="C:/Users/User/.claude/projects/$PROJECT_ID/memory"
+mkdir -p "$MEMORY_DIR"
+cp snapshot/memory-*.md "$MEMORY_DIR/"
+# 改名拿掉 "memory-" prefix：
+cd "$MEMORY_DIR" && for f in memory-*.md; do mv "$f" "${f#memory-}"; done
+```
+
+memory 是 reference + feedback 行為紀律，agent 看了會知道：
+- watcher 死了該怎麼判斷 / 重啟（`feedback_watcher_always_on.md`）
+- agent-notify schema 是 `task/detail` 不是 `message`（`feedback_notify_schema.md`）
+- Discord DM 推送格式 + 何時打不該打（`reference_agent_discord_notify.md`）
+- watcher script 完整技術文檔（`reference_mailbox_watcher.md`）
+
+沒裝 memory 也能跑（README cold-start checklist 涵蓋核心情境），但裝了 agent 對邊角 case 反應會更準。
+
+### Step 4 — 註冊 MCP 到 Claude Code
 
 每個專案各自設定，給自己一個獨特名稱：
 
@@ -177,9 +212,31 @@ mkdir -p C:/Users/User/.claude/mailbox    # DB 目錄
 
 或 CLI：`claude mcp add mailbox --scope project -e CLAUDE_MAILBOX_NAME=wiki -- uv run "<path>/server.py"`
 
-### Bridge container（Discord 整合需要）
+### Step 5 — Bridge container（Discord 整合需要）
 
-`discordBot` 跟 `mailbox-bridge` 兩個 container 起來，bridge 會 mount 此 repo 的 `mailbox-discord-bridge.py`。看 `discordBot/docker-compose.yml`。
+如果新裝置要接 Discord（agent ↔ user DM / stranger chat），起 `discordBot` 跟 `mailbox-bridge` 兩個 container：
+
+```bash
+git clone <discordBot repo> C:/Users/User/Desktop/VSCcode/discordBot
+cd C:/Users/User/Desktop/VSCcode/discordBot
+docker compose up -d
+```
+
+`mailbox-bridge` container mount 本 repo 的 `mailbox-discord-bridge.py`（看 `docker-compose.yml` volumes 段路徑要對得上你的 clone 位置）。
+
+### Step 6 — 驗證
+
+開 Claude Code session 進有 `.mcp.json` 的 project → 看到 `mcp__mailbox__*` 工具 → README 的 🚀 Cold-start checklist 跑情境 A 起 watcher → 自我寄一封 test mail 驗證 stream 觸發。
+
+```python
+import sqlite3, datetime
+db = sqlite3.connect(r'C:\Users\User\.claude\mailbox\mailbox.db')
+db.execute('INSERT INTO messages(from_name,to_name,body,sent_at) VALUES(?,?,?,?)',
+    ('self-test', '<NAME>', 'first ping', datetime.datetime.now(datetime.UTC).isoformat().replace('+00:00','Z')))
+db.commit()
+```
+
+Monitor 任務應在 5s 內 print `MAIL id=... from=self-test ...`。沒看到 → watcher 沒跑 / DB path 設錯，看 [Debug](#除錯)。
 
 ---
 
