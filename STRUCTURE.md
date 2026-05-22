@@ -70,7 +70,7 @@ claude-mailbox/                        25+ Python files at repo root
 **Counts** (as of head `b1b2cdc`):
 - 3 entry-point scripts (server.py / mailbox-server.py / mailbox-watch.py)
 - 9 shared modules (`mailbox_*.py` — importable, underscore-named)
-- 11 admin / CLI tools (`mailbox-*.py` + `bootstrap-spoke.py`)
+- 11 admin / CLI tools (`mailbox-*.py` + `tools/bootstrap-spoke.py`)
 - 14 smoke test files (`smoke_test_*.py`)
 - = **37 Python files at root**
 
@@ -156,7 +156,7 @@ Plus the `import mailbox_audit` → `from mailbox import audit` (or
 
 ### 2. CLI invocation paths in user docs + memory
 README / SETUP-CROSS-DEVICE / morning briefing / catalogue page all cite
-CLI paths like `py mailbox-retention.py --once`. Renaming to
+CLI paths like `py tools/mailbox-retention.py --once`. Renaming to
 `py tools/retention.py --once` requires updating ~20+ doc mentions and
 the user's memory of "the file is called X". Less critical for the
 short-form CLI tools because relative paths don't break, but the user's
@@ -193,7 +193,7 @@ until all in-flight commits are landed.
    - Create `tools/` dir
    - `git mv mailbox-*.py tools/` (rename to drop `mailbox-` prefix)
    - `git mv bootstrap-spoke.py tools/bootstrap-spoke.py`
-   - Update `mailbox-discord-file.py` import paths if any (none expected)
+   - Update `tools/mailbox-discord-file.py` import paths if any (none expected)
    - Update SETUP-CROSS-DEVICE.md / README.md to cite new paths
    - Update memory references in life_wiki where applicable
 

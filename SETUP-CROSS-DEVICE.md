@@ -485,17 +485,17 @@ mcp__mailbox__download(attachment_id=N, save_to="C:/tmp/snapshot.zip")
 
 ### CLI tool (no MCP)
 
-`mailbox-attach.py` — shell equivalent of `send(files=[...])`. Posts multipart to hub `/send-file`.
+`tools/mailbox-attach.py` — shell equivalent of `send(files=[...])`. Posts multipart to hub `/send-file`.
 
 ```powershell
-py mailbox-attach.py --from wiki@DESKTOP-ABC --to wiki@LAPTOP-XYZ `
+py tools/mailbox-attach.py --from wiki@DESKTOP-ABC --to wiki@LAPTOP-XYZ `
     --body "config snapshot" --files C:/cfg/foo.json C:/cfg/bar.toml `
     --hub http://192.168.1.10:1905 --token <bearer>
 ```
 
 `--hub` / `--token` fall back to `CLAUDE_MAILBOX_REMOTE` / `CLAUDE_MAILBOX_TOKEN` env vars.
 
-> Don't confuse with `mailbox-discord-file.py` — that one pushes to Discord DM via the `:1904` bridge. `mailbox-attach.py` is peer ↔ peer mailbox over the `:1905` cross-device server.
+> Don't confuse with `tools/mailbox-discord-file.py` — that one pushes to Discord DM via the `:1904` bridge. `tools/mailbox-attach.py` is peer ↔ peer mailbox over the `:1905` cross-device server.
 
 ### Watcher behavior
 
@@ -513,7 +513,7 @@ The protocol takes individual files, not directories. For folder transfer, zip f
 
 ```powershell
 Compress-Archive -Path C:/wiki -DestinationPath C:/tmp/wiki.zip
-py mailbox-attach.py --from wiki@hub --to wiki@laptop --body "wiki snapshot" --files C:/tmp/wiki.zip
+py tools/mailbox-attach.py --from wiki@hub --to wiki@laptop --body "wiki snapshot" --files C:/tmp/wiki.zip
 ```
 
 This is intentional — mailbox is a message queue with attachments, not a sync engine. For ongoing folder sync use Syncthing / Tailscale Drive instead.
@@ -523,7 +523,7 @@ This is intentional — mailbox is a message queue with attachments, not a sync 
 | Symptom | Cause | Fix |
 |---|---|---|
 | 413 on `/send-file` | exceeded MAX_SINGLE_FILE (100 MB) or MAX_TOTAL_PAYLOAD (500 MB) | split into multiple messages, or bump constants + restart server |
-| 400 "multipart parse failed" | client sent malformed multipart (boundary mismatch, missing `\r\n`) | use `mailbox-attach.py` or MCP `send(files=...)` — both use proven encoders |
+| 400 "multipart parse failed" | client sent malformed multipart (boundary mismatch, missing `\r\n`) | use `tools/mailbox-attach.py` or MCP `send(files=...)` — both use proven encoders |
 | Spoke watcher fires MAIL but no `attach=N` | spoke is on old `mailbox-watch.py` (pre-2026-05-23) | `git pull` mailbox repo on spoke, restart Monitor; SSE payload is backwards-compatible so old watcher still works, just doesn't print the tag |
 | `download()` returns sha256 mismatch error | network corruption mid-transfer (rare on LAN, possible over Tailscale on lossy link) | retry — server verifies file on disk has the original hash before serving |
 | Blob file missing on `/attachment/<id>` (500) | someone deleted from `<dir>/attachments/` manually | rare; investigate before re-sending. Server logs the path |
@@ -601,24 +601,24 @@ MAILBOX_RETENTION_UNREAD_DAYS=7
 
 Then `docker compose up -d --force-recreate mailbox-server`.
 
-### Manual CLI (`mailbox-retention.py`)
+### Manual CLI (`tools/mailbox-retention.py`)
 
 Lives in the repo root. Operates directly on the SQLite DB (server doesn't need to be running):
 
 ```powershell
-py mailbox-retention.py --stats
+py tools/mailbox-retention.py --stats
 # db / attachments dir / counts / oldest message age
 
-py mailbox-retention.py --dry-run
+py tools/mailbox-retention.py --dry-run
 # [sweep] DRY-RUN: would have deleted N read / N unread / ... — no writes
 
-py mailbox-retention.py --once
+py tools/mailbox-retention.py --once
 # [sweep] deleted N read / N unread / ... — does the sweep
 
-py mailbox-retention.py --once --read-days 3 --unread-days 7
+py tools/mailbox-retention.py --once --read-days 3 --unread-days 7
 # override retention windows for this run only
 
-py mailbox-retention.py --stats --json
+py tools/mailbox-retention.py --stats --json
 # machine-readable output for piping into other tools
 ```
 
@@ -646,7 +646,7 @@ curl http://<HUB_IP>:1905/health
 
 ### What's NOT swept
 
-- **Pinned messages**: no such feature. If you need to keep something forever, dump to wiki via `mailbox-dump.py` before TTL.
+- **Pinned messages**: no such feature. If you need to keep something forever, dump to wiki via `tools/mailbox-dump.py` before TTL.
 - **WAL files**: server uses `journal_mode=DELETE` — nothing accumulates there.
 - **Pip cache** (bridge container at `/data/.pip-cache`): tiny, ignored. Manually `rm -rf` if you really want.
 
@@ -697,27 +697,27 @@ MAILBOX_BACKUP_KEEP_DAILY=14
 
 Then `docker compose up -d --force-recreate mailbox-server`.
 
-### Manual CLI (`mailbox-backup.py`)
+### Manual CLI (`tools/mailbox-backup.py`)
 
 Lives in the repo root. Operates directly on the SQLite DB + attachments dir (server doesn't need to be running — the online backup API is concurrent-safe):
 
 ```powershell
-py mailbox-backup.py --stats
+py tools/mailbox-backup.py --stats
 # last_backup_at / backup_count / total bytes
 
-py mailbox-backup.py --list
+py tools/mailbox-backup.py --list
 # all snapshots, newest first, with db / tar / total sizes
 
-py mailbox-backup.py --once
+py tools/mailbox-backup.py --once
 # take one backup + rolling prune now
 
-py mailbox-backup.py --restore 20260523-020000
+py tools/mailbox-backup.py --restore 20260523-020000
 # DRY-RUN — prints what it would do, exits 2
 
-py mailbox-backup.py --restore 20260523-020000 --yes
+py tools/mailbox-backup.py --restore 20260523-020000 --yes
 # actually overwrites live data (after moving current state to .before-restore-<now>)
 
-py mailbox-backup.py --list --json
+py tools/mailbox-backup.py --list --json
 # machine-readable; same shape for --stats / --once / --restore with --json
 ```
 
@@ -778,12 +778,12 @@ docker logs mailbox-server | grep backup
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| Backup dir not created on disk | hub didn't reach the 1hr grace yet, or `MAILBOX_BACKUP_DISABLED=1` | wait 1hr after server boot, or check env; run `py mailbox-backup.py --once` to create manually |
-| `--restore` succeeds but `attach=N` rows still show 0 in `/health` | the snapshot itself had no attachments at backup time | verify with `py mailbox-backup.py --list` — `attachments` column == 0 means tarball wasn't generated |
+| Backup dir not created on disk | hub didn't reach the 1hr grace yet, or `MAILBOX_BACKUP_DISABLED=1` | wait 1hr after server boot, or check env; run `py tools/mailbox-backup.py --once` to create manually |
+| `--restore` succeeds but `attach=N` rows still show 0 in `/health` | the snapshot itself had no attachments at backup time | verify with `py tools/mailbox-backup.py --list` — `attachments` column == 0 means tarball wasn't generated |
 | `[backup] FAILED: OperationalError: database is locked` | another writer holds an exclusive lock (rare; SQLite online backup is supposed to handle this) | retry; if persistent, check for stuck `mailbox-discord-bridge` process or `.db-journal` leftover |
-| Restore failed with `db backup not found` | timestamp typo or backup already pruned | `py mailbox-backup.py --list` to see available timestamps |
+| Restore failed with `db backup not found` | timestamp typo or backup already pruned | `py tools/mailbox-backup.py --list` to see available timestamps |
 | `/health` shows `last_backup_at` but pruning never happens | only 1-2 backups exist; nothing to prune yet | retention triggers only when more than `KEEP_DAILY+KEEP_WEEKLY+KEEP_MONTHLY` snapshots exist with the right time spread |
-| Backup dir growing past expected size | `KEEP_*` env vars set too high, or db growing on its own | check `py mailbox-backup.py --stats`; lower `MAILBOX_BACKUP_KEEP_DAILY` if needed |
+| Backup dir growing past expected size | `KEEP_*` env vars set too high, or db growing on its own | check `py tools/mailbox-backup.py --stats`; lower `MAILBOX_BACKUP_KEEP_DAILY` if needed |
 
 ### What's NOT backed up
 
@@ -846,19 +846,19 @@ Authorization: Bearer <token>
 
 `limit` hard-capped at 500 to prevent giant dumps. Paginate older history with `since=<last-ts-from-previous-page>`. `asc=1` to reverse order.
 
-### Manual CLI (`mailbox-audit.py`)
+### Manual CLI (`tools/mailbox-audit.py`)
 
 Hub-only. Operates directly on the SQLite DB:
 
 ```powershell
-py mailbox-audit.py --tail
+py tools/mailbox-audit.py --tail
 # default — last 50 rows, newest first
 
-py mailbox-audit.py --tail --limit 200 --since 24h
+py tools/mailbox-audit.py --tail --limit 200 --since 24h
 
-py mailbox-audit.py --tail --actor wiki --action send --json
+py tools/mailbox-audit.py --tail --actor wiki --action send --json
 
-py mailbox-audit.py --stats
+py tools/mailbox-audit.py --stats
 # audit_count + first_at + last_at + by_action breakdown
 ```
 
@@ -967,10 +967,10 @@ curl http://<HUB_IP>:1905/health
 
 ### CLI surface
 
-No new CLI — `mailbox-retention.py` already operates on the new sweep logic transparently. The `--stats` output gains the two new `ttl_*` counters automatically:
+No new CLI — `tools/mailbox-retention.py` already operates on the new sweep logic transparently. The `--stats` output gains the two new `ttl_*` counters automatically:
 
 ```powershell
-py mailbox-retention.py --stats --json
+py tools/mailbox-retention.py --stats --json
 # {..., "ttl_expiring_24h": 5, "ttl_expired_pending_sweep": 2}
 ```
 
@@ -986,7 +986,7 @@ py mailbox-retention.py --stats --json
 | Symptom | Cause | Fix |
 |---|---|---|
 | `send()` with `expires_at="1h"` succeeds but the message lives forever | Hub-mode and you're on an old hub that doesn't recognize `expires_at` | `git pull` + restart `mailbox-server.py` on hub; check `/health` shows `ttl_expiring_24h` field |
-| Message expired but still in inbox | Sweep hasn't run yet. Grace period is up to 24hr by design | Run `py mailbox-retention.py --once` manually for immediate sweep |
+| Message expired but still in inbox | Sweep hasn't run yet. Grace period is up to 24hr by design | Run `py tools/mailbox-retention.py --once` manually for immediate sweep |
 | `ttl_expired_pending_sweep` grows without bound | Sweep daemon stopped | check `last_sweep_at` in `/health` — if stale, see Phase 5 troubleshooting |
 | `expires_at` returned as `null` from inbox even though sent with TTL | Wire format issue; check that the REST `/send` payload was actually serialized with the field | inspect server logs; the audit log row's `payload_json` shows what was received |
 | Want to clear TTL on a sent message | Not supported — TTL is at send-time only | re-send with no `expires_at` (different message id) |
@@ -1081,26 +1081,26 @@ X-Mailbox-Delivery-Id: <int>
 |---|---|---|
 | `MAILBOX_WEBHOOKS_DISABLED` | (unset) | `1` = daemon idle; CLI still works |
 
-### Manual CLI (`mailbox-webhooks.py`)
+### Manual CLI (`tools/mailbox-webhooks.py`)
 
 Hub-only. Operates directly on the DB:
 
 ```powershell
-py mailbox-webhooks.py --add my-slack --url https://hooks.slack.com/...
+py tools/mailbox-webhooks.py --add my-slack --url https://hooks.slack.com/...
 # Returns the generated secret_hmac — record it; receiver needs it to verify.
 
-py mailbox-webhooks.py --add koatag-only \
+py tools/mailbox-webhooks.py --add koatag-only \
     --url http://internal.example.com/hook \
     --to-glob 'koatag*' --from-glob 'wiki'
 
-py mailbox-webhooks.py --list
-py mailbox-webhooks.py --list --show-secret   # dangerous, default masks it
-py mailbox-webhooks.py --tail-deliveries --status failed --limit 10
-py mailbox-webhooks.py --stats
-py mailbox-webhooks.py --deactivate 3
-py mailbox-webhooks.py --delete 3            # cascades deliveries
+py tools/mailbox-webhooks.py --list
+py tools/mailbox-webhooks.py --list --show-secret   # dangerous, default masks it
+py tools/mailbox-webhooks.py --tail-deliveries --status failed --limit 10
+py tools/mailbox-webhooks.py --stats
+py tools/mailbox-webhooks.py --deactivate 3
+py tools/mailbox-webhooks.py --delete 3            # cascades deliveries
 
-py mailbox-webhooks.py --test 3              # run one delivery cycle now
+py tools/mailbox-webhooks.py --test 3              # run one delivery cycle now
                                               # useful after fixing a failed receiver
 ```
 
@@ -1160,7 +1160,7 @@ curl http://<HUB_IP>:1905/health
 |---|---|---|
 | Webhook registered, no deliveries | `MAILBOX_WEBHOOKS_DISABLED=1` set; daemon idle | `unset` the env; restart server |
 | `webhook_pending_deliveries` grows unboundedly | Daemon dead OR all webhook URLs dead | `--tail-deliveries --status failed` shows last_error per row |
-| Receiver gets 0 POSTs after registration but DB has new messages | Filter glob excludes them | `py mailbox-webhooks.py --list` shows the glob; widen or null it |
+| Receiver gets 0 POSTs after registration but DB has new messages | Filter glob excludes them | `py tools/mailbox-webhooks.py --list` shows the glob; widen or null it |
 | HMAC verify fails on receiver | Wrong secret stored client-side OR body modified by intermediate proxy | re-fetch secret via `--list --show-secret`; rule out proxy rewrite |
 | `last_error: HTTP 500` after many attempts | Receiver crashed | fix receiver, then `--test <id>` to re-fire (creates a new tick, but failed rows stay failed; new messages trigger new deliveries) |
 | Message stays "pending" forever, attempts=0 | Daemon thread never started (server log will show no `[webhook] daemon start` line) | check for early exception in main() — usually a missing dependency. Restart with stderr captured. |
@@ -1168,7 +1168,7 @@ curl http://<HUB_IP>:1905/health
 
 ### What's NOT installed on the spoke
 
-Webhooks live entirely on the hub. Spokes never write to the webhook tables and have no daemon. The admin CLI `mailbox-webhooks.py` is hub-only.
+Webhooks live entirely on the hub. Spokes never write to the webhook tables and have no daemon. The admin CLI `tools/mailbox-webhooks.py` is hub-only.
 
 ---
 
@@ -1343,21 +1343,21 @@ CREATE TABLE rate_limit_buckets (
 
 Pure SQLite — no in-memory hot path. Restart-safe; the bucket counts persist.
 
-### Manual CLI (`mailbox-rate-limit.py`)
+### Manual CLI (`tools/mailbox-rate-limit.py`)
 
 Hub-only:
 
 ```powershell
-py mailbox-rate-limit.py --stats
+py tools/mailbox-rate-limit.py --stats
 # active scopes (last 5min), buckets total, current limit, disabled flag
 
-py mailbox-rate-limit.py --top --limit 20
+py tools/mailbox-rate-limit.py --top --limit 20
 # top 20 scopes by recent traffic — find the loud ones
 
-py mailbox-rate-limit.py --reset from:wiki
+py tools/mailbox-rate-limit.py --reset from:wiki
 # wipe one scope's buckets — manual override after fixing client
 
-py mailbox-rate-limit.py --prune
+py tools/mailbox-rate-limit.py --prune
 # delete buckets older than 1 hour
 ```
 
@@ -1407,13 +1407,13 @@ curl http://<HUB_IP>:1905/health
 You do **not** need on the laptop:
 - `mailbox-server.py` (hub-only — only the writer runs this)
 - `mailbox-bridge` (Discord container — hub-only)
-- `mailbox-followup.py` (admin tool — hub-only)
-- `mailbox-whitelist.py` (admin tool — hub-only)
-- `mailbox-retention.py` (hub-only — operates on hub's DB; spoke has no local DB)
-- `mailbox-backup.py` (hub-only — same reason as retention)
-- `mailbox-audit.py` (hub-only — spoke has no local audit table)
-- `mailbox-webhooks.py` (hub-only — webhook daemon + tables live on the hub)
-- `mailbox-rate-limit.py` (hub-only — rate-limit buckets live on the hub)
+- `tools/mailbox-followup.py` (admin tool — hub-only)
+- `tools/mailbox-whitelist.py` (admin tool — hub-only)
+- `tools/mailbox-retention.py` (hub-only — operates on hub's DB; spoke has no local DB)
+- `tools/mailbox-backup.py` (hub-only — same reason as retention)
+- `tools/mailbox-audit.py` (hub-only — spoke has no local audit table)
+- `tools/mailbox-webhooks.py` (hub-only — webhook daemon + tables live on the hub)
+- `tools/mailbox-rate-limit.py` (hub-only — rate-limit buckets live on the hub)
 
 Just `server.py` (MCP, with REMOTE env) + `mailbox-watch.py` (SSE client).
 That's it.
