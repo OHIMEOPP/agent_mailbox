@@ -90,10 +90,12 @@ services:
       - MAILBOX_BACKUP_KEEP_MONTHLY=${MAILBOX_BACKUP_KEEP_MONTHLY:-3}
       - MAILBOX_BACKUP_DISABLED=${MAILBOX_BACKUP_DISABLED:-}
     volumes:
-      # mount the script + sweep/backup modules (sibling) read-only
+      # mount the entry-point script + the shared `mailbox/` package (one
+      # dir mount covers audit/backup/migrations/priority/rate_limit/
+      # reactions/scheduled/sweep/webhooks — post-2026-05-23 reorg into
+      # mailbox/ package; previously these were N individual mounts)
       - ../mailbox-server.py:/app/mailbox-server.py:ro
-      - ../mailbox_sweep.py:/app/mailbox_sweep.py:ro
-      - ../mailbox_backup.py:/app/mailbox_backup.py:ro
+      - ../mailbox:/app/mailbox:ro
       # share the SAME mailbox dir as mailbox-bridge so both hit the same db
       # (backup dir defaults to /data/backups → host ~/.claude/mailbox/backups)
       - C:/Users/User/.claude/mailbox:/data
