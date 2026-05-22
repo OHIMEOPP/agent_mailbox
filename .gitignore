@@ -9,3 +9,10 @@ __pycache__/
 
 # Secrets — never commit. Template is .env.example.
 .env
+
+# Per-machine MCP config — path differs per checkout location.
+# Template is .mcp.example.json (see comment inside).
+.mcp.json
+
+# Claude Code per-project harness state.
+.claude/
