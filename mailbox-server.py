@@ -48,6 +48,7 @@ import urllib.parse
 import mailbox_audit
 import mailbox_backup
 import mailbox_migrations
+import mailbox_rate_limit
 import mailbox_reactions
 import mailbox_scheduled
 import mailbox_sweep
@@ -171,6 +172,8 @@ def db_init(path: pathlib.Path):
     mailbox_reactions.init_schema(path)
     # Scheduled-send queue: separate table, independent DDL.
     mailbox_scheduled.init_schema(path)
+    # Rate-limit buckets: separate table, independent DDL.
+    mailbox_rate_limit.init_schema(path)
 
 
 def _init_fts(path: pathlib.Path):
@@ -352,6 +355,41 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return False
         return auth[7:].strip() == self.server.token
 
+    def _rate_limit_check(self, scope_key: str, endpoint: str) -> bool:
+        """Pre-flight rate limit check. Returns False + sends 429 + audits
+        the rejection if scope is over budget. Caller must `return` immediately
+        on False.
+
+        Always increments the counter (even on reject) — see module docstring.
+        """
+        srv = self.server
+        allowed, info = mailbox_rate_limit.check_and_consume(
+            srv.db_path, scope_key,
+        )
+        if allowed:
+            return True
+        # Reject with 429
+        mailbox_audit.log_event(
+            srv.db_path, actor=scope_key, action="rate_limit_rejected",
+            target=endpoint,
+            payload={
+                "effective_count": info["effective_count"],
+                "limit": info["limit"],
+                "retry_after": info["retry_after_seconds"],
+            },
+            ok=False,
+        )
+        self._send(429, "application/json", json.dumps({
+            "error": "rate limit exceeded",
+            "scope": scope_key,
+            "limit_per_min": info["limit"],
+            "effective_count": info["effective_count"],
+            "retry_after_seconds": info["retry_after_seconds"],
+        }, ensure_ascii=False).encode("utf-8"),
+            extra_headers={"Retry-After": str(info["retry_after_seconds"])},
+        )
+        return False
+
     def _read_body_json(self):
         length = int(self.headers.get("Content-Length", "0"))
         if length == 0:
@@ -404,6 +442,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # Migration head — operator visibility ("am I on latest schema?")
             migration_stats = mailbox_migrations.stats(srv.db_path)
             payload.update(migration_stats)
+            # Merge rate-limit stats — active scopes / total buckets / limit
+            rl_stats = mailbox_rate_limit.stats(srv.db_path)
+            payload.update(rl_stats)
             return self._json(200, payload)
 
         if not self._check_auth():
@@ -415,6 +456,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             name = first("name").strip()
             if not name:
                 return self._json(400, {"error": "missing name"})
+            if not self._rate_limit_check(f"name:{name}", "/inbox"):
+                return  # 429 sent
             unread_only = first("unread", "1") in ("1", "true", "yes")
             limit = int(first("limit", "50"))
             sql = ("SELECT id, from_name, to_name, body, sent_at, read_at, has_attachments, "
@@ -517,6 +560,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             for k in ("from", "to", "body"):
                 if k not in payload or not isinstance(payload[k], str):
                     return self._json(400, {"error": f"missing or non-string field: {k}"})
+            if not self._rate_limit_check(f"from:{payload['from']}", "/send"):
+                return
             in_reply_to = payload.get("in_reply_to")
             if in_reply_to is not None and not isinstance(in_reply_to, int):
                 return self._json(400, {"error": "in_reply_to must be integer or null"})
@@ -642,6 +687,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._json(400, {"error": "ids must be list[int]"})
             if not ids:
                 return self._json(200, {"count": 0})
+            if not self._rate_limit_check(
+                f"ip:{self.client_address[0]}", "/mark_read",
+            ):
+                return
             placeholders = ",".join("?" for _ in ids)
             conn = db_connect(srv.db_path)
             try:
@@ -668,6 +717,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._json(400, {"error": "actor + emoji must be strings"})
             if not isinstance(payload["message_id"], int):
                 return self._json(400, {"error": "message_id must be int"})
+            if not self._rate_limit_check(f"from:{payload['actor']}", "/react"):
+                return
             try:
                 result = mailbox_reactions.react(
                     srv.db_path, payload["message_id"],
@@ -690,6 +741,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._json(400, {"error": "actor + emoji must be strings"})
             if not isinstance(payload["message_id"], int):
                 return self._json(400, {"error": "message_id must be int"})
+            if not self._rate_limit_check(f"from:{payload['actor']}", "/unreact"):
+                return
             removed = mailbox_reactions.unreact(
                 srv.db_path, payload["message_id"],
                 payload["actor"], payload["emoji"],
@@ -739,6 +792,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         for k in ("from", "to", "body"):
             if k not in payload or not isinstance(payload[k], str):
                 return self._json(400, {"error": f"payload missing or non-string: {k}"})
+        if not self._rate_limit_check(f"from:{payload['from']}", "/send-file"):
+            return
         in_reply_to = payload.get("in_reply_to")
         if in_reply_to is not None and not isinstance(in_reply_to, int):
             return self._json(400, {"error": "in_reply_to must be integer or null"})

@@ -35,6 +35,7 @@ ACTIONS = frozenset({
     "search",     # FTS5 full-text search (added 2026-05-23 by wiki/FTS5)
     "react",      # add a reaction (emoji) to a message
     "unreact",    # remove a reaction
+    "rate_limit_rejected",  # request denied by rate limiter (429)
 })
 
 DEFAULT_TAIL_LIMIT = 50

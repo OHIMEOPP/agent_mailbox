@@ -509,6 +509,45 @@ mcp__mailbox__unreact(message_id=123, emoji="✅") # 撤回
 
 **Emoji** 是 TEXT 1..32 chars freeform — 慣例是單個 emoji（`👍` `🔥` `👀` `✅`），但短文字標籤（`"ack"`、`"todo"`）也可，client 自由。
 
+## Rate limiting（自 2026-05-23）
+
+Hub-side sliding window per-scope，防 runaway agent / 暴衝。預設 **120 requests/min per scope**。Scope 由 endpoint 決定：
+
+| Endpoint | Scope key |
+|---|---|
+| `/send`, `/send-file` | `from:<payload.from>` |
+| `/react`, `/unreact` | `from:<payload.actor>` |
+| `/inbox` | `name:<query.name>` |
+| `/mark_read` | `ip:<client-ip>` |
+
+超過 → HTTP **429** + `Retry-After` header + JSON `{error, scope, limit_per_min, effective_count, retry_after_seconds}`，並寫 audit (`action=rate_limit_rejected`, `ok=0`)。
+
+**Env vars**：
+
+| Var | Default | Purpose |
+|---|---|---|
+| `MAILBOX_RATE_LIMIT_PER_MIN` | 120 | 上限 (sliding window) |
+| `MAILBOX_RATE_LIMIT_DISABLED` | (unset) | `1` = always allow（dev / debug） |
+
+**Sliding window** 採 2-bucket 設計：current + previous minute，previous bucket 按剩餘秒數 pro-rate (避免 minute-boundary 處驟降)。
+
+**Storage**：`rate_limit_buckets(scope_key, minute_bucket, count, last_request_at)` — small + indexed + prunable。
+
+**手動 CLI**：
+```bash
+py mailbox-rate-limit.py --stats        # 全局 stats
+py mailbox-rate-limit.py --top          # 5-min 最忙 20 scopes
+py mailbox-rate-limit.py --reset from:wiki   # 重設某 scope
+py mailbox-rate-limit.py --prune        # 砍 >1hr 老 bucket
+```
+
+**`/health` 多 4 欄**：`rate_limit_limit_per_min`、`rate_limit_disabled`、`rate_limit_active_scopes`、`rate_limit_buckets_total`。
+
+**已知限制 / 未來**：
+- IP scope 在 reverse-proxy 後是 proxy IP — 真正源頭需要 `X-Forwarded-For` parsing（沒做）
+- 沒分 endpoint quota — 同 scope 跨所有 endpoint 共用同 limit
+- buckets 沒自動接 retention sweep — 需要手動 `--prune` 或之後加進 mailbox_sweep
+
 ## Bridge / 周邊工具
 
 - `mailbox-discord-bridge.py` — Docker container `mailbox-bridge`（port 1904）。**Inbound only**：Discord DM → mailbox INSERT。Agent **不直接 call** 這個 port，是 Discord bot 自動推進來。看完整 e2e 流程圖：[Discord 整合：兩個 port，分工不對稱](#discord-整合兩個-port分工不對稱)
@@ -518,6 +557,7 @@ mcp__mailbox__unreact(message_id=123, emoji="✅") # 撤回
 - `mailbox-backup.py` — CLI，手動打 backup / list / restore / stats（hub-only）
 - `mailbox-audit.py` — CLI，tail / filter / stats audit log（hub-only）
 - `mailbox-webhooks.py` — CLI，register/list/delete/tail outbound webhooks（hub-only）
+- `mailbox-rate-limit.py` — CLI，stats/top/reset/prune rate-limit buckets（hub-only）
 - `mailbox-dump.py` — 撈 mailbox 歷史；wiki session 有 slash command `/mblog` 跟 `/觀看紀錄` 包好
 - `mailbox-whitelist.py` — Discord 來源信任名單 CLI（trusted / approved / pending），see [discord-stranger-chat](https://github.com/OHIMEOPP/discord-stranger-chat) 設計
 

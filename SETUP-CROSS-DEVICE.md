@@ -1272,6 +1272,136 @@ curl http://<HUB_IP>:1905/health
 
 ---
 
+## Phase 11 — Rate limiting (since 2026-05-23)
+
+Sliding-window per-scope rate limit on write/read endpoints. Defends against runaway agents and accidental spammy loops; not a security boundary (auth still required).
+
+### Defaults
+
+- 120 requests/minute per scope (≈ 2/s sustained, bursty up to ~60 in a 30s window)
+- Override: `MAILBOX_RATE_LIMIT_PER_MIN` env
+- Kill-switch: `MAILBOX_RATE_LIMIT_DISABLED=1`
+
+### Scope per endpoint
+
+| Endpoint | Scope key |
+|---|---|
+| `/send`, `/send-file` | `from:<payload.from>` |
+| `/react`, `/unreact` | `from:<payload.actor>` |
+| `/inbox` | `name:<query.name>` |
+| `/mark_read` | `ip:<client-ip>` |
+
+Endpoints NOT rate-limited: `/health` (monitoring), `/audit` (forensics, admin-only), `/peers` (read-only metadata), `/watch` (SSE long-poll holds one connection), `/attachment/<id>` (download), `/search` (assumed low frequency — revisit if proven wrong).
+
+### Sliding window algorithm
+
+```
+now              = current wall-clock time
+current_bucket   = floor(now / 60)
+previous_bucket  = current_bucket - 1
+elapsed_frac     = (now % 60) / 60
+prev_weight      = 1 - elapsed_frac
+
+effective_count = count[current] + count[previous] * prev_weight
+
+allow if effective_count <= limit
+```
+
+This smooths the minute boundary (no sudden drop from 60→0 at :00:00).
+
+### Behavior on reject
+
+```
+HTTP/1.1 429 Too Many Requests
+Content-Type: application/json
+Retry-After: 33
+
+{
+  "error": "rate limit exceeded",
+  "scope": "from:wiki",
+  "limit_per_min": 120,
+  "effective_count": 121.4,
+  "retry_after_seconds": 33
+}
+```
+
+Rejection also writes an audit row: `action=rate_limit_rejected, actor=<scope>, target=<endpoint>, ok=0, payload={effective_count, limit, retry_after}`. Use `mailbox-audit.py --action rate_limit_rejected --since 1h` to find offenders.
+
+The counter increments even on rejection — a tight spam loop keeps adding to its own deficit. This is deliberate.
+
+### Schema
+
+```sql
+CREATE TABLE rate_limit_buckets (
+    scope_key       TEXT NOT NULL,
+    minute_bucket   INTEGER NOT NULL,    -- floor(epoch / 60)
+    count           INTEGER NOT NULL DEFAULT 0,
+    last_request_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    PRIMARY KEY (scope_key, minute_bucket)
+);
+```
+
+Pure SQLite — no in-memory hot path. Restart-safe; the bucket counts persist.
+
+### Manual CLI (`mailbox-rate-limit.py`)
+
+Hub-only:
+
+```powershell
+py mailbox-rate-limit.py --stats
+# active scopes (last 5min), buckets total, current limit, disabled flag
+
+py mailbox-rate-limit.py --top --limit 20
+# top 20 scopes by recent traffic — find the loud ones
+
+py mailbox-rate-limit.py --reset from:wiki
+# wipe one scope's buckets — manual override after fixing client
+
+py mailbox-rate-limit.py --prune
+# delete buckets older than 1 hour
+```
+
+### /health observability
+
+```bash
+curl http://<HUB_IP>:1905/health
+# {
+#   ...
+#   "rate_limit_limit_per_min": 120,
+#   "rate_limit_disabled": false,
+#   "rate_limit_active_scopes": 4,
+#   "rate_limit_buckets_total": 47
+# }
+```
+
+`rate_limit_active_scopes` counts scopes that have hit at least one bucket in the last 5 minutes. Operator sanity check.
+
+### Tuning guidance
+
+- Default 120/min is generous — typical agent traffic is < 10/min per scope.
+- Drop to 30 if you want to be tight against accidental loops.
+- Raise to 600+ if you have a programmatic ingest pipeline; pair with explicit token-based scoping.
+- Don't disable entirely without a replacement — server is open to LAN/VPN, the auth token alone doesn't stop a misbehaving spoke.
+
+### What this is NOT
+
+- **Not a security boundary**: receiver-only auth (bearer token) is still the gate. Rate limit just constrains otherwise-authenticated traffic.
+- **Not adaptive**: no AI-flavored anomaly detection. Fixed limit + sliding window. Predictable.
+- **Not per-endpoint quota**: all rate-limited endpoints share the same limit per scope. A single scope sending 60 `/send` + 60 `/inbox` in a minute hits the cap.
+- **Not aware of X-Forwarded-For**: `ip:` scope uses TCP peer IP, so a reverse proxy sees one collective scope. Set up proper auth scoping (`from:` / `name:`) instead of relying on IP.
+
+### Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Agent loop suddenly hangs and gets 429s | Hit the rate limit | `mailbox-audit.py --actor from:<name> --action rate_limit_rejected --since 5m` shows when + how many; pause the agent or `--reset` after fixing |
+| 429s on `/inbox` from a single spoke | Spoke's `mailbox-watch.py` polling too aggressively, or duplicate watchers | Stop one watcher; if poll-rate is correct, raise `MAILBOX_RATE_LIMIT_PER_MIN` for that environment |
+| All endpoints suddenly allow even abusive traffic | `MAILBOX_RATE_LIMIT_DISABLED=1` set somewhere | check `docker compose config` for env; review server start banner |
+| `--top` shows a scope with high count but no audit entries for `rate_limit_rejected` | Scope is busy but under the limit — that's fine | nothing to fix |
+| `rate_limit_buckets` table growing | Old buckets aren't auto-pruned | run `mailbox-rate-limit.py --prune` weekly, or add prune call to your daily ops |
+
+---
+
 ## What is NOT installed on the spoke
 
 You do **not** need on the laptop:
@@ -1283,6 +1413,7 @@ You do **not** need on the laptop:
 - `mailbox-backup.py` (hub-only — same reason as retention)
 - `mailbox-audit.py` (hub-only — spoke has no local audit table)
 - `mailbox-webhooks.py` (hub-only — webhook daemon + tables live on the hub)
+- `mailbox-rate-limit.py` (hub-only — rate-limit buckets live on the hub)
 
 Just `server.py` (MCP, with REMOTE env) + `mailbox-watch.py` (SSE client).
 That's it.
