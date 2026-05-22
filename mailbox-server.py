@@ -47,6 +47,7 @@ import urllib.parse
 
 from mailbox import audit as mailbox_audit
 from mailbox import backup as mailbox_backup
+from mailbox import forward as mailbox_forward
 from mailbox import migrations as mailbox_migrations
 from mailbox import pinned as mailbox_pinned
 from mailbox import priority as mailbox_priority
@@ -139,7 +140,8 @@ def db_init(path: pathlib.Path):
             claimed_until TEXT,
             priority INTEGER NOT NULL DEFAULT 0,
             pinned INTEGER NOT NULL DEFAULT 0,
-            snoozed_until TEXT
+            snoozed_until TEXT,
+            forwarded_from_msg_id INTEGER
         );
         CREATE INDEX IF NOT EXISTS idx_to_unread
             ON messages(to_name, read_at);
@@ -475,6 +477,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # Snooze counters
             snooze_stats = mailbox_snoozed.stats(srv.db_path)
             payload.update(snooze_stats)
+            # Forward counters
+            fwd_stats = mailbox_forward.stats(srv.db_path)
+            payload.update(fwd_stats)
             return self._json(200, payload)
 
         if not self._check_auth():
@@ -894,6 +899,36 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 srv.db_path, actor=payload["actor"], action="unsnooze",
                 target=str(payload["message_id"]),
                 payload={"was_snoozed": result["was_snoozed"]},
+            )
+            return self._json(200, result)
+
+        if path == "/forward":
+            for k in ("actor", "message_id", "to"):
+                if k not in payload:
+                    return self._json(400, {"error": f"missing field: {k}"})
+            if not isinstance(payload["actor"], str) or not isinstance(payload["to"], str):
+                return self._json(400, {"error": "actor + to must be strings"})
+            if not isinstance(payload["message_id"], int):
+                return self._json(400, {"error": "message_id must be int"})
+            note = payload.get("note")
+            if note is not None and not isinstance(note, str):
+                return self._json(400, {"error": "note must be string or null"})
+            if not self._rate_limit_check(f"from:{payload['actor']}", "/forward"):
+                return
+            try:
+                result = mailbox_forward.forward(
+                    srv.db_path, payload["message_id"],
+                    forwarder=payload["actor"], to_name=payload["to"],
+                    note=note,
+                )
+            except FileNotFoundError as e:
+                return self._json(404, {"error": str(e)})
+            mailbox_audit.log_event(
+                srv.db_path, actor=payload["actor"], action="forward",
+                target=payload["to"],
+                payload={"new_msg_id": result["id"],
+                         "forwarded_from_msg_id": payload["message_id"],
+                         "had_note": bool(note)},
             )
             return self._json(200, result)
 

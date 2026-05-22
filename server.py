@@ -31,6 +31,7 @@ import urllib.request
 from pathlib import Path
 
 from mailbox import audit as mailbox_audit
+from mailbox import forward as mailbox_forward
 from mailbox import migrations as mailbox_migrations
 from mailbox import pinned as mailbox_pinned
 from mailbox import priority as mailbox_priority
@@ -203,7 +204,8 @@ def _init_db() -> None:
                 in_reply_to INTEGER,
                 priority INTEGER NOT NULL DEFAULT 0,
                 pinned INTEGER NOT NULL DEFAULT 0,
-                snoozed_until TEXT
+                snoozed_until TEXT,
+                forwarded_from_msg_id INTEGER
             );
             CREATE INDEX IF NOT EXISTS idx_messages_to_unread
                 ON messages(to_name, read_at);
@@ -1139,6 +1141,47 @@ def unsnooze(message_id: int) -> dict:
     mailbox_audit.log_event(
         DB_PATH, actor=NAME, action="unsnooze", target=str(message_id),
         payload={"was_snoozed": result["was_snoozed"]},
+    )
+    return result
+
+
+@mcp.tool()
+def forward(message_id: int, to: str, note: str | None = None) -> dict:
+    """Forward an existing message to another recipient with attribution preserved.
+
+    Different from a reply (in_reply_to keeps the original recipient as the
+    conversation root); forward branches off to a new audience. The new
+    message's body is the original body prefixed with a forward header
+    (`>>> forwarded from <orig.from> (msg #N) <ts>`) plus your optional note.
+
+    Args:
+        message_id: id of message to forward
+        to: new recipient name (literal — no glob fanout in this version)
+        note: optional prefix added before the forward header
+
+    Returns:
+        {id, sent_at, forwarded_from_msg_id, forwarded_to, forwarded_by,
+         inherited_priority}.
+    """
+    if REMOTE:
+        body_payload: dict = {
+            "actor": NAME, "message_id": message_id, "to": to,
+        }
+        if note:
+            body_payload["note"] = note
+        r = _remote("POST", "/forward", body_payload)
+        return r
+    try:
+        result = mailbox_forward.forward(
+            DB_PATH, message_id, forwarder=NAME, to_name=to, note=note,
+        )
+    except FileNotFoundError as e:
+        raise RuntimeError(str(e))
+    mailbox_audit.log_event(
+        DB_PATH, actor=NAME, action="forward", target=to,
+        payload={"new_msg_id": result["id"],
+                 "forwarded_from_msg_id": message_id,
+                 "had_note": bool(note)},
     )
     return result
 

@@ -40,6 +40,7 @@ ACTIONS = frozenset({
     "unpin",      # remove pin
     "snooze",     # hide message from inbox until wake_at time
     "unsnooze",   # remove snooze immediately
+    "forward",    # forward an existing message to another recipient
 })
 
 DEFAULT_TAIL_LIMIT = 50

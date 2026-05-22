@@ -171,6 +171,23 @@ def _migration_v007_snoozed(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migration_v008_forwarded(conn: sqlite3.Connection) -> None:
+    """messages.forwarded_from_msg_id + partial index.
+
+    Added 2026-05-23 forward feature. Points at the source message id (no
+    FK — source can be retention-pruned without breaking the forward; the
+    forward keeps the original body baked in via header so the info isn't
+    lost). Partial index supports dump --tree chain rendering.
+    """
+    if "forwarded_from_msg_id" not in _messages_columns(conn):
+        conn.execute("ALTER TABLE messages ADD COLUMN forwarded_from_msg_id INTEGER")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_messages_forwarded_from "
+        "ON messages(forwarded_from_msg_id) "
+        "WHERE forwarded_from_msg_id IS NOT NULL"
+    )
+
+
 # Canonical migration list. Append only; never re-order or delete.
 # `version` must be sequential starting from 1.
 MIGRATIONS: list[tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
@@ -181,6 +198,7 @@ MIGRATIONS: list[tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (5, "messages_priority_with_partial_index", _migration_v005_priority),
     (6, "messages_pinned_with_partial_index", _migration_v006_pinned),
     (7, "messages_snoozed_until_with_partial_index", _migration_v007_snoozed),
+    (8, "messages_forwarded_from_msg_id_with_partial_index", _migration_v008_forwarded),
 ]
 
 
