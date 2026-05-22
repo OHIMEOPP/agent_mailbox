@@ -88,6 +88,47 @@ def _has_in_reply_to(conn: sqlite3.Connection) -> bool:
     return "in_reply_to" in cols
 
 
+def _fetch_audit_for_msgs(conn: sqlite3.Connection, msg_ids: list[int]) -> list:
+    """Return audit_log rows referencing any of the given message ids.
+
+    Matches either:
+      - audit_log.target = str(msg_id)   (some actions stamp the id directly)
+      - JSON LIKE '%"msg_id": <id>%' or '%"scheduled_id": <id>%' (payload-embedded)
+
+    Returns ordered by ts ASC. Empty if audit_log table absent (pre-2026-05-23
+    schema) or msg_ids empty.
+    """
+    if not msg_ids or not conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='audit_log'"
+    ).fetchone():
+        return []
+    # Build OR conditions
+    target_in = ",".join("?" * len(msg_ids))
+    target_args = [str(i) for i in msg_ids]
+    payload_like = " OR ".join(
+        ['payload_json LIKE ?' for _ in msg_ids]
+    )
+    payload_args = [f'%"msg_id": {i}%' for i in msg_ids]
+    sql = (
+        f"SELECT ts, actor, action, target, payload_json, ok FROM audit_log "
+        f"WHERE target IN ({target_in}) OR {payload_like} "
+        f"ORDER BY ts ASC, id ASC"
+    )
+    return list(conn.execute(sql, target_args + payload_args).fetchall())
+
+
+def _render_audit_trail(rows: list) -> None:
+    if not rows:
+        return
+    print()
+    print(f"== Audit trail ({len(rows)} entries) ==")
+    for r in rows:
+        ts, actor, action, target, payload_json, ok = r
+        ok_marker = "" if ok else "  ✗"
+        target_str = f" → {target}" if target else ""
+        print(f"  📜 {ts}  {actor:<20} {action:<14}{target_str}{ok_marker}")
+
+
 def _fetch_scheduled_pending(conn: sqlite3.Connection, peer: str | None) -> list:
     """Return pending (not delivered, not cancelled) scheduled_messages rows.
     Optionally filter by peer (sender OR recipient).
@@ -265,6 +306,10 @@ def main() -> int:
     p.add_argument('--include-scheduled', action='store_true',
                    help='append a "Pending scheduled deliveries" section listing '
                         'scheduled_messages rows not yet delivered (peer filter applies)')
+    p.add_argument('--audit-trail', action='store_true',
+                   help='append a "Audit trail" section showing audit_log entries '
+                        'referencing any of the rendered message ids '
+                        '(send / inbox / react / mark_read / etc.)')
     p.add_argument('--db', default=DB, help='path to mailbox SQLite db')
     args = p.parse_args()
 
@@ -321,6 +366,15 @@ def main() -> int:
             conn3.close()
         _render_scheduled_pending(sched_rows)
 
+    # Optional audit-trail footer
+    if args.audit_trail:
+        conn4 = sqlite3.connect(args.db)
+        try:
+            audit_rows = _fetch_audit_for_msgs(conn4, [r[0] for r in rows])
+        finally:
+            conn4.close()
+        _render_audit_trail(audit_rows)
+
     filter_desc = []
     if args.peer:
         filter_desc.append(f"peer={args.peer}")
@@ -330,6 +384,8 @@ def main() -> int:
         filter_desc.append("tree")
     if args.include_scheduled:
         filter_desc.append("+scheduled")
+    if args.audit_trail:
+        filter_desc.append("+audit")
     suffix = f" ({', '.join(filter_desc)})" if filter_desc else ""
     print(f"\n[dump] {len(rows)} message(s) shown{suffix}")
     return 0

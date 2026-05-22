@@ -59,6 +59,15 @@ def main() -> int:
                 delivered_msg_id INTEGER,
                 cancelled_at TEXT
             );
+            CREATE TABLE audit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                actor TEXT NOT NULL,
+                action TEXT NOT NULL,
+                target TEXT,
+                payload_json TEXT,
+                ok INTEGER NOT NULL DEFAULT 1
+            );
         """)
 
         def insert(from_name, to_name, body, in_reply_to=None):
@@ -111,13 +120,37 @@ def main() -> int:
             "VALUES('alice', 'bob', 'cancelled', '2099-03-01T00:00:00Z', "
             "strftime('%Y-%m-%dT%H:%M:%fZ','now'))")
 
+        # Audit log entries — some referencing rendered messages, some unrelated
+        # m1 (id=1): send + 2 reacts
+        conn.execute(
+            "INSERT INTO audit_log(actor, action, target, payload_json, ok) "
+            "VALUES('alice', 'send', '1', '{\"msg_id\": 1, \"body_len\": 6}', 1)")
+        conn.execute(
+            "INSERT INTO audit_log(actor, action, target, payload_json, ok) "
+            "VALUES('bob', 'react', '1', '{\"msg_id\": 1, \"emoji\": \"❤\"}', 1)")
+        conn.execute(
+            "INSERT INTO audit_log(actor, action, target, payload_json, ok) "
+            "VALUES('carol', 'react', '1', '{\"msg_id\": 1, \"emoji\": \"👍\"}', 1)")
+        # m2 (id=2): send
+        conn.execute(
+            "INSERT INTO audit_log(actor, action, target, payload_json, ok) "
+            "VALUES('bob', 'send', '2', '{\"msg_id\": 2}', 1)")
+        # An unrelated audit entry (message id 999 not in rendered set) — should NOT appear
+        conn.execute(
+            "INSERT INTO audit_log(actor, action, target, payload_json, ok) "
+            "VALUES('zelda', 'send', '999', '{\"msg_id\": 999}', 1)")
+        # A failed entry on m1 (ok=0)
+        conn.execute(
+            "INSERT INTO audit_log(actor, action, target, payload_json, ok) "
+            "VALUES('eve', 'react', '1', '{\"msg_id\": 1, \"reason\": \"rate_limit\"}', 0)")
+
         conn.commit()
         conn.close()
 
-        # --- Run mailbox-dump.py --tree --include-scheduled ---
+        # --- Run mailbox-dump.py --tree --include-scheduled --audit-trail ---
         result = subprocess.run(
             [sys.executable, str(here / "mailbox-dump.py"),
-             "--db", str(db), "--tree", "--include-scheduled"],
+             "--db", str(db), "--tree", "--include-scheduled", "--audit-trail"],
             capture_output=True, text=True, encoding="utf-8",
             timeout=10,
         )
@@ -188,7 +221,20 @@ def main() -> int:
         print("[smoke] --include-scheduled pending footer ok "
               "(2 rendered, delivered+cancelled excluded)")
 
-        print(f"\n[smoke] ALL DUMP TREE TESTS PASSED ({6} messages, tree + 4 reactions + 2 scheduled verified)")
+        # Audit-trail footer assertions
+        assert "Audit trail" in out, "missing audit footer"
+        # 5 audit rows reference m1 (3) + m2 (1) + a failed one on m1 → 5 total
+        # Plus 0 for m3-m6 (no audit entries). 999 should NOT appear.
+        assert "📜" in out, "missing audit sigil"
+        # All 5 actions related to rendered msgs should be present
+        for actor in ["alice", "bob", "carol", "eve"]:
+            assert actor in out, f"audit entry by {actor} missing from output"
+        assert "zelda" not in out, "unrelated audit entry (zelda → msg 999) should NOT render"
+        # ok=0 entry should show with ✗ marker
+        assert "✗" in out, "failed audit entry should be marked ✗"
+        print("[smoke] --audit-trail footer ok (5 entries rendered, msg 999 excluded, ✗ on failure)")
+
+        print(f"\n[smoke] ALL DUMP TREE TESTS PASSED ({6} messages, tree + reactions + scheduled + audit verified)")
         return 0
     except AssertionError as e:
         print(f"\n[smoke] ASSERT FAIL: {e}", file=sys.stderr)
