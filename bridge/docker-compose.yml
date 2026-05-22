@@ -81,11 +81,21 @@ services:
       - MAILBOX_RETENTION_PEER_DAYS=${MAILBOX_RETENTION_PEER_DAYS:-30}
       # Kill-switch (set to 1 to disable auto-sweep; manual CLI sweep still works)
       - MAILBOX_RETENTION_DISABLED=${MAILBOX_RETENTION_DISABLED:-}
+      # Backup policy (runs BEFORE sweep on same 24hr tick + grace).
+      # Default backup dir derived from --db parent: /data/backups → host
+      # C:/Users/User/.claude/mailbox/backups
+      - MAILBOX_BACKUP_DIR=${MAILBOX_BACKUP_DIR:-}
+      - MAILBOX_BACKUP_KEEP_DAILY=${MAILBOX_BACKUP_KEEP_DAILY:-7}
+      - MAILBOX_BACKUP_KEEP_WEEKLY=${MAILBOX_BACKUP_KEEP_WEEKLY:-4}
+      - MAILBOX_BACKUP_KEEP_MONTHLY=${MAILBOX_BACKUP_KEEP_MONTHLY:-3}
+      - MAILBOX_BACKUP_DISABLED=${MAILBOX_BACKUP_DISABLED:-}
     volumes:
-      # mount the script + sweep module (sibling) read-only
+      # mount the script + sweep/backup modules (sibling) read-only
       - ../mailbox-server.py:/app/mailbox-server.py:ro
       - ../mailbox_sweep.py:/app/mailbox_sweep.py:ro
+      - ../mailbox_backup.py:/app/mailbox_backup.py:ro
       # share the SAME mailbox dir as mailbox-bridge so both hit the same db
+      # (backup dir defaults to /data/backups → host ~/.claude/mailbox/backups)
       - C:/Users/User/.claude/mailbox:/data
     working_dir: /app
     command:

@@ -44,6 +44,7 @@ import threading
 import time
 import urllib.parse
 
+import mailbox_backup
 import mailbox_sweep
 
 DEFAULT_PORT = 1905
@@ -58,9 +59,11 @@ MAX_FILES_PER_MSG = 32                 # sanity cap on count
 SWEEP_INTERVAL_SECONDS = 86400  # 24 hours
 SWEEP_GRACE_SECONDS = 3600      # delay first sweep by 1hr after boot
 
-# Mutable global tracking last sweep time / counters; read by /health JSON.
+# Mutable globals tracking last sweep / backup; read by /health JSON.
 LAST_SWEEP_AT: str | None = None
 LAST_SWEEP_COUNTERS: dict | None = None
+LAST_BACKUP_AT: str | None = None
+LAST_BACKUP_COUNTERS: dict | None = None
 
 
 def db_connect(path: pathlib.Path) -> sqlite3.Connection:
@@ -271,6 +274,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             payload = mailbox_sweep.stats(srv.db_path, srv.attachments_dir)
             payload["last_sweep_at"] = LAST_SWEEP_AT
             payload["last_sweep_counters"] = LAST_SWEEP_COUNTERS
+            # Merge backup stats if backup dir configured
+            if getattr(srv, "backup_dir", None) is not None:
+                bk_stats = mailbox_backup.stats(srv.backup_dir)
+                payload.update(bk_stats)
+                payload["last_backup_counters"] = LAST_BACKUP_COUNTERS
             return self._json(200, payload)
 
         if not self._check_auth():
@@ -624,11 +632,32 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 
 def _sweep_loop(db_path: pathlib.Path, attachments_dir: pathlib.Path,
-                read_days: int, unread_days: int, peer_days: int) -> None:
-    """Daemon thread: 1hr grace period, then sweep every 24hr."""
-    global LAST_SWEEP_AT, LAST_SWEEP_COUNTERS
+                read_days: int, unread_days: int, peer_days: int,
+                backup_dir: pathlib.Path | None,
+                keep_daily: int, keep_weekly: int, keep_monthly: int) -> None:
+    """Daemon thread: 1hr grace period, then backup→sweep every 24hr.
+
+    Order matters: backup FIRST (captures pre-sweep state), then sweep removes
+    old data. If a sweep ever turns out to be wrong, the last backup is still
+    the pre-sweep snapshot, recoverable.
+    """
+    global LAST_SWEEP_AT, LAST_SWEEP_COUNTERS, LAST_BACKUP_AT, LAST_BACKUP_COUNTERS
     time.sleep(SWEEP_GRACE_SECONDS)
     while True:
+        # --- Backup phase (if enabled) ---
+        if backup_dir is not None:
+            try:
+                bc = mailbox_backup.backup_once(
+                    db_path, attachments_dir, backup_dir,
+                    keep_daily=keep_daily, keep_weekly=keep_weekly, keep_monthly=keep_monthly,
+                )
+                LAST_BACKUP_AT = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                LAST_BACKUP_COUNTERS = bc
+                print(f"[backup] {mailbox_backup.format_summary(bc)}", file=sys.stderr)
+            except Exception as e:
+                print(f"[backup] FAILED: {type(e).__name__}: {e}", file=sys.stderr)
+
+        # --- Sweep phase ---
         try:
             counters = mailbox_sweep.sweep_all(
                 db_path, attachments_dir,
@@ -678,24 +707,57 @@ def main():
     unread_days = int(os.environ.get("MAILBOX_RETENTION_UNREAD_DAYS", mailbox_sweep.DEFAULT_UNREAD_DAYS))
     peer_days = int(os.environ.get("MAILBOX_RETENTION_PEER_DAYS", mailbox_sweep.DEFAULT_PEER_DAYS))
 
+    # Backup config — env vars; kill-switch disables backup half of daemon
+    # (sweep still runs without backup). Default backup dir = <db parent>/backups.
+    backup_disabled = os.environ.get("MAILBOX_BACKUP_DISABLED", "").strip() in ("1", "true", "yes")
+    backup_dir_env = os.environ.get("MAILBOX_BACKUP_DIR", "").strip()
+    if backup_dir_env:
+        backup_dir = pathlib.Path(backup_dir_env)
+    else:
+        backup_dir = args.db.parent / "backups"
+    keep_daily = int(os.environ.get("MAILBOX_BACKUP_KEEP_DAILY", mailbox_backup.DEFAULT_KEEP_DAILY))
+    keep_weekly = int(os.environ.get("MAILBOX_BACKUP_KEEP_WEEKLY", mailbox_backup.DEFAULT_KEEP_WEEKLY))
+    keep_monthly = int(os.environ.get("MAILBOX_BACKUP_KEEP_MONTHLY", mailbox_backup.DEFAULT_KEEP_MONTHLY))
+    if not backup_disabled:
+        backup_dir.mkdir(parents=True, exist_ok=True)
+
     httpd = http.server.ThreadingHTTPServer((args.host, args.port), Handler)
     httpd.token = token
     httpd.db_path = args.db
     httpd.attachments_dir = args.attachments_dir
+    httpd.backup_dir = backup_dir if not backup_disabled else None
     print(f"[mailbox-server] listening on http://{args.host}:{args.port}  db={args.db}",
           file=sys.stderr)
     print(f"[mailbox-server] attachments dir: {args.attachments_dir}", file=sys.stderr)
     print(f"[mailbox-server] bearer token: {token[:6]}... (length {len(token)})", file=sys.stderr)
+    if backup_disabled:
+        print("[mailbox-server] backup: DISABLED via MAILBOX_BACKUP_DISABLED", file=sys.stderr)
+    else:
+        print(f"[mailbox-server] backup: dir={backup_dir} keep={keep_daily}d/{keep_weekly}w/{keep_monthly}m",
+              file=sys.stderr)
     if retention_disabled:
         print("[mailbox-server] retention: DISABLED via MAILBOX_RETENTION_DISABLED", file=sys.stderr)
+        # Even if retention disabled, still spin up backup daemon if backup enabled
+        if not backup_disabled:
+            t = threading.Thread(
+                target=_sweep_loop,
+                args=(args.db, args.attachments_dir,
+                      365 * 100, 365 * 100, 365 * 100,  # effectively never-expire (sweep no-ops)
+                      backup_dir, keep_daily, keep_weekly, keep_monthly),
+                daemon=True,
+                name="mailbox-backup-only",
+            )
+            t.start()
     else:
         print(f"[mailbox-server] retention: read={read_days}d unread={unread_days}d peer={peer_days}d "
               f"interval={SWEEP_INTERVAL_SECONDS}s grace={SWEEP_GRACE_SECONDS}s", file=sys.stderr)
         t = threading.Thread(
             target=_sweep_loop,
-            args=(args.db, args.attachments_dir, read_days, unread_days, peer_days),
+            args=(args.db, args.attachments_dir, read_days, unread_days, peer_days,
+                  backup_dir if not backup_disabled else None,
+                  keep_daily, keep_weekly, keep_monthly),
             daemon=True,
-            name="mailbox-sweep",
+            name="mailbox-sweep-backup",
         )
         t.start()
 
