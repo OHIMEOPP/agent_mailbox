@@ -652,6 +652,147 @@ curl http://<HUB_IP>:1905/health
 
 ---
 
+## Phase 6 — Backup (since 2026-05-23)
+
+Retention sweep deletes; backup snapshots. The pair gives you: stable disk footprint **and** recoverability if a sweep or external corruption removes something you wanted back.
+
+### Defaults
+
+| Item | Method | Rationale |
+|---|---|---|
+| `mailbox.db` | SQLite online `.backup()` API | atomic, doesn't block live writers, captures consistent view |
+| `attachments/` | tar.gz of the entire directory | content-addressed blobs already dedup; tar preserves layout |
+| Rolling retention | 7 daily / 4 weekly / 3 monthly | keeps ~1 month deep history without unbounded growth |
+| Default location | `<db parent>/backups/` (= `~/.claude/mailbox/backups/` on hub) | siblings the DB it's backing up |
+| Naming | `mailbox-backup-YYYYMMDD-HHMMSS.db` + `-attachments.tar.gz` | UTC timestamp; pair shares the timestamp |
+
+### Backup daemon (hub-side, automatic)
+
+Same thread as the sweep daemon (Phase 5) — order is **backup first, then sweep**, so the most recent backup always reflects pre-sweep state. If a sweep ever turns out to be wrong, restoring the latest backup gets you back the data sweep just deleted.
+
+1. Wait **1 hour grace** (shared with sweep)
+2. Backup, logs `[backup] backed up db=XMB + attachments=YMB, pruned N old (ZMB freed)`
+3. Sweep, logs `[sweep] ...`
+4. Sleep **24 hours**
+5. Repeat
+
+State is in-memory only — `LAST_BACKUP_AT` and counters surface via `/health`.
+
+### Config (env vars)
+
+| Var | Default | Purpose |
+|---|---|---|
+| `MAILBOX_BACKUP_DIR` | `<db parent>/backups` | override output directory (e.g. external drive) |
+| `MAILBOX_BACKUP_DISABLED` | (unset) | set to `1` to skip auto-backup (sweep still runs; CLI still works) |
+| `MAILBOX_BACKUP_KEEP_DAILY` | 7 | rolling — newest-per-day buckets to keep |
+| `MAILBOX_BACKUP_KEEP_WEEKLY` | 4 | rolling — newest-per-ISO-week buckets to keep (additive) |
+| `MAILBOX_BACKUP_KEEP_MONTHLY` | 3 | rolling — newest-per-month buckets to keep (additive) |
+
+Wired into `bridge/docker-compose.yml` — override in `bridge/.env`:
+
+```env
+MAILBOX_BACKUP_DIR=/data/backups          # mount this as a docker volume
+MAILBOX_BACKUP_KEEP_DAILY=14
+```
+
+Then `docker compose up -d --force-recreate mailbox-server`.
+
+### Manual CLI (`mailbox-backup.py`)
+
+Lives in the repo root. Operates directly on the SQLite DB + attachments dir (server doesn't need to be running — the online backup API is concurrent-safe):
+
+```powershell
+py mailbox-backup.py --stats
+# last_backup_at / backup_count / total bytes
+
+py mailbox-backup.py --list
+# all snapshots, newest first, with db / tar / total sizes
+
+py mailbox-backup.py --once
+# take one backup + rolling prune now
+
+py mailbox-backup.py --restore 20260523-020000
+# DRY-RUN — prints what it would do, exits 2
+
+py mailbox-backup.py --restore 20260523-020000 --yes
+# actually overwrites live data (after moving current state to .before-restore-<now>)
+
+py mailbox-backup.py --list --json
+# machine-readable; same shape for --stats / --once / --restore with --json
+```
+
+The CLI uses `mailbox_backup` (importable module) — same code path as the daemon, so output matches.
+
+### Restore semantics
+
+`mailbox-backup.py --restore <timestamp> --yes`:
+
+1. Moves current `mailbox.db` → `mailbox.db.before-restore-<now>`
+2. Moves current `attachments/` → `attachments.before-restore-<now>`
+3. Copies `mailbox-backup-<timestamp>.db` into place
+4. Extracts `mailbox-backup-<timestamp>-attachments.tar.gz` into place (if it exists)
+
+If the restore turns out wrong, rollback is: rename `.before-restore-*` back to original. No state is destroyed by `--restore`.
+
+`<timestamp>` can be:
+- the bare `YYYYMMDD-HHMMSS` (from `--list`)
+- the full filename (`mailbox-backup-20260523-020000.db`) — CLI extracts the ts portion
+
+### /health observability
+
+```bash
+curl http://<HUB_IP>:1905/health
+# {
+#   ...
+#   "last_backup_at": "2026-05-22T22:00:11Z",
+#   "backup_count": 11,
+#   "backup_total_bytes": 14_280_192,
+#   "last_backup_counters": {
+#     "db_backup_path": "...",
+#     "db_backup_bytes": 524288,
+#     "attachments_tar_path": "...",
+#     "attachments_tar_bytes": 12345678,
+#     "backups_pruned": 0,
+#     "bytes_freed_pruning": 0
+#   }
+# }
+```
+
+`last_backup_at` is `null` until the first backup runs (1hr after server boot). Monitor for staleness > 25hr — that's a dead backup daemon.
+
+### Verify docker env-var disables auto-backup
+
+Manual check (smoke test #5 leaves this as a comment — would require spinning the container):
+
+```bash
+# In bridge/.env:
+MAILBOX_BACKUP_DISABLED=1
+
+docker compose up -d --force-recreate mailbox-server
+docker logs mailbox-server | grep backup
+# Expected: "[mailbox-server] backup: DISABLED via MAILBOX_BACKUP_DISABLED"
+# AND no "[backup] backed up ..." lines appear after the 1hr grace period
+```
+
+### Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Backup dir not created on disk | hub didn't reach the 1hr grace yet, or `MAILBOX_BACKUP_DISABLED=1` | wait 1hr after server boot, or check env; run `py mailbox-backup.py --once` to create manually |
+| `--restore` succeeds but `attach=N` rows still show 0 in `/health` | the snapshot itself had no attachments at backup time | verify with `py mailbox-backup.py --list` — `attachments` column == 0 means tarball wasn't generated |
+| `[backup] FAILED: OperationalError: database is locked` | another writer holds an exclusive lock (rare; SQLite online backup is supposed to handle this) | retry; if persistent, check for stuck `mailbox-discord-bridge` process or `.db-journal` leftover |
+| Restore failed with `db backup not found` | timestamp typo or backup already pruned | `py mailbox-backup.py --list` to see available timestamps |
+| `/health` shows `last_backup_at` but pruning never happens | only 1-2 backups exist; nothing to prune yet | retention triggers only when more than `KEEP_DAILY+KEEP_WEEKLY+KEEP_MONTHLY` snapshots exist with the right time spread |
+| Backup dir growing past expected size | `KEEP_*` env vars set too high, or db growing on its own | check `py mailbox-backup.py --stats`; lower `MAILBOX_BACKUP_KEEP_DAILY` if needed |
+
+### What's NOT backed up
+
+- **Memory state**: `LAST_SWEEP_AT`, `LAST_BACKUP_AT`, etc — these are stats only; rebuilt on next daemon tick.
+- **Token file** (`~/.claude/mailbox/token.txt`): backup it yourself if you care; not auto-managed.
+- **Config files** (`bridge/.env`, `docker-compose.yml`): tracked in git, not in the runtime backup.
+
+---
+
 ## What is NOT installed on the spoke
 
 You do **not** need on the laptop:
@@ -660,6 +801,7 @@ You do **not** need on the laptop:
 - `mailbox-followup.py` (admin tool — hub-only)
 - `mailbox-whitelist.py` (admin tool — hub-only)
 - `mailbox-retention.py` (hub-only — operates on hub's DB; spoke has no local DB)
+- `mailbox-backup.py` (hub-only — same reason as retention)
 
 Just `server.py` (MCP, with REMOTE env) + `mailbox-watch.py` (SSE client).
 That's it.

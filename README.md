@@ -311,12 +311,50 @@ py mailbox-retention.py --once       # 立即跑一次 sweep
 
 設定 / tuning 細節：[SETUP-CROSS-DEVICE.md Phase 5](SETUP-CROSS-DEVICE.md#phase-5--retention-since-2026-05-23)
 
+## 備份 / Backup（自 2026-05-23）
+
+Retention sweep 會刪舊資料；萬一刪錯、或 DB 被外部寫壞，要有 snapshot 可救回。Hub 端內建 daily backup daemon，**在 sweep 之前**先打 snapshot — 順序保證最近一份 backup 一定是 pre-sweep 狀態。
+
+| Item | 備份方式 | Filename |
+|---|---|---|
+| `mailbox.db` | SQLite online `.backup` API（atomic, 不擋 writer） | `mailbox-backup-YYYYMMDD-HHMMSS.db` |
+| `attachments/` | tar.gz | `mailbox-backup-YYYYMMDD-HHMMSS-attachments.tar.gz` |
+| Rolling retention | 7 daily + 4 weekly + 3 monthly | (auto-pruned per backup) |
+
+**自動**：跟 retention sweep daemon 共用 thread — backup → sweep → sleep 24hr。`MAILBOX_BACKUP_DISABLED=1` 關掉。
+
+**手動 CLI**：
+```bash
+py mailbox-backup.py --stats                     # last_backup_at / count / total bytes
+py mailbox-backup.py --list                      # 列現存 snapshot，新→舊
+py mailbox-backup.py --once                      # 立刻打一份 + rolling prune
+py mailbox-backup.py --restore 20260523-020000 --yes
+                                                  # 從 timestamp restore（會把現狀搬去 .before-restore-<now>）
+```
+
+**Env vars**：
+
+| Var | Default | Purpose |
+|---|---|---|
+| `MAILBOX_BACKUP_DIR` | `<db parent>/backups` | 改 backup 落地位置 |
+| `MAILBOX_BACKUP_DISABLED` | (unset) | `1` = 關掉 daemon（CLI 仍可用） |
+| `MAILBOX_BACKUP_KEEP_DAILY` | 7 | rolling — daily 保留幾份 |
+| `MAILBOX_BACKUP_KEEP_WEEKLY` | 4 | rolling — weekly 保留幾份 |
+| `MAILBOX_BACKUP_KEEP_MONTHLY` | 3 | rolling — monthly 保留幾份 |
+
+**觀測**：`/health` JSON 多三欄 `last_backup_at`、`backup_count`、`backup_total_bytes`，外加 `last_backup_counters`（同 sweep 的設計）。`last_backup_at` > 25hr 沒更新 = backup daemon 死了。
+
+**Restore 流程**：`--restore` 會先把現有 `mailbox.db` 跟 `attachments/` 搬到 `*.before-restore-<timestamp>`，然後 copy backup 進去。restore 失敗或不滿意 → 把 `.before-restore-*` 改回原名即可 rollback。Restore 需要 `--yes` 才會真執行，沒帶就 dry-run（印步驟、退 exit=2）。
+
+設定 / tuning 細節：[SETUP-CROSS-DEVICE.md Phase 6](SETUP-CROSS-DEVICE.md#phase-6--backup-since-2026-05-23)
+
 ## Bridge / 周邊工具
 
 - `mailbox-discord-bridge.py` — Docker container `mailbox-bridge`（port 1904）。**Inbound only**：Discord DM → mailbox INSERT。Agent **不直接 call** 這個 port，是 Discord bot 自動推進來。看完整 e2e 流程圖：[Discord 整合：兩個 port，分工不對稱](#discord-整合兩個-port分工不對稱)
 - `mailbox-discord-file.py` — CLI，推檔到使用者 Discord DM（port 1904 bridge），**走 Discord REST API**。跟下面 `mailbox-attach.py` 不同：那個是 agent ↔ agent，這個是 agent → Discord user。
 - `mailbox-attach.py` — CLI，cross-device 寄訊息+檔案到 peer agent mailbox（port 1905 hub server）。MCP `send(files=[...])` 的 shell 等價物。
 - `mailbox-retention.py` — CLI，手動 trigger retention sweep / 看 stats / dry-run（hub-only）
+- `mailbox-backup.py` — CLI，手動打 backup / list / restore / stats（hub-only）
 - `mailbox-dump.py` — 撈 mailbox 歷史；wiki session 有 slash command `/mblog` 跟 `/觀看紀錄` 包好
 - `mailbox-whitelist.py` — Discord 來源信任名單 CLI（trusted / approved / pending），see [discord-stranger-chat](https://github.com/OHIMEOPP/discord-stranger-chat) 設計
 
