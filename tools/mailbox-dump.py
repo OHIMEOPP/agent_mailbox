@@ -88,6 +88,34 @@ def _has_in_reply_to(conn: sqlite3.Connection) -> bool:
     return "in_reply_to" in cols
 
 
+def _messages_columns(conn: sqlite3.Connection) -> set[str]:
+    return {r[1] for r in conn.execute("PRAGMA table_info(messages)").fetchall()}
+
+
+def _row_marker_prefix(row: dict) -> str:
+    """Build a marker prefix for the header line: 📌 P9, etc."""
+    parts = []
+    if row.get("pinned"):
+        parts.append("📌")
+    prio = row.get("priority")
+    if prio is not None and prio > 0:
+        parts.append(f"P{prio}")
+    return (" ".join(parts) + " ") if parts else ""
+
+
+def _row_footer_lines(row: dict, body_indent: str) -> list[str]:
+    """Build extra footer lines per-message: snoozed / expires."""
+    lines = []
+    snoozed = row.get("snoozed_until")
+    if snoozed:
+        # Display as-is; user can eyeball whether it's past or future
+        lines.append(f"{body_indent}😴 snoozed_until={snoozed}")
+    expires = row.get("expires_at")
+    if expires:
+        lines.append(f"{body_indent}⏳ expires_at={expires}")
+    return lines
+
+
 def _fetch_audit_for_msgs(conn: sqlite3.Connection, msg_ids: list[int]) -> list:
     """Return audit_log rows referencing any of the given message ids.
 
@@ -201,19 +229,27 @@ def _format_reactions(rxns: list[tuple[str, str]]) -> str:
 
 
 def _render_flat(rows: list, reactions_by_id: dict | None = None) -> None:
-    """Original flat per-message rendering, with optional reactions footer."""
+    """Flat per-message rendering with optional reactions / pinned / snoozed / TTL footers."""
     reactions_by_id = reactions_by_id or {}
     for r in rows:
-        mid, sender, recipient, sent, body = r[0], r[1], r[2], r[3], r[4]
+        # sqlite3.Row supports both index and named access
+        row = dict(r) if hasattr(r, "keys") else {
+            "id": r[0], "from_name": r[1], "to_name": r[2],
+            "sent_at": r[3], "body": r[4],
+            "in_reply_to": r[5] if len(r) > 5 else None,
+        }
+        mid = row["id"]
+        marker = _row_marker_prefix(row)
         ref_suffix = ""
-        # rows may include in_reply_to as r[5] if tree-aware fetch was used
-        if len(r) > 5 and r[5] is not None:
-            ref_suffix = f"  (re: #{r[5]})"
-        print(f"\n[{mid}] {sent}  {sender} -> {recipient}{ref_suffix}")
-        print(body)
+        if row.get("in_reply_to") is not None:
+            ref_suffix = f"  (re: #{row['in_reply_to']})"
+        print(f"\n{marker}[{mid}] {row['sent_at']}  {row['from_name']} -> {row['to_name']}{ref_suffix}")
+        print(row["body"])
         rxns = reactions_by_id.get(mid, [])
         if rxns:
             print(f"  💬 {_format_reactions(rxns)}")
+        for line in _row_footer_lines(row, "  "):
+            print(line)
         print("-" * 60)
 
 
@@ -232,18 +268,26 @@ def _render_tree(rows: list, reactions_by_id: dict | None = None) -> None:
     Rows must include in_reply_to as column index 5.
     """
     reactions_by_id = reactions_by_id or {}
-    by_id = {r[0]: r for r in rows}
+    # Convert each row to a dict for named access
+    def _to_dict(r):
+        if hasattr(r, "keys"):
+            return dict(r)
+        return {
+            "id": r[0], "from_name": r[1], "to_name": r[2],
+            "sent_at": r[3], "body": r[4],
+            "in_reply_to": r[5] if len(r) > 5 else None,
+        }
+
+    rows_d = [_to_dict(r) for r in rows]
+    by_id = {r["id"]: r for r in rows_d}
     children: dict[int, list[int]] = {}
     roots: list[int] = []
 
-    for r in rows:
-        mid = r[0]
-        parent = r[5] if len(r) > 5 else None
+    for r in rows_d:
+        mid = r["id"]
+        parent = r.get("in_reply_to")
         if parent is None or parent not in by_id:
             roots.append(mid)
-            if parent is not None and parent not in by_id:
-                # orphan — parent was pruned or outside filter
-                pass
         else:
             children.setdefault(parent, []).append(mid)
 
@@ -252,9 +296,9 @@ def _render_tree(rows: list, reactions_by_id: dict | None = None) -> None:
         children[parent_id].sort()
 
     def _print_node(node_id: int, prefix: str, is_last: bool, is_root: bool) -> None:
-        r = by_id[node_id]
-        mid, sender, recipient, sent, body = r[0], r[1], r[2], r[3], r[4]
-        parent = r[5] if len(r) > 5 else None
+        row = by_id[node_id]
+        mid = row["id"]
+        parent = row.get("in_reply_to")
         # Determine connector
         if is_root:
             connector = ""
@@ -270,16 +314,23 @@ def _render_tree(rows: list, reactions_by_id: dict | None = None) -> None:
         elif parent is not None:
             orphan_flag = f"  (re: #{parent})"
 
+        # Pinned + priority markers
+        marker = _row_marker_prefix(row)
+
         # Header line
-        print(f"{prefix}{connector}[{mid}] {sent}  {sender} -> {recipient}{orphan_flag}")
+        print(f"{prefix}{connector}{marker}[{mid}] {row['sent_at']}  "
+              f"{row['from_name']} -> {row['to_name']}{orphan_flag}")
         # Body lines indented under header
         body_indent = f"{prefix}{child_prefix}  " if not is_root else "  "
-        for line in body.splitlines() or [""]:
+        for line in (row["body"] or "").splitlines() or [""]:
             print(f"{body_indent}{line}")
         # Reactions footer (if any)
         rxns = reactions_by_id.get(mid, [])
         if rxns:
             print(f"{body_indent}💬 {_format_reactions(rxns)}")
+        # Pinned/snoozed/TTL footers (if any)
+        for line in _row_footer_lines(row, body_indent):
+            print(line)
 
         # Recurse into children
         kids = children.get(node_id, [])
@@ -317,11 +368,17 @@ def main() -> int:
         return list_agents(args.db)
 
     conn = sqlite3.connect(args.db)
+    conn.row_factory = sqlite3.Row
     try:
         tree_capable = _has_in_reply_to(conn)
+        cols = _messages_columns(conn)
         col_list = "id, from_name, to_name, sent_at, body"
         if tree_capable:
             col_list += ", in_reply_to"
+        # Optional indicators — only SELECT if column exists (schema-aware)
+        for opt in ("pinned", "priority", "snoozed_until", "expires_at"):
+            if opt in cols:
+                col_list += f", {opt}"
         if args.peer:
             sql = (f"SELECT {col_list} "
                    "FROM messages WHERE from_name=? OR to_name=? "

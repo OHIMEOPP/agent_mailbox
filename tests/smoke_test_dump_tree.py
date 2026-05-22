@@ -36,7 +36,11 @@ def main() -> int:
                 sent_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
                 read_at TEXT,
                 has_attachments INTEGER NOT NULL DEFAULT 0,
-                in_reply_to INTEGER
+                in_reply_to INTEGER,
+                pinned INTEGER NOT NULL DEFAULT 0,
+                priority INTEGER NOT NULL DEFAULT 0,
+                snoozed_until TEXT,
+                expires_at TEXT
             );
             CREATE TABLE peers (name TEXT PRIMARY KEY, last_seen_at TEXT NOT NULL);
             CREATE TABLE reactions (
@@ -102,6 +106,16 @@ def main() -> int:
         react(m1, "carol", "👍")
         react(m2, "alice", "🚀")
         # m5 gets no reactions — should render without 💬 line
+
+        # Indicators: pinned + priority + snoozed_until + expires_at on selected msgs
+        conn.execute("UPDATE messages SET pinned=1 WHERE id=?", (m1,))
+        conn.execute("UPDATE messages SET priority=9 WHERE id=?", (m2,))
+        conn.execute(
+            "UPDATE messages SET snoozed_until=strftime('%Y-%m-%dT%H:%M:%fZ','now','+2 hours') "
+            "WHERE id=?", (m3,))
+        conn.execute(
+            "UPDATE messages SET expires_at=strftime('%Y-%m-%dT%H:%M:%fZ','now','+24 hours') "
+            "WHERE id=?", (m4,))
 
         # Scheduled pending: 2 rows
         conn.execute(
@@ -234,7 +248,14 @@ def main() -> int:
         assert "✗" in out, "failed audit entry should be marked ✗"
         print("[smoke] --audit-trail footer ok (5 entries rendered, msg 999 excluded, ✗ on failure)")
 
-        print(f"\n[smoke] ALL DUMP TREE TESTS PASSED ({6} messages, tree + reactions + scheduled + audit verified)")
+        # New indicator markers
+        assert "📌" in out, "missing pinned 📌 marker"
+        assert " P9 " in out or "P9 [" in out, "missing P9 priority marker"
+        assert "😴" in out and "snoozed_until=" in out, "missing snoozed indicator"
+        assert "⏳" in out and "expires_at=" in out, "missing TTL indicator"
+        print("[smoke] indicators ok (📌 / P9 / 😴 / ⏳ all rendered)")
+
+        print(f"\n[smoke] ALL DUMP TREE TESTS PASSED ({6} messages, tree + reactions + scheduled + audit + indicators verified)")
         return 0
     except AssertionError as e:
         print(f"\n[smoke] ASSERT FAIL: {e}", file=sys.stderr)
