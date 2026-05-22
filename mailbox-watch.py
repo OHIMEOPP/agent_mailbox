@@ -269,14 +269,17 @@ def main() -> int:
                         "field per line. Used by wiki to oversee whole mailbox.")
     p.add_argument('--remote', default=None,
                    help="connect to remote hub via HTTP/SSE (e.g. http://hub-ip:1905). "
-                        "Implies stream mode; ignores --db --tick --max.")
+                        "Implies stream mode; ignores --db --tick --max. "
+                        "Auto-filled from env CLAUDE_MAILBOX_REMOTE if not given.")
     p.add_argument('--token', default=None,
                    help="bearer token for --remote (or env CLAUDE_MAILBOX_TOKEN)")
     args = p.parse_args()
 
+    import os
+    if not args.remote:
+        args.remote = os.environ.get('CLAUDE_MAILBOX_REMOTE', '').strip() or None
     if args.remote:
         if not args.token:
-            import os
             args.token = os.environ.get('CLAUDE_MAILBOX_TOKEN', '').strip() or None
         return run_remote_mode(args)
     if args.monitor:
