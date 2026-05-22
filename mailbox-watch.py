@@ -35,6 +35,9 @@ Why an OS subprocess (not /loop or ScheduleWakeup):
   TTL. Different cost model entirely.
 """
 import argparse
+import json
+import urllib.error
+import urllib.request
 import io
 import sqlite3
 import sys
@@ -181,6 +184,74 @@ def run_monitor_mode(args) -> int:
         time.sleep(args.tick)
 
 
+def run_remote_mode(args) -> int:
+    """Connect to a hub running mailbox-server.py over HTTP/SSE.
+
+    Outputs same `MAIL id=... from=... sent=... preview=...` line format as
+    local --monitor mode so Claude Code Monitor tool can consume identically.
+    """
+    if args.watch_all:
+        print("[watcher] --watch-all not supported with --remote (per-name watch only)",
+              file=sys.stderr)
+        return 2
+    if not args.token:
+        print("[watcher] --token required with --remote", file=sys.stderr)
+        return 2
+
+    base = args.remote.rstrip('/')
+    url = f"{base}/watch?name={args.name}"
+    headers = {"Authorization": f"Bearer {args.token}"}
+    print(f"[watcher] remote-mode connect: {base}  name={args.name}", file=sys.stderr)
+
+    backoff = 1
+    while True:
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=None) as resp:
+                if resp.status != 200:
+                    print(f"[watcher] HTTP {resp.status}", file=sys.stderr)
+                    time.sleep(min(backoff, 60))
+                    backoff = min(backoff * 2, 60)
+                    continue
+                backoff = 1  # reset on successful connect
+                print(f"[watcher] connected, streaming events", file=sys.stderr)
+                event = None
+                for raw in resp:
+                    line = raw.decode('utf-8', errors='replace').rstrip('\n').rstrip('\r')
+                    if not line:
+                        event = None
+                        continue
+                    if line.startswith(':'):  # comment/heartbeat
+                        continue
+                    if line.startswith('event:'):
+                        event = line[6:].strip()
+                        continue
+                    if line.startswith('data:'):
+                        data = line[5:].strip()
+                        if event == 'mail':
+                            try:
+                                m = json.loads(data)
+                                preview = m['body'].replace('\n', ' ')[:200]
+                                print(f"MAIL id={m['id']} from={m['from_name']} "
+                                      f"sent={m['sent_at']} preview={preview}",
+                                      flush=True)
+                            except Exception as e:
+                                print(f"[watcher] parse err: {e}", file=sys.stderr)
+                        elif event == 'error':
+                            print(f"[watcher] server error: {data}", file=sys.stderr)
+        except urllib.error.HTTPError as e:
+            if e.code == 401:
+                print(f"[watcher] auth failed (401), check --token", file=sys.stderr)
+                return 1
+            print(f"[watcher] HTTP {e.code}: retry in {backoff}s", file=sys.stderr)
+        except (urllib.error.URLError, ConnectionError, OSError) as e:
+            print(f"[watcher] conn err: {e}, retry in {backoff}s", file=sys.stderr)
+        except KeyboardInterrupt:
+            return 0
+        time.sleep(min(backoff, 60))
+        backoff = min(backoff * 2, 60)
+
+
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument('name', help="instance name to watch (e.g. wiki, koatag)")
@@ -196,8 +267,18 @@ def main() -> int:
                    help="supervisor mode: fire on ANY recipient's new mail "
                         "(not just to_name=<NAME>). Output adds 'to=<peer>' "
                         "field per line. Used by wiki to oversee whole mailbox.")
+    p.add_argument('--remote', default=None,
+                   help="connect to remote hub via HTTP/SSE (e.g. http://hub-ip:1905). "
+                        "Implies stream mode; ignores --db --tick --max.")
+    p.add_argument('--token', default=None,
+                   help="bearer token for --remote (or env CLAUDE_MAILBOX_TOKEN)")
     args = p.parse_args()
 
+    if args.remote:
+        if not args.token:
+            import os
+            args.token = os.environ.get('CLAUDE_MAILBOX_TOKEN', '').strip() or None
+        return run_remote_mode(args)
     if args.monitor:
         return run_monitor_mode(args)
     return run_exit_mode(args)

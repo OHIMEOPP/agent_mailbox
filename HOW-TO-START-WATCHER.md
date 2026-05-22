@@ -119,4 +119,58 @@ baselines on max(id) at startup, so historical mail isn't re-announced.
 ## Sending mail (FYI, not watcher-related)
 
 - **Agent ↔ agent (internal)**: `mcp__mailbox__send(to="<peer>", body="...")` — sits in SQLite, peer's watcher emits it
-- **Agent → user Discord DM**: `POST http://localhost:1901/agent-notify` with `agent / task / status / detail` JSON. The `mailbox-bridge` container is **one-way** (Discord→mailbox only); INSERTing `to_name='user-discord'` does NOT reach Discord
+- **Agent → user Discord DM**: `POST http://localhost:1904/agent-notify` with `agent / task / status / detail` JSON. The `mailbox-bridge` container is **one-way** (Discord→mailbox only); INSERTing `to_name='user-discord'` does NOT reach Discord
+
+---
+
+## Cross-device watch (LAN / VPN, since 2026-05-22)
+
+If the agent runs on a different machine than the SQLite mailbox.db, the watcher
+can connect to a hub running `mailbox-server.py` over HTTP/SSE instead of
+opening the SQLite file directly.
+
+### Hub side (the machine that owns `mailbox.db`)
+
+```bash
+# Generate token once
+py -c "import secrets; print(secrets.token_urlsafe(32))" > ~/.claude/mailbox/token.txt
+
+# Start REST server (binds 0.0.0.0:1905 by default)
+CLAUDE_MAILBOX_TOKEN=$(cat ~/.claude/mailbox/token.txt) \
+  py C:/Users/User/Desktop/VSCcode/claude-mailbox/mailbox-server.py
+```
+
+Keep this running on the hub. For Tailscale-only access, pass `--host 100.x.y.z`
+(the hub's tailscale IP) instead of the default 0.0.0.0.
+
+### Spoke side (the remote machine running the agent)
+
+```yaml
+tool: Monitor
+command:     py C:/path/to/mailbox-watch.py <NAME> --remote http://<hub-ip>:1905 --token <TOKEN>
+description: mailbox watcher for <NAME> via remote hub
+persistent:  true
+timeout_ms:  3600000
+```
+
+The watcher outputs identical `MAIL id=...` lines to the local --monitor mode,
+so Monitor tool consumes events the same way. Auto-reconnects with exponential
+backoff on network drop.
+
+### REST endpoints exposed by mailbox-server
+
+| Method | Path | Auth | Use |
+|---|---|---|---|
+| GET  | `/health`     | none | liveness check |
+| POST | `/send`       | bearer | `{from, to, body}` → `{id, sent_at}` |
+| GET  | `/inbox?name=X&unread=1&limit=50` | bearer | list of messages |
+| POST | `/mark_read`  | bearer | `{ids:[...]}` → `{count}` |
+| GET  | `/peers`      | bearer | list of known peers + last_seen_at |
+| GET  | `/watch?name=X` | bearer | SSE stream `event: mail\ndata: {...}` |
+
+### Trust model
+
+- Single shared bearer token; LAN/VPN-trusted environment assumed
+- No per-peer auth, no rate limiting, no replay protection
+- Token leak → fix: rotate, restart server with new env var; clients re-deploy
+- Don't expose `0.0.0.0` to public internet without putting a TLS reverse-proxy in front
