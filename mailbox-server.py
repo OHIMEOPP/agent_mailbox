@@ -125,6 +125,59 @@ def db_init(path: pathlib.Path):
     # Audit log is a separate concern — its own idempotent DDL; doesn't share
     # the executescript above because mailbox_audit owns the table shape.
     mailbox_audit.init_schema(path)
+    # FTS5 search index over messages.body — separate DDL because virtual
+    # table + triggers + backfill must run after the messages table exists.
+    _init_fts(path)
+
+
+def _init_fts(path: pathlib.Path):
+    """Set up FTS5 virtual table + triggers + backfill any existing rows.
+
+    Idempotent — safe to run on every server boot.
+    """
+    conn = db_connect(path)
+    try:
+        # Probe FTS5 availability. If the build doesn't include FTS5, skip
+        # silently — search() will return 501 / fallback to LIKE later.
+        try:
+            conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts "
+                         "USING fts5(body, content='messages', "
+                         "content_rowid='id', tokenize='unicode61')")
+        except sqlite3.OperationalError as e:
+            print(f"[mailbox-server] FTS5 not available — search will fall back to LIKE: {e}",
+                  file=sys.stderr)
+            return
+
+        # Triggers keep FTS in sync with messages.
+        # SQLite syntax for FTS5 external-content table uses 'delete' command
+        # to remove a row by rowid before re-inserting (UPDATE = delete+insert).
+        conn.executescript("""
+            CREATE TRIGGER IF NOT EXISTS messages_fts_ai AFTER INSERT ON messages BEGIN
+                INSERT INTO messages_fts(rowid, body) VALUES (new.id, new.body);
+            END;
+            CREATE TRIGGER IF NOT EXISTS messages_fts_ad AFTER DELETE ON messages BEGIN
+                INSERT INTO messages_fts(messages_fts, rowid, body)
+                    VALUES('delete', old.id, old.body);
+            END;
+            CREATE TRIGGER IF NOT EXISTS messages_fts_au AFTER UPDATE ON messages BEGIN
+                INSERT INTO messages_fts(messages_fts, rowid, body)
+                    VALUES('delete', old.id, old.body);
+                INSERT INTO messages_fts(rowid, body) VALUES (new.id, new.body);
+            END;
+        """)
+
+        # Backfill: any messages.id not yet in FTS index. Cheap to no-op on
+        # subsequent boots since the WHERE clause matches nothing.
+        n = conn.execute(
+            "INSERT INTO messages_fts(rowid, body) "
+            "SELECT id, body FROM messages "
+            "WHERE id NOT IN (SELECT rowid FROM messages_fts)"
+        ).rowcount
+        if n > 0:
+            print(f"[mailbox-server] FTS5 backfilled {n} existing message(s)", file=sys.stderr)
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def blob_path(attachments_dir: pathlib.Path, sha256: str) -> pathlib.Path:
@@ -336,6 +389,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                          "returned": len(rows)},
             )
             return self._json(200, {"messages": rows})
+
+        if path == "/search":
+            return self._handle_search(first)
 
         if path == "/peers":
             conn = db_connect(srv.db_path)
@@ -627,6 +683,59 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "Content-Disposition": cd,
             "X-Mailbox-Sha256": row["sha256"],
         })
+
+    def _handle_search(self, first):
+        """GET /search?q=...&scope=inbox|sent|all&name=...&limit=N"""
+        srv = self.server
+        q = first("q").strip()
+        if not q:
+            return self._json(400, {"error": "missing q"})
+        scope = first("scope", "inbox").strip()
+        if scope not in ("inbox", "sent", "all"):
+            return self._json(400, {"error": "scope must be inbox/sent/all"})
+        name = first("name").strip()
+        if scope != "all" and not name:
+            return self._json(400, {"error": f"scope={scope} requires name"})
+        try:
+            limit = min(int(first("limit", "50")), 200)
+        except ValueError:
+            return self._json(400, {"error": "limit must be integer"})
+
+        conn = db_connect(srv.db_path)
+        try:
+            # FTS5 may not be initialized (older DB pre-2026-05-23 booted
+            # against new server but error during _init_fts). Probe first.
+            exists = conn.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name='messages_fts'"
+            ).fetchone()
+            if not exists:
+                return self._json(501, {"error": "FTS5 index not initialized on this hub"})
+
+            sql = (
+                "SELECT m.id, m.from_name, m.to_name, "
+                "snippet(messages_fts, 0, '<b>', '</b>', '...', 64) AS snippet, "
+                "m.sent_at, m.has_attachments, m.in_reply_to, "
+                "bm25(messages_fts) AS rank "
+                "FROM messages_fts JOIN messages m ON m.id = messages_fts.rowid "
+                "WHERE messages_fts MATCH ?"
+            )
+            params: list = [q]
+            if scope == "inbox":
+                sql += " AND m.to_name = ?"
+                params.append(name)
+            elif scope == "sent":
+                sql += " AND m.from_name = ?"
+                params.append(name)
+            sql += " ORDER BY rank LIMIT ?"
+            params.append(limit)
+            try:
+                rows = [dict(r) for r in conn.execute(sql, params).fetchall()]
+            except sqlite3.OperationalError as e:
+                return self._json(400, {"error": f"invalid FTS5 query: {e}"})
+        finally:
+            conn.close()
+        return self._json(200, {"results": rows, "query": q, "scope": scope, "count": len(rows)})
 
     def _sse_watch(self, name: str, since: str):
         if not name:

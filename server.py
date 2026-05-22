@@ -206,9 +206,42 @@ def _init_db() -> None:
         )
 
 
+def _init_fts() -> None:
+    """Create FTS5 virtual table + triggers + backfill any existing messages.
+    Silently skip if FTS5 not compiled into this Python's sqlite3 build.
+    """
+    with _connect() as c:
+        try:
+            c.execute("CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts "
+                      "USING fts5(body, content='messages', "
+                      "content_rowid='id', tokenize='unicode61')")
+        except sqlite3.OperationalError:
+            return  # FTS5 not available — search() will raise at call time
+        c.executescript("""
+            CREATE TRIGGER IF NOT EXISTS messages_fts_ai AFTER INSERT ON messages BEGIN
+                INSERT INTO messages_fts(rowid, body) VALUES (new.id, new.body);
+            END;
+            CREATE TRIGGER IF NOT EXISTS messages_fts_ad AFTER DELETE ON messages BEGIN
+                INSERT INTO messages_fts(messages_fts, rowid, body)
+                    VALUES('delete', old.id, old.body);
+            END;
+            CREATE TRIGGER IF NOT EXISTS messages_fts_au AFTER UPDATE ON messages BEGIN
+                INSERT INTO messages_fts(messages_fts, rowid, body)
+                    VALUES('delete', old.id, old.body);
+                INSERT INTO messages_fts(rowid, body) VALUES (new.id, new.body);
+            END;
+        """)
+        c.execute(
+            "INSERT INTO messages_fts(rowid, body) "
+            "SELECT id, body FROM messages "
+            "WHERE id NOT IN (SELECT rowid FROM messages_fts)"
+        )
+
+
 if not REMOTE:
     _init_db()
     mailbox_audit.init_schema(DB_PATH)
+    _init_fts()
 
 
 def _write_blob(data: bytes) -> tuple[str, int]:
@@ -516,6 +549,74 @@ def download(attachment_id: int, save_to: str) -> dict:
         "size": row["size"],
         "sha256": row["sha256"],
     }
+
+
+@mcp.tool()
+def search(query: str, scope: str = "inbox", limit: int = 50) -> list[dict]:
+    """Full-text search messages using SQLite FTS5.
+
+    Args:
+        query: FTS5 MATCH expression. Supports phrase search ("foo bar"),
+               boolean (foo AND bar / foo OR bar / foo NOT bar), prefix (foo*),
+               and column-aware NEAR(...). Default tokenizer is unicode61
+               (good with CJK as long as words are space-separated; for fine-
+               grained Chinese tokenization a custom tokenizer would be needed).
+        scope: "inbox" (default — messages addressed to you),
+               "sent" (messages you sent),
+               "all" (no name filter — supervisor view).
+        limit: max results (default 50, max 200).
+
+    Returns:
+        List of {id, from, to, snippet, sent_at, has_attachments, in_reply_to,
+        rank} sorted by relevance (lower rank = better match, per bm25).
+        `snippet` wraps matches in <b>...</b> and trims context to ~64 chars.
+    """
+    if scope not in ("inbox", "sent", "all"):
+        raise RuntimeError(f"scope must be inbox/sent/all, got {scope!r}")
+    limit = min(max(1, limit), 200)
+
+    if REMOTE:
+        import urllib.parse
+        params = f"?q={urllib.parse.quote(query)}&scope={scope}&limit={limit}"
+        if scope != "all":
+            params += f"&name={urllib.parse.quote(NAME)}"
+        r = _remote("GET", f"/search{params}")
+        return r["results"]
+
+    sql = (
+        "SELECT m.id, m.from_name, m.to_name, "
+        "snippet(messages_fts, 0, '<b>', '</b>', '...', 64) AS snippet, "
+        "m.sent_at, m.has_attachments, m.in_reply_to, "
+        "bm25(messages_fts) AS rank "
+        "FROM messages_fts JOIN messages m ON m.id = messages_fts.rowid "
+        "WHERE messages_fts MATCH ?"
+    )
+    params_local: list = [query]
+    if scope == "inbox":
+        sql += " AND m.to_name = ?"
+        params_local.append(NAME)
+    elif scope == "sent":
+        sql += " AND m.from_name = ?"
+        params_local.append(NAME)
+    sql += " ORDER BY rank LIMIT ?"
+    params_local.append(limit)
+
+    with _connect() as c:
+        try:
+            rows = c.execute(sql, params_local).fetchall()
+        except sqlite3.OperationalError as e:
+            raise RuntimeError(f"FTS5 search failed (query={query!r}): {e}")
+    mailbox_audit.log_event(
+        DB_PATH, actor=NAME, action="search",
+        payload={"query": query, "scope": scope, "limit": limit, "count": len(rows)},
+    )
+    return [
+        {"id": r["id"], "from": r["from_name"], "to": r["to_name"],
+         "snippet": r["snippet"], "sent_at": r["sent_at"],
+         "has_attachments": r["has_attachments"], "in_reply_to": r["in_reply_to"],
+         "rank": r["rank"]}
+        for r in rows
+    ]
 
 
 @mcp.tool()
