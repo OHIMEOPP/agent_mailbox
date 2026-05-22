@@ -98,15 +98,34 @@ def sweep_all(
         expired_set = set(expired_ids)
 
         # 1b/c. Default read/unread cutoffs, excluding rows already flagged by
-        # explicit TTL to avoid double-counting.
-        read_ids = [r[0] for r in conn.execute(
-            "SELECT id FROM messages WHERE read_at IS NOT NULL AND sent_at < ?",
-            (cutoff_read,),
-        ).fetchall() if r[0] not in expired_set]
-        unread_ids = [r[0] for r in conn.execute(
-            "SELECT id FROM messages WHERE read_at IS NULL AND sent_at < ?",
-            (cutoff_unread,),
-        ).fetchall() if r[0] not in expired_set]
+        # explicit TTL and excluding pinned messages (pin = "keep indefinitely").
+        # COALESCE handles pre-v006 schemas where pinned column doesn't exist.
+        try:
+            read_ids = [r[0] for r in conn.execute(
+                "SELECT id FROM messages "
+                "WHERE read_at IS NOT NULL AND sent_at < ? "
+                "AND COALESCE(pinned, 0) = 0",
+                (cutoff_read,),
+            ).fetchall() if r[0] not in expired_set]
+            unread_ids = [r[0] for r in conn.execute(
+                "SELECT id FROM messages "
+                "WHERE read_at IS NULL AND sent_at < ? "
+                "AND COALESCE(pinned, 0) = 0",
+                (cutoff_unread,),
+            ).fetchall() if r[0] not in expired_set]
+        except sqlite3.OperationalError as e:
+            if "no such column" in str(e).lower():
+                # Pre-v006 schema — fall back without pin filter.
+                read_ids = [r[0] for r in conn.execute(
+                    "SELECT id FROM messages WHERE read_at IS NOT NULL AND sent_at < ?",
+                    (cutoff_read,),
+                ).fetchall() if r[0] not in expired_set]
+                unread_ids = [r[0] for r in conn.execute(
+                    "SELECT id FROM messages WHERE read_at IS NULL AND sent_at < ?",
+                    (cutoff_unread,),
+                ).fetchall() if r[0] not in expired_set]
+            else:
+                raise
         all_ids = expired_ids + read_ids + unread_ids
         counters["read_messages_deleted"] = len(read_ids)
         counters["unread_messages_deleted"] = len(unread_ids)

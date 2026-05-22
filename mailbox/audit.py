@@ -36,6 +36,8 @@ ACTIONS = frozenset({
     "react",      # add a reaction (emoji) to a message
     "unreact",    # remove a reaction
     "rate_limit_rejected",  # request denied by rate limiter (429)
+    "pin",        # pin a message (top of inbox, exempt from retention)
+    "unpin",      # remove pin
 })
 
 DEFAULT_TAIL_LIMIT = 50

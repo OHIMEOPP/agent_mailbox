@@ -32,6 +32,7 @@ from pathlib import Path
 
 from mailbox import audit as mailbox_audit
 from mailbox import migrations as mailbox_migrations
+from mailbox import pinned as mailbox_pinned
 from mailbox import priority as mailbox_priority
 from mailbox import reactions as mailbox_reactions
 from mailbox import scheduled as mailbox_scheduled
@@ -199,7 +200,8 @@ def _init_db() -> None:
                 claimed_until TEXT,
                 has_attachments INTEGER NOT NULL DEFAULT 0,
                 in_reply_to INTEGER,
-                priority INTEGER NOT NULL DEFAULT 0
+                priority INTEGER NOT NULL DEFAULT 0,
+                pinned INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS idx_messages_to_unread
                 ON messages(to_name, read_at);
@@ -613,13 +615,14 @@ def inbox(unread_only: bool = True, limit: int = 50,
              "in_reply_to": m.get("in_reply_to"),
              "expires_at": m.get("expires_at"),
              "priority": m.get("priority", 0),
+             "pinned": bool(m.get("pinned", 0)),
              "attachments": m.get("attachments", []),
              "reactions": m.get("reactions", [])}
             for m in r["messages"]
         ]
 
     sql = ("SELECT id, from_name, body, sent_at, read_at, has_attachments, "
-           "in_reply_to, expires_at, claimed_by, claimed_until, priority "
+           "in_reply_to, expires_at, claimed_by, claimed_until, priority, pinned "
            "FROM messages WHERE to_name = ?")
     params: list = [NAME]
     if unread_only:
@@ -632,8 +635,8 @@ def inbox(unread_only: bool = True, limit: int = 50,
     if min_priority > 0:
         sql += " AND priority >= ?"
         params.append(min_priority)
-    # Priority DESC first (high-urgency surfaces first), then id ASC (FIFO within band)
-    sql += " ORDER BY priority DESC, id ASC LIMIT ?"
+    # Pinned first (always surface), then priority DESC, then id ASC (FIFO within band)
+    sql += " ORDER BY pinned DESC, priority DESC, id ASC LIMIT ?"
     params.append(limit)
 
     with _connect() as c:
@@ -665,6 +668,7 @@ def inbox(unread_only: bool = True, limit: int = 50,
                 "in_reply_to": r["in_reply_to"],
                 "expires_at": r["expires_at"],
                 "priority": r["priority"],
+                "pinned": bool(r["pinned"]),
                 "attachments": atts_by_msg.get(r["id"], []),
                 "reactions": reactions_by_msg.get(r["id"], []),
             })
@@ -1008,6 +1012,62 @@ def unreact(message_id: int, emoji: str) -> dict:
         payload={"emoji": emoji, "removed": removed},
     )
     return {"removed": removed}
+
+
+@mcp.tool()
+def pin(message_id: int) -> dict:
+    """Pin a message so it stays at the top of inbox and survives retention sweep.
+
+    Use case: keep a reference / pending action / important decision visible
+    until you explicitly unpin it. Pinned messages bypass the read/unread TTL
+    in retention sweep (but explicit `expires_at` still wins — pin doesn't
+    override TTL).
+
+    Args:
+        message_id: id of the message to pin.
+
+    Returns:
+        {pinned: True, was_already_pinned: bool, id, actor}. Idempotent —
+        pinning twice returns was_already_pinned=True.
+    """
+    if REMOTE:
+        r = _remote("POST", "/pin",
+                    {"actor": NAME, "message_id": message_id})
+        return r
+    try:
+        result = mailbox_pinned.pin(DB_PATH, message_id, NAME)
+    except FileNotFoundError as e:
+        raise RuntimeError(str(e))
+    mailbox_audit.log_event(
+        DB_PATH, actor=NAME, action="pin", target=str(message_id),
+        payload={"was_already_pinned": result["was_already_pinned"]},
+    )
+    return result
+
+
+@mcp.tool()
+def unpin(message_id: int) -> dict:
+    """Remove a pin from a message — it returns to normal retention + sort order.
+
+    Args:
+        message_id: id of the message to unpin.
+
+    Returns:
+        {pinned: False, was_pinned: bool, id, actor}.
+    """
+    if REMOTE:
+        r = _remote("POST", "/unpin",
+                    {"actor": NAME, "message_id": message_id})
+        return r
+    try:
+        result = mailbox_pinned.unpin(DB_PATH, message_id, NAME)
+    except FileNotFoundError as e:
+        raise RuntimeError(str(e))
+    mailbox_audit.log_event(
+        DB_PATH, actor=NAME, action="unpin", target=str(message_id),
+        payload={"was_pinned": result["was_pinned"]},
+    )
+    return result
 
 
 if __name__ == "__main__":

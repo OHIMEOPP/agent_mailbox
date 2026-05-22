@@ -137,6 +137,25 @@ def _migration_v005_priority(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migration_v006_pinned(conn: sqlite3.Connection) -> None:
+    """messages.pinned + partial index.
+
+    Added 2026-05-23 pin/unpin feature. Boolean (0/1) flag; pinned messages
+    stay at the top of inbox view above priority-ordered messages and are
+    exempt from retention sweep. Partial index covers only pinned rows
+    (most messages stay unpinned).
+    """
+    if "pinned" not in _messages_columns(conn):
+        conn.execute(
+            "ALTER TABLE messages ADD COLUMN pinned "
+            "INTEGER NOT NULL DEFAULT 0"
+        )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_messages_pinned "
+        "ON messages(pinned) WHERE pinned = 1"
+    )
+
+
 # Canonical migration list. Append only; never re-order or delete.
 # `version` must be sequential starting from 1.
 MIGRATIONS: list[tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
@@ -145,6 +164,7 @@ MIGRATIONS: list[tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (3, "messages_expires_at_with_partial_index", _migration_v003_expires_at),
     (4, "messages_claim_visibility_timeout", _migration_v004_claim),
     (5, "messages_priority_with_partial_index", _migration_v005_priority),
+    (6, "messages_pinned_with_partial_index", _migration_v006_pinned),
 ]
 
 

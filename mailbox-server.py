@@ -48,6 +48,7 @@ import urllib.parse
 from mailbox import audit as mailbox_audit
 from mailbox import backup as mailbox_backup
 from mailbox import migrations as mailbox_migrations
+from mailbox import pinned as mailbox_pinned
 from mailbox import priority as mailbox_priority
 from mailbox import rate_limit as mailbox_rate_limit
 from mailbox import reactions as mailbox_reactions
@@ -135,7 +136,8 @@ def db_init(path: pathlib.Path):
             in_reply_to INTEGER,
             claimed_by TEXT,
             claimed_until TEXT,
-            priority INTEGER NOT NULL DEFAULT 0
+            priority INTEGER NOT NULL DEFAULT 0,
+            pinned INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_to_unread
             ON messages(to_name, read_at);
@@ -465,6 +467,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # Priority distribution across unread messages
             prio_stats = mailbox_priority.stats(srv.db_path)
             payload.update(prio_stats)
+            # Pinned count
+            pin_stats = mailbox_pinned.stats(srv.db_path)
+            payload.update(pin_stats)
             return self._json(200, payload)
 
         if not self._check_auth():
@@ -486,7 +491,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except ValueError:
                 return self._json(400, {"error": "min_priority must be int"})
             sql = ("SELECT id, from_name, to_name, body, sent_at, read_at, has_attachments, "
-                   "in_reply_to, expires_at, claimed_by, claimed_until, priority "
+                   "in_reply_to, expires_at, claimed_by, claimed_until, priority, pinned "
                    "FROM messages WHERE to_name=?")
             args: list = [name]
             if unread_only:
@@ -498,8 +503,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if min_priority > 0:
                 sql += " AND priority >= ?"
                 args.append(min_priority)
-            # Priority DESC (urgent first), then id ASC (FIFO within band)
-            sql += " ORDER BY priority DESC, id ASC LIMIT ?"
+            # Pinned first (always surface), then priority DESC (urgent), then id ASC (FIFO)
+            sql += " ORDER BY pinned DESC, priority DESC, id ASC LIMIT ?"
             args.append(limit)
             conn = db_connect(srv.db_path)
             try:
@@ -793,6 +798,48 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 payload={"emoji": payload["emoji"], "removed": removed},
             )
             return self._json(200, {"removed": removed})
+
+        if path == "/pin":
+            for k in ("actor", "message_id"):
+                if k not in payload:
+                    return self._json(400, {"error": f"missing field: {k}"})
+            if not isinstance(payload["actor"], str):
+                return self._json(400, {"error": "actor must be string"})
+            if not isinstance(payload["message_id"], int):
+                return self._json(400, {"error": "message_id must be int"})
+            try:
+                result = mailbox_pinned.pin(
+                    srv.db_path, payload["message_id"], payload["actor"],
+                )
+            except FileNotFoundError as e:
+                return self._json(404, {"error": str(e)})
+            mailbox_audit.log_event(
+                srv.db_path, actor=payload["actor"], action="pin",
+                target=str(payload["message_id"]),
+                payload={"was_already_pinned": result["was_already_pinned"]},
+            )
+            return self._json(200, result)
+
+        if path == "/unpin":
+            for k in ("actor", "message_id"):
+                if k not in payload:
+                    return self._json(400, {"error": f"missing field: {k}"})
+            if not isinstance(payload["actor"], str):
+                return self._json(400, {"error": "actor must be string"})
+            if not isinstance(payload["message_id"], int):
+                return self._json(400, {"error": "message_id must be int"})
+            try:
+                result = mailbox_pinned.unpin(
+                    srv.db_path, payload["message_id"], payload["actor"],
+                )
+            except FileNotFoundError as e:
+                return self._json(404, {"error": str(e)})
+            mailbox_audit.log_event(
+                srv.db_path, actor=payload["actor"], action="unpin",
+                target=str(payload["message_id"]),
+                payload={"was_pinned": result["was_pinned"]},
+            )
+            return self._json(200, result)
 
         if path == "/claim":
             for k in ("actor", "message_id"):
@@ -1204,7 +1251,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 conn = db_connect(srv.db_path)
                 try:
                     rows = conn.execute(
-                        "SELECT id, from_name, to_name, body, sent_at, has_attachments, in_reply_to, expires_at, priority "
+                        "SELECT id, from_name, to_name, body, sent_at, has_attachments, in_reply_to, expires_at, priority, pinned "
                         "FROM messages WHERE to_name=? AND id>? ORDER BY id ASC",
                         (name, last_id),
                     ).fetchall()
