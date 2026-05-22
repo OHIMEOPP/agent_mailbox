@@ -7,19 +7,25 @@ to be running. SQLite's online .backup() API is safe against a live writer.
 Usage:
     py mailbox-backup.py --stats               # last_backup_at + count + bytes
     py mailbox-backup.py --list                # all snapshots, newest first
+    py mailbox-backup.py --list --since 7d     # only backups taken in last 7d
     py mailbox-backup.py --once                # take one backup + rolling prune
     py mailbox-backup.py --restore <ts>        # restore from a timestamp (needs --yes)
     py mailbox-backup.py --restore mailbox-backup-20260523-020000.db --yes
+    py mailbox-backup.py --restore now-3d --yes # restore newest snapshot <= 3 days old
+    py mailbox-backup.py --restore now-2h --yes # restore newest snapshot <= 2 hours old
     py mailbox-backup.py --once --backup-dir /custom/path
     py mailbox-backup.py --once --db /custom/mailbox.db
 
 Defaults: backup dir = ~/.claude/mailbox/backups/ (= <db parent>/backups, matches
 server). Rolling retention = 7 daily / 4 weekly / 3 monthly (matches server).
+
+Relative time syntax (--since, --restore now-X): `15m` / `2h` / `7d`.
 """
 import argparse
 import json
 import re
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import mailbox_backup
@@ -30,14 +36,61 @@ DEFAULT_DB = Path.home() / ".claude" / "mailbox" / "mailbox.db"
 # (mailbox-backup-20260523-020000.db / -attachments.tar.gz).
 _TS_BARE = re.compile(r"^(\d{8}-\d{6})$")
 _TS_FROM_NAME = re.compile(r"mailbox-backup-(\d{8}-\d{6})")
+_RELATIVE = re.compile(r"^(\d+)([mhd])$")
+_NOW_MINUS = re.compile(r"^now-(\d+)([mhd])$")
+_BACKUP_TS = re.compile(r"^(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})$")
 
 
-def _extract_timestamp(arg: str) -> str | None:
+def _parse_relative(spec: str) -> timedelta:
+    """Parse `15m` / `2h` / `7d` into a timedelta. Raises ValueError on bad input."""
+    m = _RELATIVE.match(spec)
+    if not m:
+        raise ValueError(f"bad relative spec: {spec!r}")
+    n = int(m.group(1))
+    unit = m.group(2)
+    if unit == "m":
+        return timedelta(minutes=n)
+    if unit == "h":
+        return timedelta(hours=n)
+    return timedelta(days=n)
+
+
+def _ts_to_dt(ts: str) -> datetime | None:
+    """Parse a YYYYMMDD-HHMMSS backup timestamp into UTC datetime."""
+    m = _BACKUP_TS.match(ts)
+    if not m:
+        return None
+    y, mo, d, h, mi, s = (int(g) for g in m.groups())
+    return datetime(y, mo, d, h, mi, s, tzinfo=timezone.utc)
+
+
+def _extract_timestamp(arg: str, backup_dir: Path) -> str | None:
+    """Resolve a --restore arg into a backup timestamp.
+
+    Accepts:
+      - bare timestamp: 20260523-020000
+      - full filename: mailbox-backup-20260523-020000.db
+      - relative `now-Xd|Xh|Xm`: returns the newest backup older than X
+    """
     if _TS_BARE.match(arg):
         return arg
     m = _TS_FROM_NAME.search(arg)
     if m:
         return m.group(1)
+    nm = _NOW_MINUS.match(arg)
+    if nm:
+        delta = _parse_relative(arg[len("now-"):])
+        cutoff = datetime.now(timezone.utc) - delta
+        # Find newest backup with ts <= cutoff
+        candidates: list[tuple[datetime, str]] = []
+        for item in mailbox_backup.list_backups(backup_dir):
+            dt = _ts_to_dt(item["timestamp"])
+            if dt is not None and dt <= cutoff:
+                candidates.append((dt, item["timestamp"]))
+        if not candidates:
+            return None
+        candidates.sort(reverse=True)
+        return candidates[0][1]
     return None
 
 
@@ -69,6 +122,10 @@ def main() -> int:
                    help="restore from this timestamp (overwrites live data; needs --yes)")
     p.add_argument("--yes", action="store_true",
                    help="skip interactive confirm for --restore")
+    p.add_argument("--since", metavar="DURATION",
+                   help="for --list: only show backups newer than this "
+                        "(e.g. 1h / 7d / 30d). For --restore: use 'now-X' "
+                        "syntax in --restore arg instead.")
     p.add_argument("--keep-daily", type=int, default=mailbox_backup.DEFAULT_KEEP_DAILY)
     p.add_argument("--keep-weekly", type=int, default=mailbox_backup.DEFAULT_KEEP_WEEKLY)
     p.add_argument("--keep-monthly", type=int, default=mailbox_backup.DEFAULT_KEEP_MONTHLY)
@@ -106,6 +163,19 @@ def main() -> int:
     # --- --list ---
     if args.list:
         items = mailbox_backup.list_backups(args.backup_dir)
+        if args.since:
+            try:
+                delta = _parse_relative(args.since)
+            except ValueError as e:
+                print(f"bad --since: {e}", file=sys.stderr)
+                return 2
+            cutoff = datetime.now(timezone.utc) - delta
+            filtered = []
+            for item in items:
+                dt = _ts_to_dt(item["timestamp"])
+                if dt is not None and dt >= cutoff:
+                    filtered.append(item)
+            items = filtered
         if args.json:
             print(json.dumps(items, indent=2, ensure_ascii=False))
         else:
@@ -146,10 +216,11 @@ def main() -> int:
         return 0
 
     # --- --restore ---
-    ts = _extract_timestamp(args.restore)
+    ts = _extract_timestamp(args.restore, args.backup_dir)
     if ts is None:
         print(f"invalid --restore arg: {args.restore!r} "
-              "(expected YYYYMMDD-HHMMSS or mailbox-backup-...db filename)",
+              "(expected YYYYMMDD-HHMMSS, mailbox-backup-...db filename, "
+              "or now-<N>{m,h,d} matching an existing backup)",
               file=sys.stderr)
         return 2
 

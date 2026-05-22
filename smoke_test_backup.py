@@ -392,6 +392,89 @@ def test_5_docker_env_var_skip_with_note() -> None:
     print("\n[test 5] docker env-var verify: skipped (manual; see SETUP-CROSS-DEVICE.md)")
 
 
+def test_6_cli_relative_time_flags(workdir: Path) -> None:
+    """--list --since X / --restore now-X relative time syntax."""
+    print("\n[test 6] CLI relative-time flags (--since / --restore now-X)")
+    db = workdir / "mailbox.db"
+    attachments = workdir / "attachments"
+    attachments.mkdir(parents=True)
+    backup_dir = workdir / "backups"
+
+    init_db(db)
+    conn = sqlite3.connect(str(db))
+    insert_msg(conn, "x")
+    conn.close()
+
+    # Lay down 3 fake backups: 5h ago, 2d ago, 10d ago
+    now = datetime.now(timezone.utc)
+    for hours_ago, label in [(5, "5h_ago"), (48, "2d_ago"), (240, "10d_ago")]:
+        ts = now - timedelta(hours=hours_ago)
+        touch_fake_backup(backup_dir, ts, kind="db")
+
+    here = Path(__file__).parent
+    cli = str(here / "mailbox-backup.py")
+
+    # --list --since 24h → only the 5h_ago backup
+    r = subprocess.run(
+        [sys.executable, cli, "--list", "--since", "24h", "--json",
+         "--db", str(db), "--backup-dir", str(backup_dir),
+         "--attachments-dir", str(attachments)],
+        capture_output=True, text=True, timeout=10,
+    )
+    assert r.returncode == 0, f"--list --since failed: {r.stderr}"
+    items = json.loads(r.stdout)
+    assert len(items) == 1, \
+        f"--since 24h should return 1 backup (5h_ago), got {len(items)}: {items}"
+
+    # --list --since 7d → 5h_ago + 2d_ago
+    r = subprocess.run(
+        [sys.executable, cli, "--list", "--since", "7d", "--json",
+         "--db", str(db), "--backup-dir", str(backup_dir),
+         "--attachments-dir", str(attachments)],
+        capture_output=True, text=True, timeout=10,
+    )
+    assert r.returncode == 0
+    items = json.loads(r.stdout)
+    assert len(items) == 2, f"--since 7d should return 2 backups, got {len(items)}"
+
+    # Bad --since value
+    r = subprocess.run(
+        [sys.executable, cli, "--list", "--since", "wat",
+         "--db", str(db), "--backup-dir", str(backup_dir),
+         "--attachments-dir", str(attachments)],
+        capture_output=True, text=True, timeout=10,
+    )
+    assert r.returncode == 2 and "bad --since" in r.stderr
+
+    # --restore now-3d (without --yes → dry-run, exits 2 but extracts the
+    # newest backup older than 3d, which is 10d_ago)
+    r = subprocess.run(
+        [sys.executable, cli, "--restore", "now-3d",
+         "--db", str(db), "--backup-dir", str(backup_dir),
+         "--attachments-dir", str(attachments)],
+        capture_output=True, text=True, timeout=10,
+    )
+    assert r.returncode == 2, f"dry-run --restore should return 2, got {r.returncode}"
+    # Stderr should mention the resolved timestamp (10d_ago)
+    ten_days_ts = (now - timedelta(hours=240)).strftime("%Y%m%d-%H%M%S")
+    assert ten_days_ts in r.stderr, \
+        f"expected resolved ts {ten_days_ts} in stderr, got: {r.stderr}"
+
+    # --restore now-99d when no backup that old → not_found
+    r = subprocess.run(
+        [sys.executable, cli, "--restore", "now-99d",
+         "--db", str(db), "--backup-dir", str(backup_dir),
+         "--attachments-dir", str(attachments)],
+        capture_output=True, text=True, timeout=10,
+    )
+    assert r.returncode == 2
+    assert ("invalid --restore" in r.stderr or "restore failed" in r.stderr
+            or "no" in r.stderr.lower()), \
+        f"expected resolution-fail message, got: {r.stderr}"
+
+    print(f"  --since 24h→1, --since 7d→2, --restore now-3d resolves to {ten_days_ts}")
+
+
 def main() -> int:
     workdir = Path(tempfile.mkdtemp(prefix="mailbox-backup-smoke-"))
     print(f"[smoke] workdir={workdir}")
@@ -405,6 +488,9 @@ def main() -> int:
             sub.mkdir()
             fn(sub)
         test_5_docker_env_var_skip_with_note()
+        sub6 = workdir / "t6"
+        sub6.mkdir()
+        test_6_cli_relative_time_flags(sub6)
     finally:
         # Best-effort cleanup
         shutil.rmtree(workdir, ignore_errors=True)
