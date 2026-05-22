@@ -58,24 +58,54 @@ ipconfig | findstr IPv4
 Pick the 192.168.x.x line that matches your home wifi/ethernet. Optional:
 reserve this IP in your router's DHCP so it doesn't change.
 
-### 0.4 Start the server (foreground, smoke test first)
+### 0.4 Start the server via docker compose (preferred)
+
+`mailbox-server` is wired into the same `bridge/docker-compose.yml` as the
+existing `mailbox-bridge`. Both share `~/.claude/mailbox/` volume so they hit
+the same SQLite.
+
+**Add token to `.env`** (gitignored, same file the bridge already reads):
+
+```powershell
+cd C:\Users\User\Desktop\VSCcode\claude-mailbox\bridge
+# If .env doesn't exist yet:  cp .env.example .env
+# Append the token:
+$tok = Get-Content C:\Users\User\.claude\mailbox\token.txt
+Add-Content .env "CLAUDE_MAILBOX_TOKEN=$tok"
+```
+
+**Bring up the service**:
+
+```powershell
+docker compose up -d mailbox-server
+```
+
+(Or `docker compose up -d` to ensure both `mailbox-bridge` and `mailbox-server`
+are running.)
+
+**Verify**:
+
+```powershell
+docker compose logs --tail 5 mailbox-server
+# Expected:
+#   [mailbox-server] listening on http://0.0.0.0:1905  db=/data/mailbox.db
+#   [mailbox-server] bearer token: <prefix>... (length 43)
+
+curl http://127.0.0.1:1905/health
+# ok
+```
+
+Container has `restart: always` so it survives Docker Desktop restart / reboot
+automatically — no Task Scheduler / NSSM needed.
+
+**Manual run (debug-only fallback)**:
 
 ```powershell
 $env:CLAUDE_MAILBOX_TOKEN = Get-Content C:\Users\User\.claude\mailbox\token.txt
 py C:\Users\User\Desktop\VSCcode\claude-mailbox\mailbox-server.py
 ```
 
-Expected output:
-```
-[mailbox-server] listening on http://0.0.0.0:1905  db=C:\Users\User\.claude\mailbox\mailbox.db
-[mailbox-server] bearer token: <prefix>... (length 43)
-```
-
-In a second shell verify locally:
-```powershell
-curl http://127.0.0.1:1905/health
-# ok
-```
+Use this only when diagnosing — e.g. to see live stderr without `docker logs`.
 
 ### 0.5 Allow inbound :1905 in Windows Firewall
 
@@ -88,16 +118,14 @@ New-NetFirewallRule -DisplayName "mailbox-server :1905" `
 
 Adjust `RemoteAddress` to your LAN range (e.g. `100.64.0.0/10` for Tailscale-only).
 
-### 0.6 Make it survive reboot (optional)
+### 0.6 Make it survive reboot
 
-Quickest: Task Scheduler → "At log on" → Action:
-```
-py.exe  C:\Users\User\Desktop\VSCcode\claude-mailbox\mailbox-server.py
-```
-with `CLAUDE_MAILBOX_TOKEN` env set on the action (Settings tab → "Environment").
+If you used Phase 0.4's docker compose path, **already done** — container has
+`restart: always`. Docker Desktop auto-starts on Windows login, and the
+container then auto-starts inside.
 
-Cleaner: wrap with [NSSM](https://nssm.cc/) into a Windows Service so it
-restarts on crash.
+(If you're using the manual run fallback, then use Task Scheduler "At log on"
+or NSSM to wrap, but docker is the recommended path.)
 
 ---
 

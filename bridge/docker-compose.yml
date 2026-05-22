@@ -1,13 +1,20 @@
-# Discord bridge service. Lives entirely in claude-mailbox/bridge/ since
-# 2026-05-19 — Python package + .env + compose all colocated.
+# Mailbox compose — runs two services:
+#
+#   mailbox-bridge :1904   Discord ↔ mailbox bridge (existing since 2026-05-19)
+#   mailbox-server :1905   REST/SSE for cross-device spokes (since 2026-05-22)
+#
+# Both share /data = host `C:/Users/User/.claude/mailbox/` so they hit the
+# same SQLite mailbox.db.
 #
 # Reads `.env` next to this file. See `.env.example` for required vars.
 #
 # Apply changes (cwd must be this directory so .env is auto-loaded):
 #   cd C:/Users/User/Desktop/VSCcode/claude-mailbox/bridge
-#   docker compose up -d                          # start
+#   docker compose up -d                          # start both services
+#   docker compose up -d mailbox-server           # start just server
 #   docker compose up -d --force-recreate         # apply config / .env changes
-#   docker compose down                           # stop
+#   docker compose down                           # stop both
+#   docker compose logs -f mailbox-server         # tail logs
 #
 # Network: shares `animesite_other-networks-main` (external) with the
 # discordBot node-red container so the bridge can reach discordBot:1880
@@ -52,6 +59,36 @@ services:
       - "bash"
       - "-c"
       - "pip install --quiet 'discord.py>=2.7,<3' && exec python -m bridge --db /data/mailbox.db --bind 0.0.0.0 --port 1904"
+    networks:
+      - animesite_other-networks-main
+
+  mailbox-server:
+    # Cross-device REST + SSE for spoke agents (laptop, VPS, etc).
+    # Pure stdlib Python; no dependencies to install.
+    image: python:3.12-slim
+    container_name: mailbox-server
+    restart: always
+    ports:
+      - "1905:1905"
+    environment:
+      - TZ=Asia/Taipei
+      # Required. Server refuses to start if unset or shorter than 16 chars.
+      - CLAUDE_MAILBOX_TOKEN=${CLAUDE_MAILBOX_TOKEN:?CLAUDE_MAILBOX_TOKEN required (see .env.example)}
+    volumes:
+      # mount the script read-only (../mailbox-server.py is at repo root)
+      - ../mailbox-server.py:/app/mailbox-server.py:ro
+      # share the SAME mailbox dir as mailbox-bridge so both hit the same db
+      - C:/Users/User/.claude/mailbox:/data
+    working_dir: /app
+    command:
+      - "python"
+      - "mailbox-server.py"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "1905"
+      - "--db"
+      - "/data/mailbox.db"
     networks:
       - animesite_other-networks-main
 
