@@ -156,6 +156,21 @@ def _migration_v006_pinned(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migration_v007_snoozed(conn: sqlite3.Connection) -> None:
+    """messages.snoozed_until + partial index.
+
+    Added 2026-05-23 snooze feature. ISO 8601 timestamp; inbox() default
+    filters rows where snoozed_until > now. include_snoozed=True bypasses.
+    Partial index covers only snoozed rows.
+    """
+    if "snoozed_until" not in _messages_columns(conn):
+        conn.execute("ALTER TABLE messages ADD COLUMN snoozed_until TEXT")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_messages_snoozed "
+        "ON messages(snoozed_until) WHERE snoozed_until IS NOT NULL"
+    )
+
+
 # Canonical migration list. Append only; never re-order or delete.
 # `version` must be sequential starting from 1.
 MIGRATIONS: list[tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
@@ -165,6 +180,7 @@ MIGRATIONS: list[tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (4, "messages_claim_visibility_timeout", _migration_v004_claim),
     (5, "messages_priority_with_partial_index", _migration_v005_priority),
     (6, "messages_pinned_with_partial_index", _migration_v006_pinned),
+    (7, "messages_snoozed_until_with_partial_index", _migration_v007_snoozed),
 ]
 
 

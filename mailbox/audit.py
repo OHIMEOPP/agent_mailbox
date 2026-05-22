@@ -38,6 +38,8 @@ ACTIONS = frozenset({
     "rate_limit_rejected",  # request denied by rate limiter (429)
     "pin",        # pin a message (top of inbox, exempt from retention)
     "unpin",      # remove pin
+    "snooze",     # hide message from inbox until wake_at time
+    "unsnooze",   # remove snooze immediately
 })
 
 DEFAULT_TAIL_LIMIT = 50

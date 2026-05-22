@@ -53,6 +53,7 @@ from mailbox import priority as mailbox_priority
 from mailbox import rate_limit as mailbox_rate_limit
 from mailbox import reactions as mailbox_reactions
 from mailbox import scheduled as mailbox_scheduled
+from mailbox import snoozed as mailbox_snoozed
 from mailbox import sweep as mailbox_sweep
 from mailbox import webhooks as mailbox_webhooks
 
@@ -137,7 +138,8 @@ def db_init(path: pathlib.Path):
             claimed_by TEXT,
             claimed_until TEXT,
             priority INTEGER NOT NULL DEFAULT 0,
-            pinned INTEGER NOT NULL DEFAULT 0
+            pinned INTEGER NOT NULL DEFAULT 0,
+            snoozed_until TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_to_unread
             ON messages(to_name, read_at);
@@ -470,6 +472,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # Pinned count
             pin_stats = mailbox_pinned.stats(srv.db_path)
             payload.update(pin_stats)
+            # Snooze counters
+            snooze_stats = mailbox_snoozed.stats(srv.db_path)
+            payload.update(snooze_stats)
             return self._json(200, payload)
 
         if not self._check_auth():
@@ -490,8 +495,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 min_priority = int(first("min_priority", "0"))
             except ValueError:
                 return self._json(400, {"error": "min_priority must be int"})
+            include_snoozed = first("include_snoozed", "0") in ("1", "true", "yes")
             sql = ("SELECT id, from_name, to_name, body, sent_at, read_at, has_attachments, "
-                   "in_reply_to, expires_at, claimed_by, claimed_until, priority, pinned "
+                   "in_reply_to, expires_at, claimed_by, claimed_until, priority, pinned, "
+                   "snoozed_until "
                    "FROM messages WHERE to_name=?")
             args: list = [name]
             if unread_only:
@@ -503,6 +510,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if min_priority > 0:
                 sql += " AND priority >= ?"
                 args.append(min_priority)
+            if not include_snoozed:
+                sql += (" AND (snoozed_until IS NULL "
+                        "OR snoozed_until <= strftime('%Y-%m-%dT%H:%M:%fZ','now'))")
             # Pinned first (always surface), then priority DESC (urgent), then id ASC (FIFO)
             sql += " ORDER BY pinned DESC, priority DESC, id ASC LIMIT ?"
             args.append(limit)
@@ -838,6 +848,52 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 srv.db_path, actor=payload["actor"], action="unpin",
                 target=str(payload["message_id"]),
                 payload={"was_pinned": result["was_pinned"]},
+            )
+            return self._json(200, result)
+
+        if path == "/snooze":
+            for k in ("actor", "message_id", "until"):
+                if k not in payload:
+                    return self._json(400, {"error": f"missing field: {k}"})
+            if not isinstance(payload["actor"], str) or not isinstance(payload["until"], str):
+                return self._json(400, {"error": "actor + until must be strings"})
+            if not isinstance(payload["message_id"], int):
+                return self._json(400, {"error": "message_id must be int"})
+            try:
+                result = mailbox_snoozed.snooze(
+                    srv.db_path, payload["message_id"], payload["actor"],
+                    payload["until"],
+                )
+            except FileNotFoundError as e:
+                return self._json(404, {"error": str(e)})
+            except ValueError as e:
+                return self._json(400, {"error": str(e)})
+            mailbox_audit.log_event(
+                srv.db_path, actor=payload["actor"], action="snooze",
+                target=str(payload["message_id"]),
+                payload={"snoozed_until": result["snoozed_until"],
+                         "was_snoozed": result["was_snoozed"]},
+            )
+            return self._json(200, result)
+
+        if path == "/unsnooze":
+            for k in ("actor", "message_id"):
+                if k not in payload:
+                    return self._json(400, {"error": f"missing field: {k}"})
+            if not isinstance(payload["actor"], str):
+                return self._json(400, {"error": "actor must be string"})
+            if not isinstance(payload["message_id"], int):
+                return self._json(400, {"error": "message_id must be int"})
+            try:
+                result = mailbox_snoozed.unsnooze(
+                    srv.db_path, payload["message_id"], payload["actor"],
+                )
+            except FileNotFoundError as e:
+                return self._json(404, {"error": str(e)})
+            mailbox_audit.log_event(
+                srv.db_path, actor=payload["actor"], action="unsnooze",
+                target=str(payload["message_id"]),
+                payload={"was_snoozed": result["was_snoozed"]},
             )
             return self._json(200, result)
 

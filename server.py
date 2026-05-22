@@ -36,6 +36,7 @@ from mailbox import pinned as mailbox_pinned
 from mailbox import priority as mailbox_priority
 from mailbox import reactions as mailbox_reactions
 from mailbox import scheduled as mailbox_scheduled
+from mailbox import snoozed as mailbox_snoozed
 from mcp.server.fastmcp import FastMCP
 
 # Mailing-list / glob fanout settings (must match mailbox-server.py)
@@ -201,7 +202,8 @@ def _init_db() -> None:
                 has_attachments INTEGER NOT NULL DEFAULT 0,
                 in_reply_to INTEGER,
                 priority INTEGER NOT NULL DEFAULT 0,
-                pinned INTEGER NOT NULL DEFAULT 0
+                pinned INTEGER NOT NULL DEFAULT 0,
+                snoozed_until TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_messages_to_unread
                 ON messages(to_name, read_at);
@@ -580,7 +582,8 @@ def send(to: str, body: str, files: list[str] | None = None,
 @mcp.tool()
 def inbox(unread_only: bool = True, limit: int = 50,
           claimable_only: bool = False,
-          min_priority: int = 0) -> list[dict]:
+          min_priority: int = 0,
+          include_snoozed: bool = False) -> list[dict]:
     """Fetch messages addressed to this instance.
 
     Args:
@@ -604,9 +607,11 @@ def inbox(unread_only: bool = True, limit: int = 50,
     if REMOTE:
         unread_flag = "1" if unread_only else "0"
         claimable_flag = "1" if claimable_only else "0"
+        snoozed_flag = "1" if include_snoozed else "0"
         r = _remote("GET",
                     f"/inbox?name={NAME}&unread={unread_flag}&limit={limit}"
-                    f"&claimable={claimable_flag}&min_priority={min_priority}")
+                    f"&claimable={claimable_flag}&min_priority={min_priority}"
+                    f"&include_snoozed={snoozed_flag}")
         return [
             {"id": m["id"], "from": m["from_name"], "body": m["body"],
              "sent_at": m["sent_at"], "read_at": m["read_at"],
@@ -616,13 +621,15 @@ def inbox(unread_only: bool = True, limit: int = 50,
              "expires_at": m.get("expires_at"),
              "priority": m.get("priority", 0),
              "pinned": bool(m.get("pinned", 0)),
+             "snoozed_until": m.get("snoozed_until"),
              "attachments": m.get("attachments", []),
              "reactions": m.get("reactions", [])}
             for m in r["messages"]
         ]
 
     sql = ("SELECT id, from_name, body, sent_at, read_at, has_attachments, "
-           "in_reply_to, expires_at, claimed_by, claimed_until, priority, pinned "
+           "in_reply_to, expires_at, claimed_by, claimed_until, priority, pinned, "
+           "snoozed_until "
            "FROM messages WHERE to_name = ?")
     params: list = [NAME]
     if unread_only:
@@ -635,6 +642,11 @@ def inbox(unread_only: bool = True, limit: int = 50,
     if min_priority > 0:
         sql += " AND priority >= ?"
         params.append(min_priority)
+    if not include_snoozed:
+        # Hide rows that are still snoozed (snoozed_until > now). Use COALESCE
+        # so pre-v007 schemas (no column) just no-op the filter.
+        sql += (" AND (snoozed_until IS NULL "
+                "OR snoozed_until <= strftime('%Y-%m-%dT%H:%M:%fZ','now'))")
     # Pinned first (always surface), then priority DESC, then id ASC (FIFO within band)
     sql += " ORDER BY pinned DESC, priority DESC, id ASC LIMIT ?"
     params.append(limit)
@@ -669,6 +681,7 @@ def inbox(unread_only: bool = True, limit: int = 50,
                 "expires_at": r["expires_at"],
                 "priority": r["priority"],
                 "pinned": bool(r["pinned"]),
+                "snoozed_until": r["snoozed_until"],
                 "attachments": atts_by_msg.get(r["id"], []),
                 "reactions": reactions_by_msg.get(r["id"], []),
             })
@@ -1066,6 +1079,66 @@ def unpin(message_id: int) -> dict:
     mailbox_audit.log_event(
         DB_PATH, actor=NAME, action="unpin", target=str(message_id),
         payload={"was_pinned": result["was_pinned"]},
+    )
+    return result
+
+
+@mcp.tool()
+def snooze(message_id: int, until: str) -> dict:
+    """Snooze a message — hide from inbox until `until` elapses.
+
+    Use case: "deal with this in 1 hour" without re-sending. The message
+    pops back up on the next inbox() poll after `until`. mark_read does
+    NOT auto-unsnooze; the two are independent (snooze hides, mark_read
+    flags processed).
+
+    Args:
+        message_id: id of message to snooze
+        until: ISO 8601 timestamp (`2026-05-23T10:00:00Z`) OR relative
+               shorthand (`30m`, `1h`, `7d`).
+
+    Returns:
+        {snoozed_until, id, actor, was_snoozed}.
+    """
+    if REMOTE:
+        r = _remote("POST", "/snooze",
+                    {"actor": NAME, "message_id": message_id, "until": until})
+        return r
+    try:
+        result = mailbox_snoozed.snooze(DB_PATH, message_id, NAME, until)
+    except FileNotFoundError as e:
+        raise RuntimeError(str(e))
+    except ValueError as e:
+        raise RuntimeError(str(e))
+    mailbox_audit.log_event(
+        DB_PATH, actor=NAME, action="snooze", target=str(message_id),
+        payload={"snoozed_until": result["snoozed_until"],
+                 "was_snoozed": result["was_snoozed"]},
+    )
+    return result
+
+
+@mcp.tool()
+def unsnooze(message_id: int) -> dict:
+    """Clear a snooze immediately — message becomes visible again on next inbox.
+
+    Args:
+        message_id: id of message to unsnooze
+
+    Returns:
+        {id, actor, was_snoozed}.
+    """
+    if REMOTE:
+        r = _remote("POST", "/unsnooze",
+                    {"actor": NAME, "message_id": message_id})
+        return r
+    try:
+        result = mailbox_snoozed.unsnooze(DB_PATH, message_id, NAME)
+    except FileNotFoundError as e:
+        raise RuntimeError(str(e))
+    mailbox_audit.log_event(
+        DB_PATH, actor=NAME, action="unsnooze", target=str(message_id),
+        payload={"was_snoozed": result["was_snoozed"]},
     )
     return result
 
