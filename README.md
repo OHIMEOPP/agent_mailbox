@@ -287,11 +287,36 @@ py mailbox-attach.py --from wiki@DESKTOP --to wiki@LAPTOP \
 
 **Blob 儲存**：hub 端用 content-addressed 路徑 `<mailbox-dir>/attachments/<sha256[:2]>/<sha256>`，同 hash 自動 dedup。SSE event payload 加 `attachments: [{id, filename, mime, size}]` 欄位（additive，舊 spoke 不認該欄不會炸）。
 
+## 維運 / Retention（自 2026-05-23）
+
+Mailbox 本質是 transient queue — 訊息、附件、blob、peer heartbeat 都**不該存很久**。Hub 端內建 daily sweep daemon，避免長期累積。
+
+| Item | TTL | Env var |
+|---|---|---|
+| Read messages | 7d | `MAILBOX_RETENTION_READ_DAYS` |
+| Unread messages | 14d | `MAILBOX_RETENTION_UNREAD_DAYS` |
+| Peer rows | 30d | `MAILBOX_RETENTION_PEER_DAYS` |
+| Blobs | 跟著 attachment / sha256 reference | (auto, no knob) |
+
+**自動**：daily（24hr）背景 thread，第一次跑在 boot 後 1hr。`MAILBOX_RETENTION_DISABLED=1` 關掉。
+
+**手動 CLI**：
+```bash
+py mailbox-retention.py --stats      # 看 disk / 訊息數 / oldest age
+py mailbox-retention.py --dry-run    # 報告會刪什麼，不真刪
+py mailbox-retention.py --once       # 立即跑一次 sweep
+```
+
+**觀測**：`curl /health` 回 JSON，含 `unread_count`、`blob_count`、`blob_total_bytes`、`oldest_message_age_days`、`last_sweep_at`。最後欄 > 25hr 沒更新 = sweep daemon 死了。
+
+設定 / tuning 細節：[SETUP-CROSS-DEVICE.md Phase 5](SETUP-CROSS-DEVICE.md#phase-5--retention-since-2026-05-23)
+
 ## Bridge / 周邊工具
 
 - `mailbox-discord-bridge.py` — Docker container `mailbox-bridge`（port 1904）。**Inbound only**：Discord DM → mailbox INSERT。Agent **不直接 call** 這個 port，是 Discord bot 自動推進來。看完整 e2e 流程圖：[Discord 整合：兩個 port，分工不對稱](#discord-整合兩個-port分工不對稱)
 - `mailbox-discord-file.py` — CLI，推檔到使用者 Discord DM（port 1904 bridge），**走 Discord REST API**。跟下面 `mailbox-attach.py` 不同：那個是 agent ↔ agent，這個是 agent → Discord user。
 - `mailbox-attach.py` — CLI，cross-device 寄訊息+檔案到 peer agent mailbox（port 1905 hub server）。MCP `send(files=[...])` 的 shell 等價物。
+- `mailbox-retention.py` — CLI，手動 trigger retention sweep / 看 stats / dry-run（hub-only）
 - `mailbox-dump.py` — 撈 mailbox 歷史；wiki session 有 slash command `/mblog` 跟 `/觀看紀錄` 包好
 - `mailbox-whitelist.py` — Discord 來源信任名單 CLI（trusted / approved / pending），see [discord-stranger-chat](https://github.com/OHIMEOPP/discord-stranger-chat) 設計
 

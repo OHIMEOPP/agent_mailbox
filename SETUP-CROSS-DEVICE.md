@@ -92,7 +92,9 @@ docker compose logs --tail 5 mailbox-server
 #   [mailbox-server] bearer token: <prefix>... (length 43)
 
 curl http://127.0.0.1:1905/health
-# ok
+# Since 2026-05-23: returns JSON {ok:true, unread_count, blob_count, blob_total_bytes,
+#   oldest_message_age_days, peer_count, last_sweep_at, ...}
+# Old text "ok" deprecated — substring grep for "ok" still matches.
 ```
 
 Container has `restart: always` so it survives Docker Desktop restart / reboot
@@ -202,7 +204,7 @@ user → user fetches from hub-side agent (or directly from `token.txt` /
 
 ```powershell
 curl http://<HUB_IP>:1905/health
-# Expected: ok
+# Expected: JSON containing "ok":true plus observability fields
 
 curl -H "Authorization: Bearer <TOKEN>" http://<HUB_IP>:1905/peers
 # Expected: JSON list of peers including the hub's known agents
@@ -405,7 +407,7 @@ After both phases, run this checklist on the laptop:
 ```powershell
 # 1. Hub reachable
 curl http://<HUB_IP>:1905/health
-# Expected: ok
+# Expected: JSON with "ok":true
 
 # 2. Auth works
 curl -H "Authorization: Bearer <TOKEN>" http://<HUB_IP>:1905/peers
@@ -557,6 +559,99 @@ If a token leaks:
 
 ---
 
+## Phase 5 — Retention (since 2026-05-23)
+
+Mailbox is a transient message queue — nothing should accumulate indefinitely. Hub runs a background daily sweep that deletes old messages, frees orphan blobs, and drops stale peer rows.
+
+### Defaults
+
+| Item | TTL | Rationale |
+|---|---|---|
+| Read messages | 7 days | already processed, no value |
+| Unread messages | 14 days | likely stale dead-letter |
+| Peer rows | 30 days | no heartbeat = long-gone machine |
+| Attachment rows | tied to message | cascade when message goes |
+| Blobs on disk | tied to last referencing attachment | content-addressed; reused blobs survive |
+
+### Sweep daemon (hub-side, automatic)
+
+The container's `mailbox-server.py` spawns a daemon thread at boot that:
+1. Waits **1 hour grace** (avoid noise on boot)
+2. Sweeps, logs `[sweep] deleted N read / N unread / N attach rows / N blobs (XMB freed) / N peers`
+3. Sleeps **24 hours**
+4. Repeats
+
+State is in-memory only — `LAST_SWEEP_AT` and counters surface via `/health`.
+
+### Config (env vars)
+
+| Var | Default | Purpose |
+|---|---|---|
+| `MAILBOX_RETENTION_READ_DAYS` | 7 | read messages older than this → delete |
+| `MAILBOX_RETENTION_UNREAD_DAYS` | 14 | unread messages older than this → delete |
+| `MAILBOX_RETENTION_PEER_DAYS` | 30 | peer heartbeat older than this → drop row |
+| `MAILBOX_RETENTION_DISABLED` | (unset) | set to `1` to skip auto-sweep (CLI still works) |
+
+Wired into `bridge/docker-compose.yml` — override in `bridge/.env`:
+
+```env
+MAILBOX_RETENTION_READ_DAYS=3
+MAILBOX_RETENTION_UNREAD_DAYS=7
+```
+
+Then `docker compose up -d --force-recreate mailbox-server`.
+
+### Manual CLI (`mailbox-retention.py`)
+
+Lives in the repo root. Operates directly on the SQLite DB (server doesn't need to be running):
+
+```powershell
+py mailbox-retention.py --stats
+# db / attachments dir / counts / oldest message age
+
+py mailbox-retention.py --dry-run
+# [sweep] DRY-RUN: would have deleted N read / N unread / ... — no writes
+
+py mailbox-retention.py --once
+# [sweep] deleted N read / N unread / ... — does the sweep
+
+py mailbox-retention.py --once --read-days 3 --unread-days 7
+# override retention windows for this run only
+
+py mailbox-retention.py --stats --json
+# machine-readable output for piping into other tools
+```
+
+The CLI uses `mailbox_sweep` (importable module) — same code path as the daemon, so output matches.
+
+### /health observability
+
+```bash
+curl http://<HUB_IP>:1905/health
+# {
+#   "ok": true,
+#   "unread_count": 3,
+#   "message_count": 47,
+#   "attachment_count": 5,
+#   "blob_count": 4,
+#   "blob_total_bytes": 13_421_770,
+#   "oldest_message_age_days": 5.2,
+#   "peer_count": 4,
+#   "last_sweep_at": "2026-05-22T22:00:14Z",
+#   "last_sweep_counters": { ... }
+# }
+```
+
+`last_sweep_at` is `null` until first sweep completes (1hr after server boot). Use this for monitoring — if it falls > 25hr stale, sweep daemon died.
+
+### What's NOT swept
+
+- **Pinned messages**: no such feature. If you need to keep something forever, dump to wiki via `mailbox-dump.py` before TTL.
+- **WAL files**: server uses `journal_mode=DELETE` — nothing accumulates there.
+- **Pip cache** (bridge container at `/data/.pip-cache`): tiny, ignored. Manually `rm -rf` if you really want.
+
+---
+
 ## What is NOT installed on the spoke
 
 You do **not** need on the laptop:
@@ -564,6 +659,7 @@ You do **not** need on the laptop:
 - `mailbox-bridge` (Discord container — hub-only)
 - `mailbox-followup.py` (admin tool — hub-only)
 - `mailbox-whitelist.py` (admin tool — hub-only)
+- `mailbox-retention.py` (hub-only — operates on hub's DB; spoke has no local DB)
 
 Just `server.py` (MCP, with REMOTE env) + `mailbox-watch.py` (SSE client).
 That's it.
