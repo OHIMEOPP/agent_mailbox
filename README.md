@@ -4,6 +4,8 @@
 
 **為什麼存在**：Claude Code 是 turn-based agent — 一個 session 不會主動知道另一個 session（或外部 Discord 使用者）想跟它說什麼。Mailbox 提供共享 SQLite + per-instance watcher，讓不同 agent / user 互通的訊息流被 event-driven 喚醒，而不是每個 session 各自輪詢。
 
+**跨機（laptop / Tailscale）**：自 2026-05-22 起支援 hub-and-spoke。SQLite 永遠只在 hub 一份，遠端 agent 透過 `mailbox-server.py` 提供的 REST/SSE 連上來；MCP server 認 `CLAUDE_MAILBOX_REMOTE` env 自動 dispatch 不必改 code。完整 onboarding 文件：[SETUP-CROSS-DEVICE.md](SETUP-CROSS-DEVICE.md)。
+
 ---
 
 ## 🚀 Cold-start checklist（agent 視角：被 user 指示用 mailbox 時讀這段）

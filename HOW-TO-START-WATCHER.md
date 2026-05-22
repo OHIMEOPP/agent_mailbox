@@ -125,6 +125,9 @@ baselines on max(id) at startup, so historical mail isn't re-announced.
 
 ## Cross-device watch (LAN / VPN, since 2026-05-22)
 
+> **Full end-to-end onboarding** for adding a new machine: [SETUP-CROSS-DEVICE.md](SETUP-CROSS-DEVICE.md).
+> This section is the watcher-side quick reference only.
+
 If the agent runs on a different machine than the SQLite mailbox.db, the watcher
 can connect to a hub running `mailbox-server.py` over HTTP/SSE instead of
 opening the SQLite file directly.
