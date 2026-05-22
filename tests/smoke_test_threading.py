@@ -127,7 +127,7 @@ def main() -> int:
 
     env = os.environ.copy()
     env["CLAUDE_MAILBOX_TOKEN"] = token
-    here = Path(__file__).parent
+    here = Path(__file__).parent.parent
     proc = subprocess.Popen(
         [sys.executable, str(here / "mailbox-server.py"),
          "--host", "127.0.0.1", "--port", str(port),
@@ -263,10 +263,10 @@ def test_migration() -> int:
             [sys.executable, "-c",
              "import sys, pathlib; sys.path.insert(0, '.'); "
              "import importlib.util; "
-             f"spec = importlib.util.spec_from_file_location('m', r'{Path(__file__).parent / 'mailbox-server.py'}'); "
+             f"spec = importlib.util.spec_from_file_location('m', r'{Path(__file__).parent.parent / 'mailbox-server.py'}'); "
              "m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m); "
              f"m.db_init(pathlib.Path(r'{db}')); print('init ok')"],
-            cwd=str(Path(__file__).parent),
+            cwd=str(Path(__file__).parent.parent),
             capture_output=True, text=True, timeout=10,
         )
         if result.returncode != 0:

@@ -28,7 +28,7 @@ import time
 from pathlib import Path
 from urllib.parse import urlparse
 
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 import mailbox_webhooks  # noqa: E402
 
 

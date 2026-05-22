@@ -25,7 +25,7 @@ import tempfile
 from pathlib import Path
 
 # Local import via path manipulation since this file is alongside the module
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 import mailbox_sweep  # noqa: E402
 
 
@@ -226,7 +226,7 @@ def main() -> int:
     print(f"[smoke] idempotent re-sweep ok")
 
     # --- Test 9: CLI subprocess test ---
-    here = Path(__file__).parent
+    here = Path(__file__).parent.parent
     result = subprocess.run(
         [sys.executable, str(here / "mailbox-retention.py"),
          "--db", str(db), "--stats", "--json"],

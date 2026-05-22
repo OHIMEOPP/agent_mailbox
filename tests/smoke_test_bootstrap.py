@@ -26,7 +26,7 @@ sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8",
 
 
 def run(args, cwd=None, input_text=None, timeout=15):
-    here = Path(__file__).parent
+    here = Path(__file__).parent.parent
     proc = subprocess.run(
         [sys.executable, str(here / "bootstrap-spoke.py")] + args,
         cwd=cwd, capture_output=True, text=True,

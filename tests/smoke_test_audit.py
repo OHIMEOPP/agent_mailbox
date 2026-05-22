@@ -21,7 +21,7 @@ import time
 from pathlib import Path
 
 # Local import via path manipulation since this file is alongside the module
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 import mailbox_audit  # noqa: E402
 
 
@@ -140,7 +140,7 @@ def test_4_cli_subprocess(db: Path) -> None:
     mailbox_audit.log_event(db, "cli-actor", "inbox",
                              payload={"returned": 5})
 
-    here = Path(__file__).parent
+    here = Path(__file__).parent.parent
     cli = str(here / "mailbox-audit.py")
 
     # --stats --json

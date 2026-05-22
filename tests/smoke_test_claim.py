@@ -87,7 +87,7 @@ def main() -> int:
     env["MAILBOX_RETENTION_DISABLED"] = "1"
     env["MAILBOX_BACKUP_DISABLED"] = "1"
     env["MAILBOX_SCHEDULED_DISABLED"] = "1"
-    here = Path(__file__).parent
+    here = Path(__file__).parent.parent
     proc = subprocess.Popen(
         [sys.executable, str(here / "mailbox-server.py"),
          "--host", "127.0.0.1", "--port", str(port),

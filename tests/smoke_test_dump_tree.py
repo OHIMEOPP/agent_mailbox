@@ -21,7 +21,7 @@ sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8",
 def main() -> int:
     workdir = Path(tempfile.mkdtemp(prefix="mailbox-dump-tree-smoke-"))
     db = workdir / "mailbox.db"
-    here = Path(__file__).parent
+    here = Path(__file__).parent.parent
     print(f"[smoke] workdir={workdir}")
 
     try:

@@ -26,7 +26,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # Local import via path manipulation since this file is alongside the module
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 import mailbox_backup  # noqa: E402
 
 
@@ -347,7 +347,7 @@ def test_4_cli_list_json(workdir: Path) -> None:
     counters = mailbox_backup.backup_once(db, attachments, backup_dir)
     assert counters["db_backup_path"]
 
-    here = Path(__file__).parent
+    here = Path(__file__).parent.parent
     result = subprocess.run(
         [sys.executable, str(here / "mailbox-backup.py"),
          "--list", "--json",
@@ -411,7 +411,7 @@ def test_6_cli_relative_time_flags(workdir: Path) -> None:
         ts = now - timedelta(hours=hours_ago)
         touch_fake_backup(backup_dir, ts, kind="db")
 
-    here = Path(__file__).parent
+    here = Path(__file__).parent.parent
     cli = str(here / "mailbox-backup.py")
 
     # --list --since 24h → only the 5h_ago backup

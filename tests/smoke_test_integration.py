@@ -240,7 +240,7 @@ def scenario_3_ttl_pruning(base: str, token: str, db: Path) -> None:
         f"expected ≥1 expired pending: {h_pre}"
 
     # Run sweep via the CLI subprocess (matches operator workflow)
-    here = Path(__file__).parent
+    here = Path(__file__).parent.parent
     result = subprocess.run(
         [sys.executable, str(here / "mailbox-retention.py"),
          "--db", str(db), "--once", "--json"],
@@ -279,7 +279,7 @@ def scenario_4_webhook_delivery(base: str, token: str, db: Path) -> None:
         _RECEIVER_HITS.clear()
 
         # Register webhook via the admin CLI (matches operator workflow)
-        here = Path(__file__).parent
+        here = Path(__file__).parent.parent
         add_result = subprocess.run(
             [sys.executable, str(here / "mailbox-webhooks.py"),
              "--db", str(db), "--json",
@@ -481,7 +481,7 @@ def scenario_7_scheduled_send(base: str, token: str, db: Path) -> None:
     # Skip waiting for the 30s daemon tick — fire --deliver-now via CLI
     # subprocess (operator workflow). Tighter timing + sidesteps SQLite
     # writer contention from sibling daemons during heavy e2e traffic.
-    here = Path(__file__).parent
+    here = Path(__file__).parent.parent
     result = subprocess.run(
         [sys.executable, str(here / "mailbox-scheduled.py"),
          "--db", str(db), "--deliver-now", "--json"],
@@ -528,7 +528,7 @@ def main() -> int:
     # Tight rate-limit so scenario 6 only needs ~20 requests to overflow.
     # 15 still leaves headroom for scenarios 1-5 which stay below 10/scope.
     env["MAILBOX_RATE_LIMIT_PER_MIN"] = "15"
-    here = Path(__file__).parent
+    here = Path(__file__).parent.parent
     proc = subprocess.Popen(
         [sys.executable, str(here / "mailbox-server.py"),
          "--host", "127.0.0.1", "--port", str(port),

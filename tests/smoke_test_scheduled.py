@@ -28,7 +28,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 import mailbox_scheduled  # noqa: E402
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8",
@@ -72,7 +72,7 @@ def get_json(url, token):
 
 
 def run_cli(args, db):
-    here = Path(__file__).parent
+    here = Path(__file__).parent.parent
     return subprocess.run(
         [sys.executable, str(here / "mailbox-scheduled.py"), "--db", str(db)] + args,
         capture_output=True, text=True, encoding="utf-8", errors="replace",
@@ -224,7 +224,7 @@ def main() -> int:
         # Fresh DB for the REST e2e
         rest_db = workdir / "rest.db"
         attachments = workdir / "rest-attachments"
-        here = Path(__file__).parent
+        here = Path(__file__).parent.parent
         proc = subprocess.Popen(
             [sys.executable, str(here / "mailbox-server.py"),
              "--host", "127.0.0.1", "--port", str(port),
