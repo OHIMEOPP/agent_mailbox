@@ -109,6 +109,20 @@ restarts on crash.
 - Claude Code installed
 - Git (to clone the mailbox repo)
 
+**Heads-up about pre-existing DBs on the laptop**: if the laptop has been used
+with an older version of mailbox before, you may find leftover SQLite files at:
+- `~/.claude-mailbox.db` (pre-2026-05 legacy single-file location)
+- `~/.claude/mailbox/mailbox.db` (current default location)
+
+Either way, **cross-device spoke setup does NOT read, write, merge, or migrate
+these files**. With `CLAUDE_MAILBOX_REMOTE` set (Phase 1.7), `server.py` skips
+local SQLite entirely. Legacy DBs become orphan history — leave them, delete
+them, or archive them; no impact on cross-device operation.
+
+Do NOT try to merge a legacy laptop DB into the hub DB — id sequences will
+collide and read_at semantics get scrambled. Treat legacy laptop DBs as
+read-only history at best.
+
 ### 1.2 Install the mcp Python package
 
 ```powershell
@@ -349,6 +363,7 @@ All 6 → cross-device setup complete.
 | Watcher reconnects every 2 sec | hub serving but auth fails or path 404 | check `--remote` URL has no trailing slash; verify server log shows the connect |
 | Mail sent but spoke watcher silent | wrong `CLAUDE_MAILBOX_NAME` mismatch | watcher's name must exactly match recipient name on hub's send (case-sensitive, including `@hostname`) |
 | Two watchers wake on every mail | same `CLAUDE_MAILBOX_NAME` on two machines | adopt `<role>@<hostname>` convention (Phase 1.6) so each machine has unique name |
+| Laptop has pre-existing `~/.claude-mailbox.db` or `~/.claude/mailbox/mailbox.db` | legacy from old single-machine setup | leave alone; cross-device skips local DB entirely when REMOTE env set (see Phase 1.1). Do NOT merge into hub DB |
 | New laptop sessions create local DB | `.mcp.json` env block missing on **that** project | env config is per-project, copy `.mcp.json` to every project that uses mailbox |
 
 ---
