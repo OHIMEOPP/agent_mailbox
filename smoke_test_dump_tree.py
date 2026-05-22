@@ -47,6 +47,18 @@ def main() -> int:
                 created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
                 UNIQUE(message_id, actor, emoji)
             );
+            CREATE TABLE scheduled_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                from_name TEXT NOT NULL,
+                to_name TEXT NOT NULL,
+                body TEXT NOT NULL,
+                deliver_at TEXT NOT NULL,
+                in_reply_to INTEGER,
+                expires_at TEXT,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                delivered_msg_id INTEGER,
+                cancelled_at TEXT
+            );
         """)
 
         def insert(from_name, to_name, body, in_reply_to=None):
@@ -82,13 +94,30 @@ def main() -> int:
         react(m2, "alice", "🚀")
         # m5 gets no reactions — should render without 💬 line
 
+        # Scheduled pending: 2 rows
+        conn.execute(
+            "INSERT INTO scheduled_messages(from_name, to_name, body, deliver_at) "
+            "VALUES('alice', 'bob', 'tomorrow 9am ping', '2099-01-01T00:00:00Z')")
+        conn.execute(
+            "INSERT INTO scheduled_messages(from_name, to_name, body, deliver_at) "
+            "VALUES('bob', 'carol', 'next week reminder', '2099-01-02T00:00:00Z')")
+        # Plus 1 already delivered (should NOT appear in pending listing)
+        conn.execute(
+            "INSERT INTO scheduled_messages(from_name, to_name, body, deliver_at, delivered_msg_id) "
+            "VALUES('alice', 'bob', 'past delivered', '2025-01-01T00:00:00Z', 1)")
+        # Plus 1 cancelled (should NOT appear)
+        conn.execute(
+            "INSERT INTO scheduled_messages(from_name, to_name, body, deliver_at, cancelled_at) "
+            "VALUES('alice', 'bob', 'cancelled', '2099-03-01T00:00:00Z', "
+            "strftime('%Y-%m-%dT%H:%M:%fZ','now'))")
+
         conn.commit()
         conn.close()
 
-        # --- Run mailbox-dump.py --tree ---
+        # --- Run mailbox-dump.py --tree --include-scheduled ---
         result = subprocess.run(
             [sys.executable, str(here / "mailbox-dump.py"),
-             "--db", str(db), "--tree"],
+             "--db", str(db), "--tree", "--include-scheduled"],
             capture_output=True, text=True, encoding="utf-8",
             timeout=10,
         )
@@ -148,7 +177,18 @@ def main() -> int:
         assert not any("💬" in l for l in m5_body_lines), \
             f"m5 has no reactions but rendered 💬 line: {m5_body_lines!r}"
 
-        print(f"\n[smoke] ALL DUMP TREE TESTS PASSED ({6} messages, tree + 4 reactions verified)")
+        # Scheduled-pending footer assertions
+        assert "Pending scheduled deliveries (2)" in out, \
+            "missing scheduled footer (expected 2 pending, not delivered/cancelled)"
+        assert "tomorrow 9am ping" in out
+        assert "next week reminder" in out
+        assert "past delivered" not in out, "delivered row should not appear in pending"
+        # ⏳ sigil + [sched:N] id prefix render
+        assert "⏳" in out and "[sched:" in out
+        print("[smoke] --include-scheduled pending footer ok "
+              "(2 rendered, delivered+cancelled excluded)")
+
+        print(f"\n[smoke] ALL DUMP TREE TESTS PASSED ({6} messages, tree + 4 reactions + 2 scheduled verified)")
         return 0
     except AssertionError as e:
         print(f"\n[smoke] ASSERT FAIL: {e}", file=sys.stderr)

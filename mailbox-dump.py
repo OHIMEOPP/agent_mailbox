@@ -88,6 +88,42 @@ def _has_in_reply_to(conn: sqlite3.Connection) -> bool:
     return "in_reply_to" in cols
 
 
+def _fetch_scheduled_pending(conn: sqlite3.Connection, peer: str | None) -> list:
+    """Return pending (not delivered, not cancelled) scheduled_messages rows.
+    Optionally filter by peer (sender OR recipient).
+    Empty list if the table doesn't exist (pre-scheduled-send schema)."""
+    if not conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='scheduled_messages'"
+    ).fetchone():
+        return []
+    sql = ("SELECT id, from_name, to_name, body, deliver_at, in_reply_to, expires_at "
+           "FROM scheduled_messages "
+           "WHERE delivered_msg_id IS NULL AND cancelled_at IS NULL")
+    params: list = []
+    if peer:
+        sql += " AND (from_name=? OR to_name=?)"
+        params.extend([peer, peer])
+    sql += " ORDER BY deliver_at ASC"
+    return list(conn.execute(sql, params).fetchall())
+
+
+def _render_scheduled_pending(rows: list) -> None:
+    if not rows:
+        return
+    print()
+    print(f"== Pending scheduled deliveries ({len(rows)}) ==")
+    for r in rows:
+        sched_id, from_name, to_name, body, deliver_at, in_reply_to, expires_at = r
+        preview = (body or "").replace("\r", " ").replace("\n", " | ")[:80]
+        meta = f"deliver_at={deliver_at}"
+        if in_reply_to is not None:
+            meta += f" re=#{in_reply_to}"
+        if expires_at is not None:
+            meta += f" expires={expires_at}"
+        print(f"  ⏳ [sched:{sched_id}] {from_name} → {to_name}  {meta}")
+        print(f"        {preview}")
+
+
 def _fetch_reactions(conn: sqlite3.Connection, msg_ids: list[int]) -> dict[int, list[tuple[str, str]]]:
     """Return {message_id: [(emoji, actor), ...]} for the given message ids.
     Returns empty dict if reactions table doesn't exist (pre-2026-05-23 DB)."""
@@ -226,6 +262,9 @@ def main() -> int:
                    help='only show last N messages (after peer filter)')
     p.add_argument('--tree', action='store_true',
                    help='render as reply tree using in_reply_to chains')
+    p.add_argument('--include-scheduled', action='store_true',
+                   help='append a "Pending scheduled deliveries" section listing '
+                        'scheduled_messages rows not yet delivered (peer filter applies)')
     p.add_argument('--db', default=DB, help='path to mailbox SQLite db')
     args = p.parse_args()
 
@@ -273,6 +312,15 @@ def main() -> int:
     else:
         _render_flat(rows, reactions_by_id)
 
+    # Optional scheduled-pending footer
+    if args.include_scheduled:
+        conn3 = sqlite3.connect(args.db)
+        try:
+            sched_rows = _fetch_scheduled_pending(conn3, args.peer)
+        finally:
+            conn3.close()
+        _render_scheduled_pending(sched_rows)
+
     filter_desc = []
     if args.peer:
         filter_desc.append(f"peer={args.peer}")
@@ -280,6 +328,8 @@ def main() -> int:
         filter_desc.append(f"tail={args.tail}")
     if args.tree:
         filter_desc.append("tree")
+    if args.include_scheduled:
+        filter_desc.append("+scheduled")
     suffix = f" ({', '.join(filter_desc)})" if filter_desc else ""
     print(f"\n[dump] {len(rows)} message(s) shown{suffix}")
     return 0
