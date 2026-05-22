@@ -48,8 +48,15 @@ import urllib.parse
 import mailbox_audit
 import mailbox_backup
 import mailbox_reactions
+import mailbox_scheduled
 import mailbox_sweep
 import mailbox_webhooks
+
+SCHEDULED_TICK_SECONDS = mailbox_scheduled.SCHEDULED_TICK_SECONDS
+
+# Mutable globals tracking last scheduled delivery; read by /health JSON.
+LAST_SCHEDULED_AT: str | None = None
+LAST_SCHEDULED_COUNTERS: dict | None = None
 
 # Mailing-list / glob fanout settings
 ALIAS_ACTIVE_DAYS = 7      # only fanout to peers heartbeat within this window
@@ -168,6 +175,8 @@ def db_init(path: pathlib.Path):
     mailbox_webhooks.init_schema(path)
     # Reactions: separate table, independent DDL.
     mailbox_reactions.init_schema(path)
+    # Scheduled-send queue: separate table, independent DDL.
+    mailbox_scheduled.init_schema(path)
 
 
 def _init_fts(path: pathlib.Path):
@@ -393,6 +402,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # Merge reaction stats — totals + unique emoji count
             reaction_stats = mailbox_reactions.stats(srv.db_path)
             payload.update(reaction_stats)
+            # Merge scheduled-send stats — pending / delivered / cancelled
+            sched_stats = mailbox_scheduled.stats(srv.db_path)
+            payload.update(sched_stats)
+            payload["last_scheduled_at"] = LAST_SCHEDULED_AT
+            payload["last_scheduled_counters"] = LAST_SCHEDULED_COUNTERS
             return self._json(200, payload)
 
         if not self._check_auth():
@@ -512,6 +526,60 @@ class Handler(http.server.BaseHTTPRequestHandler):
             expires_at = payload.get("expires_at")
             if expires_at is not None and not isinstance(expires_at, str):
                 return self._json(400, {"error": "expires_at must be ISO string or null"})
+            deliver_at_raw = payload.get("deliver_at")
+            if deliver_at_raw is not None and not isinstance(deliver_at_raw, str):
+                return self._json(400, {"error": "deliver_at must be ISO/relative string or null"})
+
+            # Scheduled-send path: if deliver_at present, enqueue into
+            # scheduled_messages instead of inserting into messages. Daemon
+            # delivers when deliver_at <= now. Fanout pattern + deliver_at
+            # works — each recipient gets its own scheduled row.
+            if deliver_at_raw:
+                try:
+                    deliver_at = mailbox_scheduled.parse_deliver_at(deliver_at_raw)
+                except ValueError as e:
+                    return self._json(400, {"error": str(e)})
+                to_field = payload["to"]
+                is_pattern = _is_alias_pattern(to_field)
+                conn = db_connect(srv.db_path)
+                try:
+                    recipients = _resolve_alias(conn, to_field)
+                    if not recipients:
+                        return self._json(404, {
+                            "error": f"no active peers match pattern '{to_field}'"})
+                finally:
+                    conn.close()
+                queued: list[dict] = []
+                for to_name in recipients:
+                    q = mailbox_scheduled.enqueue(
+                        srv.db_path, from_name=payload["from"], to_name=to_name,
+                        body=payload["body"], deliver_at=deliver_at,
+                        in_reply_to=in_reply_to, expires_at=expires_at,
+                    )
+                    queued.append({"scheduled_id": q["id"],
+                                   "to": to_name,
+                                   "deliver_at": q["deliver_at"]})
+                # Audit logging — one row per scheduled recipient
+                for q in queued:
+                    mailbox_audit.log_event(
+                        srv.db_path, actor=payload["from"], action="send",
+                        target=q["to"],
+                        payload={"scheduled_id": q["scheduled_id"],
+                                 "deliver_at": q["deliver_at"],
+                                 "body_len": len(payload["body"]),
+                                 "in_reply_to": in_reply_to,
+                                 "expires_at": expires_at,
+                                 "scheduled": True,
+                                 "alias_pattern": to_field if is_pattern else None},
+                    )
+                return self._json(200, {
+                    "scheduled": True,
+                    "deliver_at": deliver_at,
+                    "count": len(queued),
+                    "items": queued,
+                    "fanout": is_pattern,
+                    "matched_peers": recipients if is_pattern else None,
+                })
 
             to_field = payload["to"]
             is_pattern = _is_alias_pattern(to_field)
@@ -1074,6 +1142,23 @@ def _sweep_loop(db_path: pathlib.Path, attachments_dir: pathlib.Path,
         time.sleep(SWEEP_INTERVAL_SECONDS)
 
 
+def _scheduled_loop(db_path: pathlib.Path) -> None:
+    """Daemon thread: every SCHEDULED_TICK_SECONDS, deliver any scheduled
+    messages whose deliver_at has passed. Idempotent; safe to die + restart."""
+    global LAST_SCHEDULED_AT, LAST_SCHEDULED_COUNTERS
+    while True:
+        try:
+            c = mailbox_scheduled.deliver_pending(db_path)
+            if c["delivered"] > 0:
+                LAST_SCHEDULED_AT = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                LAST_SCHEDULED_COUNTERS = c
+                print(f"[scheduled] {mailbox_scheduled.format_summary(c)}",
+                      file=sys.stderr)
+        except Exception as e:
+            print(f"[scheduled] FAILED: {type(e).__name__}: {e}", file=sys.stderr)
+        time.sleep(SCHEDULED_TICK_SECONDS)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="0.0.0.0",
@@ -1180,6 +1265,24 @@ def main():
         )
         wh_thread.start()
         print(f"[mailbox-server] webhooks: deliver-tick={mailbox_webhooks.DAEMON_TICK_SECONDS}s",
+              file=sys.stderr)
+
+    # Scheduled-send daemon — own thread, 30s tick. Materializes pending
+    # rows when their deliver_at passes.
+    scheduled_disabled = os.environ.get(
+        "MAILBOX_SCHEDULED_DISABLED", "").strip() in ("1", "true", "yes")
+    if scheduled_disabled:
+        print("[mailbox-server] scheduled-send: DISABLED via MAILBOX_SCHEDULED_DISABLED",
+              file=sys.stderr)
+    else:
+        sched_thread = threading.Thread(
+            target=_scheduled_loop,
+            args=(args.db,),
+            daemon=True,
+            name="mailbox-scheduled-deliver",
+        )
+        sched_thread.start()
+        print(f"[mailbox-server] scheduled-send: deliver-tick={SCHEDULED_TICK_SECONDS}s",
               file=sys.stderr)
 
     try:

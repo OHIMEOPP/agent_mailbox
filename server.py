@@ -32,6 +32,7 @@ from pathlib import Path
 
 import mailbox_audit
 import mailbox_reactions
+import mailbox_scheduled
 from mcp.server.fastmcp import FastMCP
 
 # Mailing-list / glob fanout settings (must match mailbox-server.py)
@@ -274,6 +275,7 @@ if not REMOTE:
     mailbox_audit.init_schema(DB_PATH)
     _init_fts()
     mailbox_reactions.init_schema(DB_PATH)
+    mailbox_scheduled.init_schema(DB_PATH)
 
 
 def _write_blob(data: bytes) -> tuple[str, int]:
@@ -334,7 +336,8 @@ mcp = FastMCP("mailbox")
 @mcp.tool()
 def send(to: str, body: str, files: list[str] | None = None,
          in_reply_to: int | None = None,
-         expires_at: str | None = None) -> dict:
+         expires_at: str | None = None,
+         deliver_at: str | None = None) -> dict:
     """Send a message (optionally with file attachments) to another Claude Code instance.
 
     Args:
@@ -357,6 +360,12 @@ def send(to: str, body: str, files: list[str] | None = None,
                `1h` / `7d` (computed from now). None or omitted = no expiry.
                Useful for status pings / progress updates that have no value
                beyond the next sweep.
+        deliver_at: optional scheduled-send time. If set, message enters the
+               scheduled_messages queue; a daemon delivers it (inserts into
+               messages, fires SSE / FTS / audit) when deliver_at <= now.
+               Accepts ISO 8601 or relative shorthand. Default tick is 30s so
+               minimum useful delay is ~30 seconds. NOT compatible with files=
+               (raises) — schedule text-only for now.
 
     Returns:
         Literal `to`: {id, sent_at, from, to, in_reply_to?, expires_at?, attachments?: [...]}
@@ -365,6 +374,62 @@ def send(to: str, body: str, files: list[str] | None = None,
                              from, in_reply_to?, expires_at?}
     """
     resolved_expires_at = _resolve_expires_at(expires_at)
+    # Scheduled-send intercept — if deliver_at given, defer until daemon delivers.
+    # files + deliver_at combo is not supported in this pass; we error early.
+    if deliver_at:
+        if files:
+            raise RuntimeError(
+                "deliver_at + files: not supported. Schedule a text message "
+                "or send files immediately."
+            )
+        try:
+            resolved_deliver_at = mailbox_scheduled.parse_deliver_at(deliver_at)
+        except ValueError as e:
+            raise RuntimeError(str(e))
+        if REMOTE:
+            body_payload_s: dict = {"from": NAME, "to": to, "body": body,
+                                     "deliver_at": resolved_deliver_at}
+            if in_reply_to is not None:
+                body_payload_s["in_reply_to"] = in_reply_to
+            if resolved_expires_at is not None:
+                body_payload_s["expires_at"] = resolved_expires_at
+            r = _remote("POST", "/send", body_payload_s)
+            return {**r, "from": NAME}
+
+        # Local mode
+        is_pattern = _is_alias_pattern(to)
+        with _connect() as c:
+            recipients = _resolve_alias(c, to)
+        if not recipients:
+            raise RuntimeError(
+                f"no active peers (heartbeat ≤{ALIAS_ACTIVE_DAYS}d) match pattern '{to}'")
+        queued: list[dict] = []
+        for to_name in recipients:
+            q = mailbox_scheduled.enqueue(
+                DB_PATH, from_name=NAME, to_name=to_name,
+                body=body, deliver_at=resolved_deliver_at,
+                in_reply_to=in_reply_to, expires_at=resolved_expires_at,
+            )
+            queued.append({"scheduled_id": q["id"], "to": to_name,
+                           "deliver_at": q["deliver_at"]})
+        for q in queued:
+            mailbox_audit.log_event(
+                DB_PATH, actor=NAME, action="send", target=q["to"],
+                payload={"scheduled_id": q["scheduled_id"],
+                         "deliver_at": q["deliver_at"],
+                         "body_len": len(body),
+                         "in_reply_to": in_reply_to,
+                         "expires_at": resolved_expires_at,
+                         "scheduled": True,
+                         "alias_pattern": to if is_pattern else None},
+            )
+        return {
+            "scheduled": True, "deliver_at": resolved_deliver_at,
+            "count": len(queued), "items": queued,
+            "fanout": is_pattern,
+            "matched_peers": recipients if is_pattern else None,
+            "from": NAME,
+        }
     if files:
         file_parts: list[tuple[str, str, bytes]] = []
         for fp in files:
