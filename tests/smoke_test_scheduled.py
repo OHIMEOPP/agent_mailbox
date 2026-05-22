@@ -74,7 +74,7 @@ def get_json(url, token):
 def run_cli(args, db):
     here = Path(__file__).parent.parent
     return subprocess.run(
-        [sys.executable, str(here / "mailbox-scheduled.py"), "--db", str(db)] + args,
+        [sys.executable, str(here / "tools" / "mailbox-scheduled.py"), "--db", str(db)] + args,
         capture_output=True, text=True, encoding="utf-8", errors="replace",
         timeout=10,
     )

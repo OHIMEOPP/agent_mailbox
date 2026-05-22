@@ -349,7 +349,7 @@ def test_4_cli_list_json(workdir: Path) -> None:
 
     here = Path(__file__).parent.parent
     result = subprocess.run(
-        [sys.executable, str(here / "mailbox-backup.py"),
+        [sys.executable, str(here / "tools" / "mailbox-backup.py"),
          "--list", "--json",
          "--db", str(db),
          "--attachments-dir", str(attachments),
@@ -368,7 +368,7 @@ def test_4_cli_list_json(workdir: Path) -> None:
 
     # Also smoke-test --stats --json
     result = subprocess.run(
-        [sys.executable, str(here / "mailbox-backup.py"),
+        [sys.executable, str(here / "tools" / "mailbox-backup.py"),
          "--stats", "--json",
          "--db", str(db),
          "--backup-dir", str(backup_dir)],
@@ -412,7 +412,7 @@ def test_6_cli_relative_time_flags(workdir: Path) -> None:
         touch_fake_backup(backup_dir, ts, kind="db")
 
     here = Path(__file__).parent.parent
-    cli = str(here / "mailbox-backup.py")
+    cli = str(here / "tools" / "mailbox-backup.py")
 
     # --list --since 24h → only the 5h_ago backup
     r = subprocess.run(

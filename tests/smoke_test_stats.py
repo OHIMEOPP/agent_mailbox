@@ -116,7 +116,7 @@ def seed_db(db: Path) -> None:
 def run_cli(db: Path, args: list) -> subprocess.CompletedProcess:
     here = Path(__file__).parent.parent
     return subprocess.run(
-        [sys.executable, str(here / "mailbox-stats.py"), "--db", str(db)] + args,
+        [sys.executable, str(here / "tools" / "mailbox-stats.py"), "--db", str(db)] + args,
         capture_output=True, text=True, encoding="utf-8", errors="replace",
         timeout=10,
     )

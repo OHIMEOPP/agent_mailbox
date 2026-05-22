@@ -149,7 +149,7 @@ def main() -> int:
 
         # --- Run mailbox-dump.py --tree --include-scheduled --audit-trail ---
         result = subprocess.run(
-            [sys.executable, str(here / "mailbox-dump.py"),
+            [sys.executable, str(here / "tools" / "mailbox-dump.py"),
              "--db", str(db), "--tree", "--include-scheduled", "--audit-trail"],
             capture_output=True, text=True, encoding="utf-8",
             timeout=10,

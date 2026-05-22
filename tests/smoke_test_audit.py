@@ -141,7 +141,7 @@ def test_4_cli_subprocess(db: Path) -> None:
                              payload={"returned": 5})
 
     here = Path(__file__).parent.parent
-    cli = str(here / "mailbox-audit.py")
+    cli = str(here / "tools" / "mailbox-audit.py")
 
     # --stats --json
     r = subprocess.run(

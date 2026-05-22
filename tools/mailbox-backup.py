@@ -28,6 +28,7 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import mailbox_backup
 
 DEFAULT_DB = Path.home() / ".claude" / "mailbox" / "mailbox.db"

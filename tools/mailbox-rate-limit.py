@@ -22,6 +22,7 @@ import json
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import mailbox_rate_limit
 
 DEFAULT_DB = Path.home() / ".claude" / "mailbox" / "mailbox.db"

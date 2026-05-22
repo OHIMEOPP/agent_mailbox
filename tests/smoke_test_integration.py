@@ -242,7 +242,7 @@ def scenario_3_ttl_pruning(base: str, token: str, db: Path) -> None:
     # Run sweep via the CLI subprocess (matches operator workflow)
     here = Path(__file__).parent.parent
     result = subprocess.run(
-        [sys.executable, str(here / "mailbox-retention.py"),
+        [sys.executable, str(here / "tools" / "mailbox-retention.py"),
          "--db", str(db), "--once", "--json"],
         capture_output=True, text=True, timeout=15,
     )
@@ -281,7 +281,7 @@ def scenario_4_webhook_delivery(base: str, token: str, db: Path) -> None:
         # Register webhook via the admin CLI (matches operator workflow)
         here = Path(__file__).parent.parent
         add_result = subprocess.run(
-            [sys.executable, str(here / "mailbox-webhooks.py"),
+            [sys.executable, str(here / "tools" / "mailbox-webhooks.py"),
              "--db", str(db), "--json",
              "--add", "integration-test-hook", "--url", receiver_url],
             capture_output=True, text=True, timeout=10,
@@ -483,7 +483,7 @@ def scenario_7_scheduled_send(base: str, token: str, db: Path) -> None:
     # writer contention from sibling daemons during heavy e2e traffic.
     here = Path(__file__).parent.parent
     result = subprocess.run(
-        [sys.executable, str(here / "mailbox-scheduled.py"),
+        [sys.executable, str(here / "tools" / "mailbox-scheduled.py"),
          "--db", str(db), "--deliver-now", "--json"],
         capture_output=True, text=True, timeout=20,
     )

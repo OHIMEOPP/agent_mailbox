@@ -228,7 +228,7 @@ def main() -> int:
     # --- Test 9: CLI subprocess test ---
     here = Path(__file__).parent.parent
     result = subprocess.run(
-        [sys.executable, str(here / "mailbox-retention.py"),
+        [sys.executable, str(here / "tools" / "mailbox-retention.py"),
          "--db", str(db), "--stats", "--json"],
         capture_output=True, text=True, timeout=10,
     )
@@ -239,7 +239,7 @@ def main() -> int:
 
     # CLI --dry-run on clean state
     result = subprocess.run(
-        [sys.executable, str(here / "mailbox-retention.py"),
+        [sys.executable, str(here / "tools" / "mailbox-retention.py"),
          "--db", str(db), "--dry-run", "--json"],
         capture_output=True, text=True, timeout=10,
     )
