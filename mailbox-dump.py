@@ -1,17 +1,24 @@
 """Mailbox history dumper — read past messages from the shared SQLite DB.
 
 Usage:
-    py mailbox-dump.py [peer | agent] [--tail N] [--db PATH]
+    py mailbox-dump.py [peer | agent] [--tail N] [--tree] [--db PATH]
 
 Examples:
     py mailbox-dump.py                    # all messages
     py mailbox-dump.py koatag             # all messages where koatag is sender or recipient
     py mailbox-dump.py koatag --tail 5    # last 5 messages with koatag
     py mailbox-dump.py --tail 20          # last 20 messages overall
+    py mailbox-dump.py --tail 20 --tree   # last 20, render as reply tree
     py mailbox-dump.py agent              # list all agent names that ever sent or received
 
 Magic positional values (treated as commands, not peer names):
     agent / agents / peers / list  -> list all distinct agent names with stats
+
+Tree mode:
+    --tree groups messages by in_reply_to parent chain. Roots are messages
+    with no parent (or whose parent is outside the filtered set). Children
+    nest under their parent with box-drawing characters. Broken-chain
+    children (parent retention-pruned) are flagged as orphans at root level.
 """
 import argparse
 import io
@@ -75,6 +82,95 @@ def list_agents(db_path: str) -> int:
     return 0
 
 
+def _has_in_reply_to(conn: sqlite3.Connection) -> bool:
+    """Whether the messages table has in_reply_to column (post-2026-05-23)."""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(messages)").fetchall()}
+    return "in_reply_to" in cols
+
+
+def _render_flat(rows: list) -> None:
+    """Original flat per-message rendering."""
+    for r in rows:
+        mid, sender, recipient, sent, body = r[0], r[1], r[2], r[3], r[4]
+        ref_suffix = ""
+        # rows may include in_reply_to as r[5] if tree-aware fetch was used
+        if len(r) > 5 and r[5] is not None:
+            ref_suffix = f"  (re: #{r[5]})"
+        print(f"\n[{mid}] {sent}  {sender} -> {recipient}{ref_suffix}")
+        print(body)
+        print("-" * 60)
+
+
+def _render_tree(rows: list) -> None:
+    """Tree rendering using in_reply_to chains.
+
+    Layout:
+      [root_id] ts  sender -> recipient
+          body...
+          ├─[child_id] ts  sender -> recipient  (re: #root_id)
+          │     body...
+          │     └─[grandchild_id] ...
+          └─[sibling_id] ...
+
+    Rows must include in_reply_to as column index 5.
+    """
+    by_id = {r[0]: r for r in rows}
+    children: dict[int, list[int]] = {}
+    roots: list[int] = []
+
+    for r in rows:
+        mid = r[0]
+        parent = r[5] if len(r) > 5 else None
+        if parent is None or parent not in by_id:
+            roots.append(mid)
+            if parent is not None and parent not in by_id:
+                # orphan — parent was pruned or outside filter
+                pass
+        else:
+            children.setdefault(parent, []).append(mid)
+
+    # Sort children by id (chronological)
+    for parent_id in children:
+        children[parent_id].sort()
+
+    def _print_node(node_id: int, prefix: str, is_last: bool, is_root: bool) -> None:
+        r = by_id[node_id]
+        mid, sender, recipient, sent, body = r[0], r[1], r[2], r[3], r[4]
+        parent = r[5] if len(r) > 5 else None
+        # Determine connector
+        if is_root:
+            connector = ""
+            child_prefix = ""
+        else:
+            connector = "└─" if is_last else "├─"
+            child_prefix = "   " if is_last else "│  "
+
+        # Orphan flag — parent referenced but not in dataset
+        orphan_flag = ""
+        if parent is not None and parent not in by_id:
+            orphan_flag = f"  ⚠ broken-chain (parent #{parent} not in view)"
+        elif parent is not None:
+            orphan_flag = f"  (re: #{parent})"
+
+        # Header line
+        print(f"{prefix}{connector}[{mid}] {sent}  {sender} -> {recipient}{orphan_flag}")
+        # Body lines indented under header
+        body_indent = f"{prefix}{child_prefix}  " if not is_root else "  "
+        for line in body.splitlines() or [""]:
+            print(f"{body_indent}{line}")
+
+        # Recurse into children
+        kids = children.get(node_id, [])
+        for i, kid in enumerate(kids):
+            kid_is_last = (i == len(kids) - 1)
+            kid_prefix = prefix + child_prefix
+            _print_node(kid, kid_prefix, kid_is_last, is_root=False)
+
+    for i, root_id in enumerate(roots):
+        _print_node(root_id, "", is_last=(i == len(roots) - 1), is_root=True)
+        print("-" * 60)
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description="Dump mailbox chat history")
     p.add_argument('peer', nargs='?', default=None,
@@ -83,6 +179,8 @@ def main() -> int:
                         "list all agent names instead)")
     p.add_argument('--tail', type=int, default=None,
                    help='only show last N messages (after peer filter)')
+    p.add_argument('--tree', action='store_true',
+                   help='render as reply tree using in_reply_to chains')
     p.add_argument('--db', default=DB, help='path to mailbox SQLite db')
     args = p.parse_args()
 
@@ -91,14 +189,17 @@ def main() -> int:
 
     conn = sqlite3.connect(args.db)
     try:
+        tree_capable = _has_in_reply_to(conn)
+        col_list = "id, from_name, to_name, sent_at, body"
+        if tree_capable:
+            col_list += ", in_reply_to"
         if args.peer:
-            sql = ("SELECT id, from_name, to_name, sent_at, body "
+            sql = (f"SELECT {col_list} "
                    "FROM messages WHERE from_name=? OR to_name=? "
                    "ORDER BY id")
             rows = list(conn.execute(sql, (args.peer, args.peer)))
         else:
-            sql = ("SELECT id, from_name, to_name, sent_at, body "
-                   "FROM messages ORDER BY id")
+            sql = (f"SELECT {col_list} FROM messages ORDER BY id")
             rows = list(conn.execute(sql))
     finally:
         conn.close()
@@ -111,16 +212,22 @@ def main() -> int:
         print(f"[dump] no messages {scope}".strip())
         return 0
 
-    for mid, sender, recipient, sent, body in rows:
-        print(f"\n[{mid}] {sent}  {sender} -> {recipient}")
-        print(body)
-        print("-" * 60)
+    if args.tree:
+        if not tree_capable:
+            print("[dump] --tree requires in_reply_to column (DB is pre-2026-05-23 schema)",
+                  file=sys.stderr)
+            return 2
+        _render_tree(rows)
+    else:
+        _render_flat(rows)
 
     filter_desc = []
     if args.peer:
         filter_desc.append(f"peer={args.peer}")
     if args.tail is not None:
         filter_desc.append(f"tail={args.tail}")
+    if args.tree:
+        filter_desc.append("tree")
     suffix = f" ({', '.join(filter_desc)})" if filter_desc else ""
     print(f"\n[dump] {len(rows)} message(s) shown{suffix}")
     return 0
