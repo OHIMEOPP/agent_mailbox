@@ -88,8 +88,44 @@ def _has_in_reply_to(conn: sqlite3.Connection) -> bool:
     return "in_reply_to" in cols
 
 
-def _render_flat(rows: list) -> None:
-    """Original flat per-message rendering."""
+def _fetch_reactions(conn: sqlite3.Connection, msg_ids: list[int]) -> dict[int, list[tuple[str, str]]]:
+    """Return {message_id: [(emoji, actor), ...]} for the given message ids.
+    Returns empty dict if reactions table doesn't exist (pre-2026-05-23 DB)."""
+    if not msg_ids:
+        return {}
+    # Probe table existence
+    if not conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='reactions'"
+    ).fetchone():
+        return {}
+    placeholders = ",".join("?" * len(msg_ids))
+    out: dict[int, list[tuple[str, str]]] = {}
+    for mid, emoji, actor in conn.execute(
+        f"SELECT message_id, emoji, actor FROM reactions "
+        f"WHERE message_id IN ({placeholders}) "
+        f"ORDER BY message_id, created_at",
+        msg_ids,
+    ).fetchall():
+        out.setdefault(mid, []).append((emoji, actor))
+    return out
+
+
+def _format_reactions(rxns: list[tuple[str, str]]) -> str:
+    """Format reactions list as "❤ alice,bob  👍 carol" (grouped by emoji)."""
+    if not rxns:
+        return ""
+    by_emoji: dict[str, list[str]] = {}
+    for emoji, actor in rxns:
+        by_emoji.setdefault(emoji, []).append(actor)
+    parts = []
+    for emoji, actors in by_emoji.items():
+        parts.append(f"{emoji} {','.join(actors)}")
+    return "  ".join(parts)
+
+
+def _render_flat(rows: list, reactions_by_id: dict | None = None) -> None:
+    """Original flat per-message rendering, with optional reactions footer."""
+    reactions_by_id = reactions_by_id or {}
     for r in rows:
         mid, sender, recipient, sent, body = r[0], r[1], r[2], r[3], r[4]
         ref_suffix = ""
@@ -98,15 +134,19 @@ def _render_flat(rows: list) -> None:
             ref_suffix = f"  (re: #{r[5]})"
         print(f"\n[{mid}] {sent}  {sender} -> {recipient}{ref_suffix}")
         print(body)
+        rxns = reactions_by_id.get(mid, [])
+        if rxns:
+            print(f"  💬 {_format_reactions(rxns)}")
         print("-" * 60)
 
 
-def _render_tree(rows: list) -> None:
-    """Tree rendering using in_reply_to chains.
+def _render_tree(rows: list, reactions_by_id: dict | None = None) -> None:
+    """Tree rendering using in_reply_to chains, with reactions footer per node.
 
     Layout:
       [root_id] ts  sender -> recipient
           body...
+          💬 ❤ alice,bob  👍 carol
           ├─[child_id] ts  sender -> recipient  (re: #root_id)
           │     body...
           │     └─[grandchild_id] ...
@@ -114,6 +154,7 @@ def _render_tree(rows: list) -> None:
 
     Rows must include in_reply_to as column index 5.
     """
+    reactions_by_id = reactions_by_id or {}
     by_id = {r[0]: r for r in rows}
     children: dict[int, list[int]] = {}
     roots: list[int] = []
@@ -158,6 +199,10 @@ def _render_tree(rows: list) -> None:
         body_indent = f"{prefix}{child_prefix}  " if not is_root else "  "
         for line in body.splitlines() or [""]:
             print(f"{body_indent}{line}")
+        # Reactions footer (if any)
+        rxns = reactions_by_id.get(mid, [])
+        if rxns:
+            print(f"{body_indent}💬 {_format_reactions(rxns)}")
 
         # Recurse into children
         kids = children.get(node_id, [])
@@ -212,14 +257,21 @@ def main() -> int:
         print(f"[dump] no messages {scope}".strip())
         return 0
 
+    # Fetch reactions for the rendered set (may be empty if reactions table absent)
+    conn2 = sqlite3.connect(args.db)
+    try:
+        reactions_by_id = _fetch_reactions(conn2, [r[0] for r in rows])
+    finally:
+        conn2.close()
+
     if args.tree:
         if not tree_capable:
             print("[dump] --tree requires in_reply_to column (DB is pre-2026-05-23 schema)",
                   file=sys.stderr)
             return 2
-        _render_tree(rows)
+        _render_tree(rows, reactions_by_id)
     else:
-        _render_flat(rows)
+        _render_flat(rows, reactions_by_id)
 
     filter_desc = []
     if args.peer:

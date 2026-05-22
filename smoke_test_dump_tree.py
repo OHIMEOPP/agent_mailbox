@@ -39,6 +39,14 @@ def main() -> int:
                 in_reply_to INTEGER
             );
             CREATE TABLE peers (name TEXT PRIMARY KEY, last_seen_at TEXT NOT NULL);
+            CREATE TABLE reactions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                message_id INTEGER NOT NULL,
+                actor TEXT NOT NULL,
+                emoji TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                UNIQUE(message_id, actor, emoji)
+            );
         """)
 
         def insert(from_name, to_name, body, in_reply_to=None):
@@ -62,6 +70,18 @@ def main() -> int:
         m4 = insert("alice", "bob", "nested under 2", in_reply_to=m2)
         m5 = insert("alice", "bob", "standalone root B")
         m6 = insert("alice", "bob", "orphan reply to ghost", in_reply_to=999)
+
+        # Reactions: m1 gets ❤ from bob + dave, 👍 from carol;  m2 gets 🚀 from alice
+        def react(mid, actor, emoji):
+            conn.execute(
+                "INSERT INTO reactions(message_id, actor, emoji) VALUES(?, ?, ?)",
+                (mid, actor, emoji))
+        react(m1, "bob", "❤")
+        react(m1, "dave", "❤")
+        react(m1, "carol", "👍")
+        react(m2, "alice", "🚀")
+        # m5 gets no reactions — should render without 💬 line
+
         conn.commit()
         conn.close()
 
@@ -114,7 +134,21 @@ def main() -> int:
         assert m2_header.startswith(("├", "└")), \
             f"[{m2}] should be a child with tree connector: {m2_header!r}"
 
-        print(f"\n[smoke] ALL DUMP TREE TESTS PASSED ({6} messages, tree structure verified)")
+        # Reactions render verification
+        # m1: ❤ bob,dave  👍 carol  (grouped by emoji)
+        assert "💬" in out, "missing reactions sigil"
+        assert "❤" in out and "bob,dave" in out, \
+            f"missing m1 ❤ bob,dave: {out!r}"
+        assert "👍" in out and "carol" in out, "missing m1 👍 carol"
+        assert "🚀" in out and "alice" in out, "missing m2 🚀 alice"
+        # m5 has no reactions — its 💬 line should not exist between m5 and the
+        # next separator. Find m5 block:
+        m5_idx = next(i for i, l in enumerate(lines) if f"[{m5}]" in l)
+        m5_body_lines = lines[m5_idx:m5_idx + 4]
+        assert not any("💬" in l for l in m5_body_lines), \
+            f"m5 has no reactions but rendered 💬 line: {m5_body_lines!r}"
+
+        print(f"\n[smoke] ALL DUMP TREE TESTS PASSED ({6} messages, tree + 4 reactions verified)")
         return 0
     except AssertionError as e:
         print(f"\n[smoke] ASSERT FAIL: {e}", file=sys.stderr)
