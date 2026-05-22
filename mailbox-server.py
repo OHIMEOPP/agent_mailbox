@@ -47,6 +47,7 @@ import urllib.parse
 
 import mailbox_audit
 import mailbox_backup
+import mailbox_migrations
 import mailbox_reactions
 import mailbox_scheduled
 import mailbox_sweep
@@ -149,22 +150,15 @@ def db_init(path: pathlib.Path):
         CREATE INDEX IF NOT EXISTS idx_attach_msg ON attachments(message_id);
         CREATE INDEX IF NOT EXISTS idx_attach_sha ON attachments(sha256);
     """)
-    # Forward-compat: idempotent column adds for existing DBs.
-    cols = {r[1] for r in conn.execute("PRAGMA table_info(messages)").fetchall()}
-    if "has_attachments" not in cols:
-        conn.execute("ALTER TABLE messages ADD COLUMN has_attachments INTEGER NOT NULL DEFAULT 0")
-    if "in_reply_to" not in cols:
-        conn.execute("ALTER TABLE messages ADD COLUMN in_reply_to INTEGER")
-    if "expires_at" not in cols:
-        conn.execute("ALTER TABLE messages ADD COLUMN expires_at TEXT")
-    # Indexes MUST come after ALTER (column may have just been added).
-    # Safe to always run — IF NOT EXISTS prevents duplicate-creation.
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_in_reply_to "
-                 "ON messages(in_reply_to) WHERE in_reply_to IS NOT NULL")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_expires_at "
-                 "ON messages(expires_at) WHERE expires_at IS NOT NULL")
+    # messages-table forward-compat ALTERs + partial indexes are owned by
+    # mailbox_migrations now. Centralized, versioned, idempotent on fresh
+    # and legacy DBs. See mailbox_migrations.MIGRATIONS for the list.
     conn.commit()
     conn.close()
+    # Apply pending migrations (handles ALTERs + partial indexes for
+    # messages.has_attachments / in_reply_to / expires_at — historically
+    # the source of the partial-index-after-ALTER trap).
+    mailbox_migrations.apply(path)
     # Audit log is a separate concern — its own idempotent DDL; doesn't share
     # the executescript above because mailbox_audit owns the table shape.
     mailbox_audit.init_schema(path)
@@ -407,6 +401,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             payload.update(sched_stats)
             payload["last_scheduled_at"] = LAST_SCHEDULED_AT
             payload["last_scheduled_counters"] = LAST_SCHEDULED_COUNTERS
+            # Migration head — operator visibility ("am I on latest schema?")
+            migration_stats = mailbox_migrations.stats(srv.db_path)
+            payload.update(migration_stats)
             return self._json(200, payload)
 
         if not self._check_auth():

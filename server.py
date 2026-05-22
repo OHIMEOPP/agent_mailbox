@@ -31,6 +31,7 @@ import urllib.request
 from pathlib import Path
 
 import mailbox_audit
+import mailbox_migrations
 import mailbox_reactions
 import mailbox_scheduled
 from mcp.server.fastmcp import FastMCP
@@ -217,19 +218,9 @@ def _init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_attach_sha ON attachments(sha256);
             """
         )
-        # Forward-compat: idempotent column adds for existing DBs
-        cols = {r[1] for r in c.execute("PRAGMA table_info(messages)").fetchall()}
-        if "has_attachments" not in cols:
-            c.execute("ALTER TABLE messages ADD COLUMN has_attachments INTEGER NOT NULL DEFAULT 0")
-        if "in_reply_to" not in cols:
-            c.execute("ALTER TABLE messages ADD COLUMN in_reply_to INTEGER")
-        if "expires_at" not in cols:
-            c.execute("ALTER TABLE messages ADD COLUMN expires_at TEXT")
-        # Indexes after ALTER (columns may have just been added); IF NOT EXISTS safe.
-        c.execute("CREATE INDEX IF NOT EXISTS idx_messages_in_reply_to "
-                  "ON messages(in_reply_to) WHERE in_reply_to IS NOT NULL")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_messages_expires_at "
-                  "ON messages(expires_at) WHERE expires_at IS NOT NULL")
+        # messages-table forward-compat ALTERs + partial indexes are owned by
+        # mailbox_migrations now. Centralized, versioned, idempotent on fresh
+        # and legacy DBs. See mailbox_migrations.MIGRATIONS for the list.
         c.execute(
             "INSERT INTO peers(name, last_seen_at) "
             "VALUES(?, strftime('%Y-%m-%dT%H:%M:%fZ','now')) "
@@ -272,6 +263,9 @@ def _init_fts() -> None:
 
 if not REMOTE:
     _init_db()
+    # Versioned migrations for messages-table ALTERs (has_attachments,
+    # in_reply_to, expires_at, …). Run after _init_db so the table exists.
+    mailbox_migrations.apply(DB_PATH)
     mailbox_audit.init_schema(DB_PATH)
     _init_fts()
     mailbox_reactions.init_schema(DB_PATH)
