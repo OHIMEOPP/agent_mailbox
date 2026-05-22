@@ -48,6 +48,11 @@ WATCH_HEARTBEAT_INTERVAL = 30.0  # SSE comment heartbeat to keep conn alive
 def db_connect(path: pathlib.Path) -> sqlite3.Connection:
     conn = sqlite3.connect(str(path), timeout=5.0)
     conn.row_factory = sqlite3.Row
+    # Pin DELETE journal mode every connection — defense against Docker Desktop
+    # WAL/mmap "disk I/O error" pitfall (cf. server.py same fix). Other process
+    # may have left WAL on, but every fresh connection enforces DELETE here.
+    conn.execute("PRAGMA journal_mode = DELETE")
+    conn.execute("PRAGMA busy_timeout = 5000")
     return conn
 
 

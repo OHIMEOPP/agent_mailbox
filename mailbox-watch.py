@@ -189,6 +189,12 @@ def run_remote_mode(args) -> int:
 
     Outputs same `MAIL id=... from=... sent=... preview=...` line format as
     local --monitor mode so Claude Code Monitor tool can consume identically.
+
+    Reconnect triggers:
+      - HTTPError / URLError (network drop, server down, 5xx)
+      - socket read timeout (no data + no heartbeat for SSE_READ_TIMEOUT seconds — server zombie)
+      - server `event: error` data line (server-side issue, e.g. disk I/O error)
+      - server closes the SSE stream cleanly (for-loop ends)
     """
     if args.watch_all:
         print("[watcher] --watch-all not supported with --remote (per-name watch only)",
@@ -197,6 +203,10 @@ def run_remote_mode(args) -> int:
     if not args.token:
         print("[watcher] --token required with --remote", file=sys.stderr)
         return 2
+
+    # Server sends heartbeat every 30s. If no line (mail OR heartbeat) arrives
+    # within this window, the socket read times out and we reconnect.
+    SSE_READ_TIMEOUT = 45  # seconds
 
     base = args.remote.rstrip('/')
     url = f"{base}/watch?name={args.name}"
@@ -207,14 +217,15 @@ def run_remote_mode(args) -> int:
     while True:
         try:
             req = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(req, timeout=None) as resp:
+            with urllib.request.urlopen(req, timeout=SSE_READ_TIMEOUT) as resp:
                 if resp.status != 200:
                     print(f"[watcher] HTTP {resp.status}", file=sys.stderr)
                     time.sleep(min(backoff, 60))
                     backoff = min(backoff * 2, 60)
                     continue
                 backoff = 1  # reset on successful connect
-                print(f"[watcher] connected, streaming events", file=sys.stderr)
+                print(f"[watcher] connected, streaming events (read timeout {SSE_READ_TIMEOUT}s)",
+                      file=sys.stderr)
                 event = None
                 for raw in resp:
                     line = raw.decode('utf-8', errors='replace').rstrip('\n').rstrip('\r')
@@ -238,14 +249,22 @@ def run_remote_mode(args) -> int:
                             except Exception as e:
                                 print(f"[watcher] parse err: {e}", file=sys.stderr)
                         elif event == 'error':
-                            print(f"[watcher] server error: {data}", file=sys.stderr)
+                            print(f"[watcher] server error: {data} — breaking to reconnect",
+                                  file=sys.stderr)
+                            break  # exit inner for-loop, fall through to outer reconnect
+                # If we reach here, the SSE stream ended cleanly (server closed
+                # connection). Fall through to outer while-loop reconnect.
+                print(f"[watcher] stream ended, reconnect in {backoff}s", file=sys.stderr)
         except urllib.error.HTTPError as e:
             if e.code == 401:
                 print(f"[watcher] auth failed (401), check --token", file=sys.stderr)
                 return 1
             print(f"[watcher] HTTP {e.code}: retry in {backoff}s", file=sys.stderr)
-        except (urllib.error.URLError, ConnectionError, OSError) as e:
-            print(f"[watcher] conn err: {e}, retry in {backoff}s", file=sys.stderr)
+        except (urllib.error.URLError, ConnectionError, OSError, TimeoutError) as e:
+            # OSError covers socket.timeout (Python 3.10+: TimeoutError is alias);
+            # TimeoutError explicit for clarity.
+            print(f"[watcher] conn err / read timeout: {e}, retry in {backoff}s",
+                  file=sys.stderr)
         except KeyboardInterrupt:
             return 0
         time.sleep(min(backoff, 60))
