@@ -147,7 +147,44 @@ If either fails → fix before touching `.mcp.json`. Common causes:
 - mailbox-server.py not running (Phase 0.4)
 - Token mismatch (re-copy from `token.txt`)
 
-### 1.6 Configure Claude Code MCP
+### 1.6 Naming convention — find your machine's hostname
+
+To prevent name collision across machines (two `wiki` agents on different
+devices would duplicate-process mail and be ambiguous on send), every
+`CLAUDE_MAILBOX_NAME` should embed the machine's hostname.
+
+**Format**: `<role>@<hostname>`
+
+**Why hostname**: OS-provided unique-per-machine ID, stable across reboots,
+human-readable. Beats MAC (ugly, NIC-swap-fragile), MachineGuid (unreadable
+UUID), or made-up names like "laptop" (will collide when you get a second
+laptop).
+
+**Find hostname**:
+
+| Platform | Command | Example output |
+|---|---|---|
+| Windows PowerShell | `$env:COMPUTERNAME` | `DESKTOP-ABC123` |
+| Windows cmd        | `hostname`          | `DESKTOP-ABC123` |
+| Linux / macOS      | `hostname`          | `thinkpad-x1`    |
+| Python (cross)     | `python -c "import socket; print(socket.gethostname())"` | `LAPTOP-XYZ789` |
+
+So names on different machines look like:
+
+| Machine | Agents |
+|---|---|
+| Desktop (`DESKTOP-ABC123`) | `wiki@DESKTOP-ABC123` / `koatag@DESKTOP-ABC123` / `koatag-frontend@DESKTOP-ABC123` |
+| Laptop (`LAPTOP-XYZ789`)   | `wiki@LAPTOP-XYZ789` / `koatag@LAPTOP-XYZ789` |
+| Future tablet              | `wiki@TAB-ZEN` |
+| Tailscale VPS              | `wiki@vps-tokyo` |
+
+Sending mail: `mcp__mailbox__send(to="wiki@LAPTOP-XYZ789", body="...")` — unambiguous which machine's wiki.
+
+If you're sure a role only ever runs on one machine (e.g., `koatag-bridge`
+container only on hub), you *may* drop `@hostname` for that single role. But
+mixed convention gets confusing — recommended to be consistent.
+
+### 1.7 Configure Claude Code MCP
 
 In any project on the laptop, create or edit `.mcp.json`:
 
@@ -158,7 +195,7 @@ In any project on the laptop, create or edit `.mcp.json`:
       "command": "python",
       "args": ["C:/path/to/claude-mailbox/server.py"],
       "env": {
-        "CLAUDE_MAILBOX_NAME": "laptop",
+        "CLAUDE_MAILBOX_NAME": "wiki@LAPTOP-XYZ789",
         "CLAUDE_MAILBOX_REMOTE": "http://<HUB_IP>:1905",
         "CLAUDE_MAILBOX_TOKEN": "<TOKEN>"
       }
@@ -167,8 +204,7 @@ In any project on the laptop, create or edit `.mcp.json`:
 }
 ```
 
-Pick `CLAUDE_MAILBOX_NAME` to be unique across all machines (e.g. `laptop`,
-`thinkpad`, `tablet-zen`).
+Replace `LAPTOP-XYZ789` with your actual hostname from Phase 1.6.
 
 Because `CLAUDE_MAILBOX_REMOTE` is set, `server.py` will route every MCP tool
 (`send`, `inbox`, `mark_read`, `peers`, `whoami`) through REST. It will not
@@ -177,17 +213,17 @@ create a local SQLite file. Verify by:
 ```python
 # In Claude Code, call:
 mcp__mailbox__whoami()
-# Expected: {"name": "laptop", "mode": "remote", "hub": "http://<HUB_IP>:1905"}
+# Expected: {"name": "wiki@LAPTOP-XYZ789", "mode": "remote", "hub": "http://<HUB_IP>:1905"}
 ```
 
-### 1.7 Start the watcher
+### 1.8 Start the watcher
 
 Use the `Monitor` tool (preferred — stream-mode, never dies):
 
 ```yaml
 Monitor:
-  command: py "C:/path/to/claude-mailbox/mailbox-watch.py" laptop
-  description: mailbox watcher for laptop (remote)
+  command: py "C:/path/to/claude-mailbox/mailbox-watch.py" wiki@LAPTOP-XYZ789
+  description: mailbox watcher for wiki@LAPTOP-XYZ789 (remote)
   persistent: true
   timeout_ms: 3600000
 ```
@@ -197,20 +233,21 @@ The watcher reads `CLAUDE_MAILBOX_REMOTE` and `CLAUDE_MAILBOX_TOKEN` from env
 If env vars aren't visible to the watcher process, pass explicitly:
 
 ```bash
-py "C:/path/to/claude-mailbox/mailbox-watch.py" laptop --remote http://<HUB_IP>:1905 --token <TOKEN>
+py "C:/path/to/claude-mailbox/mailbox-watch.py" wiki@LAPTOP-XYZ789 \
+  --remote http://<HUB_IP>:1905 --token <TOKEN>
 ```
 
 Expected first-line stderr:
 ```
-[watcher] remote-mode connect: http://<HUB_IP>:1905  name=laptop
+[watcher] remote-mode connect: http://<HUB_IP>:1905  name=wiki@LAPTOP-XYZ789
 [watcher] connected, streaming events
 ```
 
-### 1.8 Smoke test the round trip
+### 1.9 Smoke test the round trip
 
-From the hub, send a mail:
+From the hub, send a mail (use the laptop's full `<role>@<hostname>`):
 ```python
-mcp__mailbox__send(to="laptop", body="hello from hub")
+mcp__mailbox__send(to="wiki@LAPTOP-XYZ789", body="hello from hub")
 ```
 
 The laptop watcher should immediately emit one stdout line:
@@ -220,12 +257,13 @@ MAIL id=<N> from=<hub-name> sent=<ts> preview=hello from hub
 
 …which Claude Code's Monitor tool turns into an in-conversation notification.
 
-From the laptop, send back:
+From the laptop, send back (use the hub's full name):
 ```python
-mcp__mailbox__send(to="wiki", body="hello from laptop")  # or whoever
+mcp__mailbox__send(to="wiki@DESKTOP-ABC123", body="hello from laptop")
 ```
 
-Hub-side watcher sees it.
+Hub-side wiki watcher sees it. Names always include `@hostname` to avoid
+ambiguity.
 
 ---
 
@@ -244,6 +282,24 @@ If you want the laptop to work from coffee shops / outside home network:
 5. No protocol change — Tailscale is just a different IP for the same HTTP server.
 
 For mobile (future): Tailscale has iOS/Android apps. Same approach.
+
+---
+
+### Transitioning the hub to `@hostname` convention (optional)
+
+If your hub agents currently use bare names (`wiki`, `koatag`) — fine, they
+still work. But to make cross-device unambiguous, you may want to migrate:
+
+1. On each hub project's `.mcp.json`, change `CLAUDE_MAILBOX_NAME` from `wiki`
+   to `wiki@DESKTOP-ABC123` (your hub's hostname).
+2. Restart Claude Code sessions.
+3. Restart the hub's local watcher with the new name.
+4. The `peers` table will accumulate both old (`wiki`) and new (`wiki@DESKTOP-ABC123`)
+   rows — cosmetic, can be cleaned: `DELETE FROM peers WHERE name NOT LIKE '%@%'`.
+5. Historical message rows still reference old names — harmless, history doesn't auto-update.
+
+Or skip the migration: hub keeps bare names, spokes use `@hostname`, and you
+just remember "no `@` = hub". Either works.
 
 ---
 
@@ -291,7 +347,8 @@ All 6 → cross-device setup complete.
 | ghost `mailbox.db` appears on laptop | `.mcp.json` missing `CLAUDE_MAILBOX_REMOTE` env | re-check spelling; ensure both REMOTE + TOKEN are set |
 | Watcher exits immediately with 401 | token typo | check `CLAUDE_MAILBOX_TOKEN` env in watcher launch context |
 | Watcher reconnects every 2 sec | hub serving but auth fails or path 404 | check `--remote` URL has no trailing slash; verify server log shows the connect |
-| Mail sent but spoke watcher silent | wrong `CLAUDE_MAILBOX_NAME` mismatch | watcher's name must match recipient name on hub's send |
+| Mail sent but spoke watcher silent | wrong `CLAUDE_MAILBOX_NAME` mismatch | watcher's name must exactly match recipient name on hub's send (case-sensitive, including `@hostname`) |
+| Two watchers wake on every mail | same `CLAUDE_MAILBOX_NAME` on two machines | adopt `<role>@<hostname>` convention (Phase 1.6) so each machine has unique name |
 | New laptop sessions create local DB | `.mcp.json` env block missing on **that** project | env config is per-project, copy `.mcp.json` to every project that uses mailbox |
 
 ---
