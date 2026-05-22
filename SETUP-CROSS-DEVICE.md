@@ -295,24 +295,36 @@ mcp__mailbox__whoami()
 
 ### 1.8 Start the watcher
 
+> **Critical**: `.mcp.json` env block injects ONLY into the MCP server subprocess
+> (`server.py`). The watcher is a **separate** subprocess spawned by Monitor /
+> Bash and does **not** inherit `.mcp.json` env. Pass `--remote` + `--token`
+> on the watcher command line, do not rely on env propagation.
+>
+> Symptom of getting this wrong: watcher stderr spams `unable to open
+> database file` (it tried local-mode), `stdout` is empty, Monitor never fires
+> notifications. Round-trip ping mail gets queued in hub DB but spoke never
+> wakes up.
+
 Use the `Monitor` tool (preferred — stream-mode, never dies):
 
 ```yaml
 Monitor:
-  command: py "C:/path/to/claude-mailbox/mailbox-watch.py" wiki@LAPTOP-XYZ789
+  command: py "C:/path/to/claude-mailbox/mailbox-watch.py" wiki@LAPTOP-XYZ789 --remote http://<HUB_IP>:1905 --token <TOKEN>
   description: mailbox watcher for wiki@LAPTOP-XYZ789 (remote)
   persistent: true
   timeout_ms: 3600000
 ```
 
-The watcher reads `CLAUDE_MAILBOX_REMOTE` and `CLAUDE_MAILBOX_TOKEN` from env
-(no `--remote` flag needed when MCP server set them in `.mcp.json` env block).
-If env vars aren't visible to the watcher process, pass explicitly:
-
-```bash
-py "C:/path/to/claude-mailbox/mailbox-watch.py" wiki@LAPTOP-XYZ789 \
-  --remote http://<HUB_IP>:1905 --token <TOKEN>
+Expected first stderr lines:
 ```
+[watcher] remote-mode connect: http://<HUB_IP>:1905  name=wiki@LAPTOP-XYZ789
+[watcher] connected, streaming events
+```
+
+If your shell wrapper sets `CLAUDE_MAILBOX_REMOTE` / `CLAUDE_MAILBOX_TOKEN` in
+the *parent* env before launching Monitor (e.g. a systemd unit, a wrapper
+`.ps1`), the watcher will pick them up — but inside Claude Code's Monitor tool
+the cleanest path is **always pass flags explicitly**.
 
 Expected first-line stderr:
 ```
@@ -429,7 +441,8 @@ All 6 → cross-device setup complete.
 | `curl /peers` returns 401 | wrong token | re-copy token.txt; remove leading/trailing whitespace |
 | `whoami` returns `mode: local` not `remote` | env var not propagated to MCP server | check `.mcp.json` env block; restart Claude Code session |
 | ghost `mailbox.db` appears on laptop | `.mcp.json` missing `CLAUDE_MAILBOX_REMOTE` env | re-check spelling; ensure both REMOTE + TOKEN are set |
-| Watcher exits immediately with 401 | token typo | check `CLAUDE_MAILBOX_TOKEN` env in watcher launch context |
+| Watcher exits immediately with 401 | token typo | check `--token` on watcher command line (don't rely on env from `.mcp.json` — see Phase 1.8) |
+| Watcher stderr spams `unable to open database file` | watcher launched without `--remote`, fell back to local SQLite mode | pass `--remote http://<HUB_IP>:1905 --token <TOKEN>` on the Monitor command line; `.mcp.json` env does NOT propagate to watcher subprocess |
 | Watcher reconnects every 2 sec | hub serving but auth fails or path 404 | check `--remote` URL has no trailing slash; verify server log shows the connect |
 | Mail sent but spoke watcher silent | wrong `CLAUDE_MAILBOX_NAME` mismatch | watcher's name must exactly match recipient name on hub's send (case-sensitive, including `@hostname`) |
 | Two watchers wake on every mail | same `CLAUDE_MAILBOX_NAME` on two machines | adopt `<role>@<hostname>` convention (Phase 1.6) so each machine has unique name |

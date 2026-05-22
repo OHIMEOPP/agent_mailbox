@@ -270,9 +270,12 @@ def main() -> int:
     p.add_argument('--remote', default=None,
                    help="connect to remote hub via HTTP/SSE (e.g. http://hub-ip:1905). "
                         "Implies stream mode; ignores --db --tick --max. "
-                        "Auto-filled from env CLAUDE_MAILBOX_REMOTE if not given.")
+                        "RECOMMENDED to pass explicitly when launched from Claude Code "
+                        "Monitor tool (Monitor subprocess does NOT inherit env from .mcp.json). "
+                        "Falls back to env CLAUDE_MAILBOX_REMOTE only if parent process set it.")
     p.add_argument('--token', default=None,
-                   help="bearer token for --remote (or env CLAUDE_MAILBOX_TOKEN)")
+                   help="bearer token for --remote (recommended to pass explicitly; "
+                        "falls back to env CLAUDE_MAILBOX_TOKEN if parent process set it)")
     args = p.parse_args()
 
     import os
