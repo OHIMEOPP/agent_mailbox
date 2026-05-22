@@ -32,6 +32,7 @@ from pathlib import Path
 
 import mailbox_audit
 import mailbox_migrations
+import mailbox_priority
 import mailbox_reactions
 import mailbox_scheduled
 from mcp.server.fastmcp import FastMCP
@@ -197,7 +198,8 @@ def _init_db() -> None:
                 claimed_by TEXT,
                 claimed_until TEXT,
                 has_attachments INTEGER NOT NULL DEFAULT 0,
-                in_reply_to INTEGER
+                in_reply_to INTEGER,
+                priority INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS idx_messages_to_unread
                 ON messages(to_name, read_at);
@@ -333,7 +335,8 @@ mcp = FastMCP("mailbox")
 def send(to: str, body: str, files: list[str] | None = None,
          in_reply_to: int | None = None,
          expires_at: str | None = None,
-         deliver_at: str | None = None) -> dict:
+         deliver_at: str | None = None,
+         priority: int = 0) -> dict:
     """Send a message (optionally with file attachments) to another Claude Code instance.
 
     Args:
@@ -370,6 +373,10 @@ def send(to: str, body: str, files: list[str] | None = None,
                              from, in_reply_to?, expires_at?}
     """
     resolved_expires_at = _resolve_expires_at(expires_at)
+    try:
+        validated_priority = mailbox_priority.parse_priority(priority)
+    except ValueError as e:
+        raise RuntimeError(str(e))
     # Scheduled-send intercept — if deliver_at given, defer until daemon delivers.
     # files + deliver_at combo is not supported in this pass; we error early.
     if deliver_at:
@@ -469,9 +476,10 @@ def send(to: str, body: str, files: list[str] | None = None,
             fanout_results: list[dict] = []
             for to_name in recipients:
                 row = c.execute(
-                    "INSERT INTO messages(from_name, to_name, body, has_attachments, in_reply_to, expires_at) "
-                    "VALUES(?, ?, ?, 1, ?, ?) RETURNING id, sent_at",
-                    (NAME, to_name, body, in_reply_to, resolved_expires_at),
+                    "INSERT INTO messages(from_name, to_name, body, has_attachments, in_reply_to, expires_at, priority) "
+                    "VALUES(?, ?, ?, 1, ?, ?, ?) RETURNING id, sent_at",
+                    (NAME, to_name, body, in_reply_to, resolved_expires_at,
+                     validated_priority),
                 ).fetchone()
                 msg_id = row["id"]
                 attach_rows = []
@@ -539,9 +547,10 @@ def send(to: str, body: str, files: list[str] | None = None,
         inserted: list[dict] = []
         for to_name in recipients:
             row = c.execute(
-                "INSERT INTO messages(from_name, to_name, body, in_reply_to, expires_at) "
-                "VALUES(?, ?, ?, ?, ?) RETURNING id, sent_at",
-                (NAME, to_name, body, in_reply_to, resolved_expires_at),
+                "INSERT INTO messages(from_name, to_name, body, in_reply_to, expires_at, priority) "
+                "VALUES(?, ?, ?, ?, ?, ?) RETURNING id, sent_at",
+                (NAME, to_name, body, in_reply_to, resolved_expires_at,
+                 validated_priority),
             ).fetchone()
             inserted.append({"id": row["id"], "sent_at": row["sent_at"], "to": to_name})
 
@@ -568,7 +577,8 @@ def send(to: str, body: str, files: list[str] | None = None,
 
 @mcp.tool()
 def inbox(unread_only: bool = True, limit: int = 50,
-          claimable_only: bool = False) -> list[dict]:
+          claimable_only: bool = False,
+          min_priority: int = 0) -> list[dict]:
     """Fetch messages addressed to this instance.
 
     Args:
@@ -578,17 +588,23 @@ def inbox(unread_only: bool = True, limit: int = 50,
                         agent within the visibility-timeout window. Useful for
                         worker-loop patterns to avoid double-processing.
                         Messages you've claimed yourself are still returned.
+        min_priority: only return messages with priority ≥ this (0..9, default 0).
+                      Worker-loop pattern: poll with min_priority=5 to drain
+                      urgent items first, then drop to 0 for backlog.
+
+    Order: priority DESC then id ASC — high-priority first, FIFO within band.
 
     Returns:
         List of {id, from, body, sent_at, read_at, claimed_by, claimed_until,
-                 in_reply_to, expires_at, attachments: [...], reactions: [...]}.
+                 in_reply_to, expires_at, priority,
+                 attachments: [...], reactions: [...]}.
     """
     if REMOTE:
         unread_flag = "1" if unread_only else "0"
         claimable_flag = "1" if claimable_only else "0"
         r = _remote("GET",
                     f"/inbox?name={NAME}&unread={unread_flag}&limit={limit}"
-                    f"&claimable={claimable_flag}")
+                    f"&claimable={claimable_flag}&min_priority={min_priority}")
         return [
             {"id": m["id"], "from": m["from_name"], "body": m["body"],
              "sent_at": m["sent_at"], "read_at": m["read_at"],
@@ -596,13 +612,14 @@ def inbox(unread_only: bool = True, limit: int = 50,
              "claimed_until": m.get("claimed_until"),
              "in_reply_to": m.get("in_reply_to"),
              "expires_at": m.get("expires_at"),
+             "priority": m.get("priority", 0),
              "attachments": m.get("attachments", []),
              "reactions": m.get("reactions", [])}
             for m in r["messages"]
         ]
 
     sql = ("SELECT id, from_name, body, sent_at, read_at, has_attachments, "
-           "in_reply_to, expires_at, claimed_by, claimed_until "
+           "in_reply_to, expires_at, claimed_by, claimed_until, priority "
            "FROM messages WHERE to_name = ?")
     params: list = [NAME]
     if unread_only:
@@ -612,7 +629,11 @@ def inbox(unread_only: bool = True, limit: int = 50,
         sql += (" AND (claimed_by IS NULL OR claimed_by = ? "
                 "OR claimed_until < strftime('%Y-%m-%dT%H:%M:%fZ','now'))")
         params.append(NAME)
-    sql += " ORDER BY id ASC LIMIT ?"
+    if min_priority > 0:
+        sql += " AND priority >= ?"
+        params.append(min_priority)
+    # Priority DESC first (high-urgency surfaces first), then id ASC (FIFO within band)
+    sql += " ORDER BY priority DESC, id ASC LIMIT ?"
     params.append(limit)
 
     with _connect() as c:
@@ -643,6 +664,7 @@ def inbox(unread_only: bool = True, limit: int = 50,
                 "claimed_until": r["claimed_until"],
                 "in_reply_to": r["in_reply_to"],
                 "expires_at": r["expires_at"],
+                "priority": r["priority"],
                 "attachments": atts_by_msg.get(r["id"], []),
                 "reactions": reactions_by_msg.get(r["id"], []),
             })

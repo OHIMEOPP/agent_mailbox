@@ -48,6 +48,7 @@ import urllib.parse
 import mailbox_audit
 import mailbox_backup
 import mailbox_migrations
+import mailbox_priority
 import mailbox_rate_limit
 import mailbox_reactions
 import mailbox_scheduled
@@ -133,7 +134,8 @@ def db_init(path: pathlib.Path):
             has_attachments INTEGER NOT NULL DEFAULT 0,
             in_reply_to INTEGER,
             claimed_by TEXT,
-            claimed_until TEXT
+            claimed_until TEXT,
+            priority INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_to_unread
             ON messages(to_name, read_at);
@@ -460,6 +462,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 payload["messages_claimed_active"] = 0
             finally:
                 conn_h.close()
+            # Priority distribution across unread messages
+            prio_stats = mailbox_priority.stats(srv.db_path)
+            payload.update(prio_stats)
             return self._json(200, payload)
 
         if not self._check_auth():
@@ -476,8 +481,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             unread_only = first("unread", "1") in ("1", "true", "yes")
             claimable_only = first("claimable", "0") in ("1", "true", "yes")
             limit = int(first("limit", "50"))
+            try:
+                min_priority = int(first("min_priority", "0"))
+            except ValueError:
+                return self._json(400, {"error": "min_priority must be int"})
             sql = ("SELECT id, from_name, to_name, body, sent_at, read_at, has_attachments, "
-                   "in_reply_to, expires_at, claimed_by, claimed_until "
+                   "in_reply_to, expires_at, claimed_by, claimed_until, priority "
                    "FROM messages WHERE to_name=?")
             args: list = [name]
             if unread_only:
@@ -486,7 +495,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 sql += (" AND (claimed_by IS NULL OR claimed_by = ? "
                         "OR claimed_until < strftime('%Y-%m-%dT%H:%M:%fZ','now'))")
                 args.append(name)
-            sql += " ORDER BY id DESC LIMIT ?"
+            if min_priority > 0:
+                sql += " AND priority >= ?"
+                args.append(min_priority)
+            # Priority DESC (urgent first), then id ASC (FIFO within band)
+            sql += " ORDER BY priority DESC, id ASC LIMIT ?"
             args.append(limit)
             conn = db_connect(srv.db_path)
             try:
@@ -592,6 +605,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             deliver_at_raw = payload.get("deliver_at")
             if deliver_at_raw is not None and not isinstance(deliver_at_raw, str):
                 return self._json(400, {"error": "deliver_at must be ISO/relative string or null"})
+            try:
+                priority = mailbox_priority.parse_priority(payload.get("priority"))
+            except ValueError as e:
+                return self._json(400, {"error": str(e)})
 
             # Scheduled-send path: if deliver_at present, enqueue into
             # scheduled_messages instead of inserting into messages. Daemon
@@ -659,10 +676,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 inserted: list[dict] = []
                 for to_name in recipients:
                     row = conn.execute(
-                        "INSERT INTO messages(from_name, to_name, body, in_reply_to, expires_at) "
-                        "VALUES(?, ?, ?, ?, ?) RETURNING id, sent_at",
+                        "INSERT INTO messages(from_name, to_name, body, in_reply_to, expires_at, priority) "
+                        "VALUES(?, ?, ?, ?, ?, ?) RETURNING id, sent_at",
                         (payload["from"], to_name, payload["body"],
-                         in_reply_to, expires_at),
+                         in_reply_to, expires_at, priority),
                     ).fetchone()
                     inserted.append({"id": row["id"], "sent_at": row["sent_at"],
                                      "to": to_name})
@@ -916,6 +933,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         expires_at = payload.get("expires_at")
         if expires_at is not None and not isinstance(expires_at, str):
             return self._json(400, {"error": "expires_at must be ISO string or null"})
+        try:
+            priority = mailbox_priority.parse_priority(payload.get("priority"))
+        except ValueError as e:
+            return self._json(400, {"error": str(e)})
 
         # Collect file parts: any field name like files[0], files[1], ... or "files"
         file_parts: list[tuple[str, dict]] = []
@@ -972,10 +993,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             fanout_results: list[dict] = []
             for to_name in recipients:
                 row = conn.execute(
-                    "INSERT INTO messages(from_name, to_name, body, has_attachments, in_reply_to, expires_at) "
-                    "VALUES(?, ?, ?, 1, ?, ?) RETURNING id, sent_at",
+                    "INSERT INTO messages(from_name, to_name, body, has_attachments, in_reply_to, expires_at, priority) "
+                    "VALUES(?, ?, ?, 1, ?, ?, ?) RETURNING id, sent_at",
                     (payload["from"], to_name, payload["body"],
-                     in_reply_to, expires_at),
+                     in_reply_to, expires_at, priority),
                 ).fetchone()
                 msg_id = row["id"]
                 attach_rows = []
@@ -1183,7 +1204,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 conn = db_connect(srv.db_path)
                 try:
                     rows = conn.execute(
-                        "SELECT id, from_name, to_name, body, sent_at, has_attachments, in_reply_to, expires_at "
+                        "SELECT id, from_name, to_name, body, sent_at, has_attachments, in_reply_to, expires_at, priority "
                         "FROM messages WHERE to_name=? AND id>? ORDER BY id ASC",
                         (name, last_id),
                     ).fetchall()

@@ -118,6 +118,25 @@ def _migration_v004_claim(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migration_v005_priority(conn: sqlite3.Connection) -> None:
+    """messages.priority + partial index.
+
+    Added 2026-05-23 priority-lanes feature. Per-message integer 0..9
+    (default 0). Inbox queries order by priority DESC, id ASC so high-priority
+    items surface first while FIFO is preserved within a priority band.
+    Partial index covers only non-default priorities — most traffic is priority=0.
+    """
+    if "priority" not in _messages_columns(conn):
+        conn.execute(
+            "ALTER TABLE messages ADD COLUMN priority "
+            "INTEGER NOT NULL DEFAULT 0"
+        )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_messages_priority "
+        "ON messages(priority) WHERE priority > 0"
+    )
+
+
 # Canonical migration list. Append only; never re-order or delete.
 # `version` must be sequential starting from 1.
 MIGRATIONS: list[tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
@@ -125,6 +144,7 @@ MIGRATIONS: list[tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (2, "messages_in_reply_to_with_partial_index", _migration_v002_in_reply_to),
     (3, "messages_expires_at_with_partial_index", _migration_v003_expires_at),
     (4, "messages_claim_visibility_timeout", _migration_v004_claim),
+    (5, "messages_priority_with_partial_index", _migration_v005_priority),
 ]
 
 

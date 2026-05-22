@@ -548,6 +548,37 @@ py mailbox-rate-limit.py --prune        # 砍 >1hr 老 bucket
 - 沒分 endpoint quota — 同 scope 跨所有 endpoint 共用同 limit
 - buckets 沒自動接 retention sweep — 需要手動 `--prune` 或之後加進 mailbox_sweep
 
+## Priority lanes（自 2026-05-23）
+
+每封訊息可帶 integer `priority`（0..9，default 0）。Inbox query 自動 `ORDER BY priority DESC, id ASC` — high-priority 先冒出來，同 priority 走 FIFO。Worker 可以 `min_priority=5` 過濾只看 urgent。
+
+```python
+mcp__mailbox__send(to="wiki", body="server is down", priority=9)
+mcp__mailbox__send(to="koatag", body="weekly summary")  # priority=0 default
+
+# Worker pattern: drain urgent first, then backlog
+urgent = mcp__mailbox__inbox(min_priority=5)
+if not urgent:
+    backlog = mcp__mailbox__inbox()
+```
+
+**REST `/inbox?min_priority=N`** + body `{"priority": N}` in `/send` / `/send-file`。
+
+**Schema**：`messages.priority INTEGER NOT NULL DEFAULT 0` + partial index `WHERE priority > 0` — migration v005，由 `mailbox_migrations.apply()` 自動帶上。
+
+**Buckets**（CLI / dump 渲染）：
+- 0 = normal
+- 1-3 = elevated
+- 4-6 = high
+- 7-9 = critical
+
+**`/health` 多 2 欄**：`priority_unread_total`、`priority_buckets: {normal/elevated/high/critical: count}` — operator 可以一眼看 urgent backlog 累積。
+
+**設計約束**：
+- Priority 是 send-time only，sender 自己決定（沒 server-side rewrite）
+- Out-of-range (>9 或 <0) → 400 / ValueError，validate via `mailbox_priority.parse_priority`
+- 跟 `claim` (visibility timeout) 自然 pair：worker `inbox(claimable_only=True, min_priority=5)` 抓最 urgent + 未被別人 claim 的
+
 ## Bridge / 周邊工具
 
 - `mailbox-discord-bridge.py` — Docker container `mailbox-bridge`（port 1904）。**Inbound only**：Discord DM → mailbox INSERT。Agent **不直接 call** 這個 port，是 Discord bot 自動推進來。看完整 e2e 流程圖：[Discord 整合：兩個 port，分工不對稱](#discord-整合兩個-port分工不對稱)

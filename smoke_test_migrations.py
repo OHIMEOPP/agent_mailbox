@@ -141,11 +141,15 @@ def test_4_partial_legacy_db(db: Path) -> None:
     conn.close()
 
     result = mailbox_migrations.apply(db)
-    # All 3 should be recorded as applied (v001 is no-op but still tracked)
-    assert len(result["applied"]) == 3
-    assert {v for v, _ in result["applied"]} == {1, 2, 3}
+    # All registered migrations should be recorded as applied (v001 is a no-op
+    # for the pre-existing column but still tracked).
+    expected_n = len(mailbox_migrations.MIGRATIONS)
+    assert len(result["applied"]) == expected_n
+    assert {v for v, _ in result["applied"]} == {
+        v for v, _, _ in mailbox_migrations.MIGRATIONS
+    }
 
-    # Columns should all exist post-apply
+    # All migration-added columns should exist post-apply
     cols = _messages_columns(db)
     for c in ("has_attachments", "in_reply_to", "expires_at"):
         assert c in cols, f"missing column {c} after migration"
@@ -153,7 +157,7 @@ def test_4_partial_legacy_db(db: Path) -> None:
     # Second apply is a no-op
     second = mailbox_migrations.apply(db)
     assert second["applied"] == []
-    print(f"  v001 idempotent on pre-existing column, v002+v003 ALTERed cleanly")
+    print(f"  v001 idempotent on pre-existing column, {expected_n - 1} other migrations ALTERed cleanly")
 
 
 def test_5_stats_and_list_applied(db: Path) -> None:
