@@ -24,6 +24,7 @@ import sys
 from pathlib import Path
 
 # Action vocabulary. Keep this list as the canonical set; CLI/--action validates against it.
+# When adding actions, also wire them at the call site (server.py / mailbox-server.py).
 ACTIONS = frozenset({
     "send",       # any send (text-only or with files)
     "inbox",      # inbox poll
@@ -31,6 +32,7 @@ ACTIONS = frozenset({
     "download",   # attachment fetched
     "whoami",     # identity probe
     "peers",      # peer list
+    "search",     # FTS5 full-text search (added 2026-05-23 by wiki/FTS5)
 })
 
 DEFAULT_TAIL_LIMIT = 50

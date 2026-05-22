@@ -195,9 +195,13 @@ def _init_db() -> None:
             c.execute("ALTER TABLE messages ADD COLUMN has_attachments INTEGER NOT NULL DEFAULT 0")
         if "in_reply_to" not in cols:
             c.execute("ALTER TABLE messages ADD COLUMN in_reply_to INTEGER")
-        # Index after ALTER (column may have just been added); IF NOT EXISTS safe.
+        if "expires_at" not in cols:
+            c.execute("ALTER TABLE messages ADD COLUMN expires_at TEXT")
+        # Indexes after ALTER (columns may have just been added); IF NOT EXISTS safe.
         c.execute("CREATE INDEX IF NOT EXISTS idx_messages_in_reply_to "
                   "ON messages(in_reply_to) WHERE in_reply_to IS NOT NULL")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_messages_expires_at "
+                  "ON messages(expires_at) WHERE expires_at IS NOT NULL")
         c.execute(
             "INSERT INTO peers(name, last_seen_at) "
             "VALUES(?, strftime('%Y-%m-%dT%H:%M:%fZ','now')) "
@@ -261,6 +265,39 @@ def _guess_mime(filename: str) -> str:
     return mimetypes.guess_type(filename)[0] or "application/octet-stream"
 
 
+import re as _re_ttl
+from datetime import datetime as _datetime_ttl, timedelta as _timedelta_ttl, timezone as _timezone_ttl
+
+_TTL_RELATIVE = _re_ttl.compile(r"^(\d+)([mhd])$")
+
+
+def _resolve_expires_at(spec: str | None) -> str | None:
+    """Parse expires_at arg into an ISO 8601 UTC string, or None.
+
+    Accepts:
+      - None / "" → None (no expiry)
+      - ISO 8601 with `Z` or `+00:00` (`2026-05-25T00:00:00Z`) — pass through
+      - Relative: `30m`, `1h`, `7d` (computed from now in UTC)
+    """
+    if spec is None or spec == "":
+        return None
+    m = _TTL_RELATIVE.match(spec)
+    if m:
+        n = int(m.group(1))
+        unit = m.group(2)
+        if unit == "m":
+            delta = _timedelta_ttl(minutes=n)
+        elif unit == "h":
+            delta = _timedelta_ttl(hours=n)
+        else:
+            delta = _timedelta_ttl(days=n)
+        ts = _datetime_ttl.now(_timezone_ttl.utc) + delta
+        # SQLite-compatible ISO 8601 with millisecond precision and Z suffix
+        return ts.strftime("%Y-%m-%dT%H:%M:%S.") + f"{ts.microsecond // 1000:03d}Z"
+    # Assume ISO; lex-compare in SQL is correct for sorted ISO strings.
+    return spec
+
+
 # ---------- MCP server & tools ----------
 
 mcp = FastMCP("mailbox")
@@ -268,7 +305,8 @@ mcp = FastMCP("mailbox")
 
 @mcp.tool()
 def send(to: str, body: str, files: list[str] | None = None,
-         in_reply_to: int | None = None) -> dict:
+         in_reply_to: int | None = None,
+         expires_at: str | None = None) -> dict:
     """Send a message (optionally with file attachments) to another Claude Code instance.
 
     Args:
@@ -282,10 +320,17 @@ def send(to: str, body: str, files: list[str] | None = None,
                `id` from a prior inbox() entry. No FK enforcement — if the
                parent was retention-pruned, the field becomes a broken chain
                (rendered as orphan in dump).
+        expires_at: optional TTL for ephemeral messages. Retention sweep deletes
+               messages whose expires_at < now, regardless of read state. Accepts
+               ISO 8601 (`2026-05-25T00:00:00Z`) or relative shorthand `30m` /
+               `1h` / `7d` (computed from now). None or omitted = no expiry.
+               Useful for status pings / progress updates that have no value
+               beyond the next sweep.
 
     Returns:
-        {id, sent_at, from, to, in_reply_to?, attachments?: [{id, filename, mime, size, sha256}]}
+        {id, sent_at, from, to, in_reply_to?, expires_at?, attachments?: [{id, filename, mime, size, sha256}]}
     """
+    resolved_expires_at = _resolve_expires_at(expires_at)
     if files:
         file_parts: list[tuple[str, str, bytes]] = []
         for fp in files:
@@ -298,6 +343,8 @@ def send(to: str, body: str, files: list[str] | None = None,
             body_payload: dict = {"from": NAME, "to": to, "body": body}
             if in_reply_to is not None:
                 body_payload["in_reply_to"] = in_reply_to
+            if resolved_expires_at is not None:
+                body_payload["expires_at"] = resolved_expires_at
             r = _remote_multipart(
                 "/send-file",
                 body_payload,
@@ -306,6 +353,7 @@ def send(to: str, body: str, files: list[str] | None = None,
             return {
                 "id": r["id"], "sent_at": r["sent_at"], "from": NAME, "to": to,
                 "in_reply_to": in_reply_to,
+                "expires_at": resolved_expires_at,
                 "attachments": r["attachments"],
             }
 
@@ -316,9 +364,9 @@ def send(to: str, body: str, files: list[str] | None = None,
             written.append({"filename": fname, "mime": mime, "size": size, "sha256": sha})
         with _connect() as c:
             row = c.execute(
-                "INSERT INTO messages(from_name, to_name, body, has_attachments, in_reply_to) "
-                "VALUES(?, ?, ?, 1, ?) RETURNING id, sent_at",
-                (NAME, to, body, in_reply_to),
+                "INSERT INTO messages(from_name, to_name, body, has_attachments, in_reply_to, expires_at) "
+                "VALUES(?, ?, ?, 1, ?, ?) RETURNING id, sent_at",
+                (NAME, to, body, in_reply_to, resolved_expires_at),
             ).fetchone()
             msg_id = row["id"]
             for w in written:
@@ -331,11 +379,13 @@ def send(to: str, body: str, files: list[str] | None = None,
         mailbox_audit.log_event(
             DB_PATH, actor=NAME, action="send", target=to,
             payload={"msg_id": msg_id, "body_len": len(body),
-                     "files_count": len(written), "in_reply_to": in_reply_to},
+                     "files_count": len(written), "in_reply_to": in_reply_to,
+                     "expires_at": resolved_expires_at},
         )
         return {
             "id": msg_id, "sent_at": row["sent_at"], "from": NAME, "to": to,
             "in_reply_to": in_reply_to,
+            "expires_at": resolved_expires_at,
             "attachments": written,
         }
 
@@ -344,23 +394,27 @@ def send(to: str, body: str, files: list[str] | None = None,
         body_payload2: dict = {"from": NAME, "to": to, "body": body}
         if in_reply_to is not None:
             body_payload2["in_reply_to"] = in_reply_to
+        if resolved_expires_at is not None:
+            body_payload2["expires_at"] = resolved_expires_at
         r = _remote("POST", "/send", body_payload2)
         return {"id": r["id"], "sent_at": r["sent_at"], "from": NAME, "to": to,
-                "in_reply_to": in_reply_to}
+                "in_reply_to": in_reply_to,
+                "expires_at": resolved_expires_at}
 
     with _connect() as c:
         row = c.execute(
-            "INSERT INTO messages(from_name, to_name, body, in_reply_to) "
-            "VALUES(?, ?, ?, ?) RETURNING id, sent_at",
-            (NAME, to, body, in_reply_to),
+            "INSERT INTO messages(from_name, to_name, body, in_reply_to, expires_at) "
+            "VALUES(?, ?, ?, ?, ?) RETURNING id, sent_at",
+            (NAME, to, body, in_reply_to, resolved_expires_at),
         ).fetchone()
     mailbox_audit.log_event(
         DB_PATH, actor=NAME, action="send", target=to,
         payload={"msg_id": row["id"], "body_len": len(body),
-                 "files_count": 0, "in_reply_to": in_reply_to},
+                 "files_count": 0, "in_reply_to": in_reply_to,
+                 "expires_at": resolved_expires_at},
     )
     return {"id": row["id"], "sent_at": row["sent_at"], "from": NAME, "to": to,
-            "in_reply_to": in_reply_to}
+            "in_reply_to": in_reply_to, "expires_at": resolved_expires_at}
 
 
 @mcp.tool()
@@ -384,11 +438,12 @@ def inbox(unread_only: bool = True, limit: int = 50) -> list[dict]:
             {"id": m["id"], "from": m["from_name"], "body": m["body"],
              "sent_at": m["sent_at"], "read_at": m["read_at"],
              "in_reply_to": m.get("in_reply_to"),
+             "expires_at": m.get("expires_at"),
              "attachments": m.get("attachments", [])}
             for m in r["messages"]
         ]
 
-    sql = ("SELECT id, from_name, body, sent_at, read_at, has_attachments, in_reply_to "
+    sql = ("SELECT id, from_name, body, sent_at, read_at, has_attachments, in_reply_to, expires_at "
            "FROM messages WHERE to_name = ?")
     params: list = [NAME]
     if unread_only:
@@ -418,6 +473,7 @@ def inbox(unread_only: bool = True, limit: int = 50) -> list[dict]:
                 "id": r["id"], "from": r["from_name"], "body": r["body"],
                 "sent_at": r["sent_at"], "read_at": r["read_at"],
                 "in_reply_to": r["in_reply_to"],
+                "expires_at": r["expires_at"],
                 "attachments": atts_by_msg.get(r["id"], []),
             })
     mailbox_audit.log_event(

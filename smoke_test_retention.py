@@ -249,9 +249,163 @@ def main() -> int:
     assert cli_dry["counters"]["read_messages_deleted"] == 0
     print(f"[smoke] CLI --dry-run ok")
 
+    # --- Test 10: explicit per-message TTL (expires_at) ---
+    ttl_workdir = Path(tempfile.mkdtemp(prefix="mailbox-ttl-smoke-"))
+    try:
+        _test_ttl_expires_at(ttl_workdir)
+    finally:
+        shutil.rmtree(ttl_workdir, ignore_errors=True)
+
     print(f"\n[smoke] ALL RETENTION TESTS PASSED")
     shutil.rmtree(workdir, ignore_errors=True)
     return 0 if not failures else 1
+
+
+def init_schema_with_ttl(db: Path) -> None:
+    """Variant of init_schema that includes expires_at + partial index.
+
+    Used by TTL test to verify sweep behavior on a future-schema DB. Once
+    server.py adds the column, init_schema(...) above can be updated to
+    include it and this variant removed.
+    """
+    conn = sqlite3.connect(str(db))
+    conn.executescript("""
+        CREATE TABLE messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            from_name TEXT NOT NULL,
+            to_name TEXT NOT NULL,
+            body TEXT NOT NULL,
+            sent_at TEXT NOT NULL,
+            read_at TEXT,
+            has_attachments INTEGER NOT NULL DEFAULT 0,
+            expires_at TEXT
+        );
+        CREATE INDEX idx_messages_expires_at ON messages(expires_at) WHERE expires_at IS NOT NULL;
+        CREATE TABLE peers (
+            name TEXT PRIMARY KEY,
+            last_seen_at TEXT NOT NULL
+        );
+        CREATE TABLE attachments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            message_id INTEGER NOT NULL,
+            filename TEXT NOT NULL,
+            mime TEXT,
+            size INTEGER NOT NULL,
+            sha256 TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        );
+    """)
+    conn.commit()
+    conn.close()
+
+
+def insert_msg_with_ttl(conn, body: str, days_old: int, read: bool,
+                        expires_hours_from_now: int | None) -> int:
+    """Insert a message with optional expires_at offset (None = no TTL)."""
+    sent_at = conn.execute(
+        "SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?)",
+        (f"-{days_old} days",),
+    ).fetchone()[0]
+    read_at = sent_at if read else None
+    expires_at = None
+    if expires_hours_from_now is not None:
+        sign = "+" if expires_hours_from_now >= 0 else "-"
+        magnitude = abs(expires_hours_from_now)
+        expires_at = conn.execute(
+            "SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?)",
+            (f"{sign}{magnitude} hours",),
+        ).fetchone()[0]
+    row = conn.execute(
+        "INSERT INTO messages(from_name, to_name, body, sent_at, read_at, expires_at) "
+        "VALUES('hub', 'spoke', ?, ?, ?, ?) RETURNING id",
+        (body, sent_at, read_at, expires_at),
+    ).fetchone()
+    conn.commit()
+    return row[0]
+
+
+def _test_ttl_expires_at(workdir: Path) -> None:
+    print(f"\n[smoke-ttl] workdir={workdir}")
+    db = workdir / "mailbox.db"
+    attachments = workdir / "attachments"
+    attachments.mkdir(parents=True)
+
+    init_schema_with_ttl(db)
+    conn = sqlite3.connect(str(db))
+
+    # Seed:
+    # e1: expires 2hr ago, read, fresh sent_at → DELETE (expired beats read TTL)
+    # e2: expires 1hr ago, unread, fresh sent_at → DELETE (expired beats unread TTL)
+    # k1: expires 5hr future, read, fresh → KEEP (TTL not reached)
+    # k2: expires 25hr future, read, fresh → KEEP
+    # k3: no TTL, read, fresh → KEEP (no read cutoff hit either)
+    # k4: no TTL, unread, fresh → KEEP
+    # overlap: expires 1hr ago + read 30 days old → DELETE once (counted as expired)
+    e1 = insert_msg_with_ttl(conn, "expired-read", days_old=0, read=True,
+                              expires_hours_from_now=-2)
+    e2 = insert_msg_with_ttl(conn, "expired-unread", days_old=0, read=False,
+                              expires_hours_from_now=-1)
+    k1 = insert_msg_with_ttl(conn, "future-soon", days_old=0, read=True,
+                              expires_hours_from_now=5)
+    k2 = insert_msg_with_ttl(conn, "future-far", days_old=0, read=True,
+                              expires_hours_from_now=25)
+    k3 = insert_msg_with_ttl(conn, "no-ttl-read", days_old=0, read=True,
+                              expires_hours_from_now=None)
+    k4 = insert_msg_with_ttl(conn, "no-ttl-unread", days_old=0, read=False,
+                              expires_hours_from_now=None)
+    overlap = insert_msg_with_ttl(conn, "expired-and-old-read",
+                                   days_old=30, read=True,
+                                   expires_hours_from_now=-1)
+    conn.close()
+
+    # Stats: ttl_expired_pending_sweep should count e1+e2+overlap = 3
+    # ttl_expiring_24h: messages with expires_at in future window 0..24hr → k1 only (k2 is 25hr out)
+    s = mailbox_sweep.stats(db, attachments)
+    assert s["ttl_expired_pending_sweep"] == 3, \
+        f"expected 3 expired pending, got {s['ttl_expired_pending_sweep']}"
+    assert s["ttl_expiring_24h"] == 1, \
+        f"expected 1 expiring in 24h (k1), got {s['ttl_expiring_24h']}"
+    print(f"  pre-sweep stats: expired={s['ttl_expired_pending_sweep']} "
+          f"expiring_24h={s['ttl_expiring_24h']}")
+
+    # Dry run
+    dry = mailbox_sweep.sweep_all(db, attachments, dry_run=True)
+    assert dry["expired_messages_deleted"] == 3, \
+        f"dry expired count {dry['expired_messages_deleted']} != 3"
+    # The overlap message is 30d old and read — would normally also be in
+    # read_messages_deleted, but we deduplicate to avoid double counting.
+    assert dry["read_messages_deleted"] == 0, \
+        f"overlap shouldn't double-count in read bucket: {dry}"
+    assert dry["unread_messages_deleted"] == 0
+    print(f"  dry-run: expired=3 read=0 unread=0 (overlap dedup ok)")
+
+    # Real sweep
+    real = mailbox_sweep.sweep_all(db, attachments)
+    assert real["expired_messages_deleted"] == 3
+    assert real == dry, f"dry vs real diff:\n  dry={dry}\n  real={real}"
+
+    # Post-sweep DB
+    s_after = mailbox_sweep.stats(db, attachments)
+    assert s_after["message_count"] == 4, \
+        f"expected 4 surviving (k1-k4), got {s_after['message_count']}"
+    assert s_after["ttl_expired_pending_sweep"] == 0
+    assert s_after["ttl_expiring_24h"] == 1, "k1 still expires within 24h"
+
+    conn = sqlite3.connect(str(db))
+    surviving = {r[0] for r in conn.execute("SELECT id FROM messages")}
+    conn.close()
+    assert surviving == {k1, k2, k3, k4}, f"surviving ids: {surviving}"
+
+    # Idempotent — second sweep is a no-op
+    again = mailbox_sweep.sweep_all(db, attachments)
+    assert again["expired_messages_deleted"] == 0
+
+    # format_summary includes expired in human readout when > 0
+    line = mailbox_sweep.format_summary(real)
+    assert "3 expired" in line, f"format_summary missing expired clause: {line}"
+
+    print(f"  post-sweep state correct; idempotent re-run ok")
+    print(f"  format_summary: {line}")
 
 
 if __name__ == "__main__":

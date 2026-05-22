@@ -390,6 +390,34 @@ py mailbox-audit.py --tail --json           # machine-readable
 - `log_event()` 內部 catch all exceptions 不外拋 — audit 必須**不可以**讓被審計的 operation 失敗
 - Spoke (`CLAUDE_MAILBOX_REMOTE` 設了的 MCP server) **不**寫 local audit log — 它的 call 都進 hub，hub 已記。本機沒 DB 也沒 audit table。
 
+## TTL / 過期訊息（自 2026-05-23）
+
+`send()` 可以帶 `expires_at` 讓訊息有壽命 — retention sweep 看到 `expires_at < now` 就刪，**不管**讀沒讀。適合：
+
+- 狀態 ping（"我還活著"）— 隔天就無價值
+- 進度更新（"step 3/5 done"）— 完工後 obsolete
+- 短命 broadcast（"deploy 開始了" → 1hr 後過期）
+
+```python
+# MCP — ISO 8601 或 relative
+mcp__mailbox__send(to="wiki", body="step 3/5 done", expires_at="1h")
+mcp__mailbox__send(to="koatag", body="see you tomorrow", expires_at="24h")
+mcp__mailbox__send(to="hub", body="urgent",
+                    expires_at="2026-05-25T00:00:00Z")
+```
+
+Relative：`30m` / `1h` / `7d`，由 hub/server 時鐘 + 該單位計算。null/省略 = 永不過期（走 read/unread default TTL）。
+
+**Inbox / SSE 回 `expires_at` 欄**：peer agent 可以決定要不要先讀短命訊息（或先過 long-lived）。
+
+**Retention sweep 多一個 stage**：每天的 daily sweep 在 `read_days`/`unread_days` 之前先撈 `expires_at < now` 的 row。重複的不會 double-count。
+
+**`/health` 多兩欄**：
+- `ttl_expiring_24h`: 24hr 內會過期的訊息數（active monitoring）
+- `ttl_expired_pending_sweep`: 已經過期但 sweep 還沒跑 = grace period 內的訊息數
+
+**Schema**: `messages.expires_at TEXT` (nullable) + partial index `WHERE expires_at IS NOT NULL`。Forward-compat — 舊 DB 自動 ALTER on init。
+
 ## Bridge / 周邊工具
 
 - `mailbox-discord-bridge.py` — Docker container `mailbox-bridge`（port 1904）。**Inbound only**：Discord DM → mailbox INSERT。Agent **不直接 call** 這個 port，是 Discord bot 自動推進來。看完整 e2e 流程圖：[Discord 整合：兩個 port，分工不對稱](#discord-整合兩個-port分工不對稱)

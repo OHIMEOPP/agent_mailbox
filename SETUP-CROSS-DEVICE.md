@@ -900,6 +900,105 @@ Currently the audit table grows unbounded. When this becomes a problem, extend `
 
 ---
 
+## Phase 8 — TTL / message expiry (since 2026-05-23)
+
+Per-message TTL via the optional `expires_at` field on `send()`. Retention sweep deletes any message whose `expires_at < now`, regardless of read state. Useful for short-lived signals (status pings, progress updates, transient broadcasts) that don't deserve to sit in the read/unread default cutoff.
+
+### Schema change
+
+```sql
+ALTER TABLE messages ADD COLUMN expires_at TEXT;
+CREATE INDEX idx_expires_at ON messages(expires_at) WHERE expires_at IS NOT NULL;
+```
+
+Idempotent on existing DBs — `server.py` / `mailbox-server.py` add the column at startup if missing, then create the partial index. Mirrors the `in_reply_to` migration pattern (ALTER outside `executescript`, index after ALTER).
+
+### Send-side API
+
+```python
+# MCP (server.py)
+mcp__mailbox__send(to="wiki", body="step 3/5", expires_at="1h")
+mcp__mailbox__send(to="koatag", body="x", expires_at="2026-05-25T00:00:00Z")
+mcp__mailbox__send(to="hub", body="permanent")  # expires_at=None → never expires
+
+# REST (mailbox-server.py)
+POST /send
+{"from": "wiki", "to": "koatag", "body": "...", "expires_at": "2026-05-25T00:00:00Z"}
+
+POST /send-file        # payload_json field accepts expires_at too
+```
+
+The MCP `send()` accepts both ISO 8601 (`2026-05-25T00:00:00Z`) and relative shorthand (`30m` / `1h` / `7d`). REST endpoints expect ISO 8601 — relative is resolved client-side in `server.py` before the call. This split keeps the wire protocol unambiguous; relative is purely a server.py convenience.
+
+### Sweep behavior
+
+`mailbox_sweep.sweep_all` runs a new Stage 1a before the existing read/unread cutoffs:
+
+```
+1a. expired = messages where expires_at < now
+1b. read    = messages where read_at IS NOT NULL AND sent_at < now-7d AND id NOT IN expired
+1c. unread  = messages where read_at IS NULL     AND sent_at < now-14d AND id NOT IN expired
+```
+
+`expired` always wins — a message tagged with TTL gets deleted on the very next sweep tick after its `expires_at` passes, no matter how recently sent or whether it's been read. Read/unread cutoffs only apply to messages with `expires_at IS NULL`.
+
+`counters` gains `expired_messages_deleted`. `format_summary` adds an `N expired /` clause to the human readout when it's non-zero.
+
+### Inbox / SSE / search expose `expires_at`
+
+- `inbox()` results include `"expires_at": <iso or null>` per message
+- `/inbox` REST + SSE `/watch` mail events both include the field
+- search results (FTS5) inherit it via `SELECT *` joins
+
+Peer agents can use this to prioritize: deal with short-lived urgent stuff before evergreen tasks.
+
+### /health observability
+
+```bash
+curl http://<HUB_IP>:1905/health
+# {
+#   ...
+#   "ttl_expiring_24h": 5,           # how many will die in next 24hr
+#   "ttl_expired_pending_sweep": 2,  # already past TTL, sweep grace window
+# }
+```
+
+`ttl_expired_pending_sweep` should approach 0 right after a sweep runs and grow back gradually through the day. Persistently large = the sweep daemon isn't running.
+
+### CLI surface
+
+No new CLI — `mailbox-retention.py` already operates on the new sweep logic transparently. The `--stats` output gains the two new `ttl_*` counters automatically:
+
+```powershell
+py mailbox-retention.py --stats --json
+# {..., "ttl_expiring_24h": 5, "ttl_expired_pending_sweep": 2}
+```
+
+### Backward compatibility
+
+- Old DBs without the column: `ALTER TABLE` runs on init, default NULL for all existing rows → no behavior change for already-stored messages.
+- Old MCP `send()` calls without the kwarg: `expires_at` defaults to `None`, message never expires by TTL.
+- Old REST clients (pre-2026-05-23) that don't send `expires_at`: server treats missing field as `None`.
+- Old watchers (pre-2026-05-23): SSE payload gains an extra field, additive — parsers that whitelist known fields keep working.
+
+### Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `send()` with `expires_at="1h"` succeeds but the message lives forever | Hub-mode and you're on an old hub that doesn't recognize `expires_at` | `git pull` + restart `mailbox-server.py` on hub; check `/health` shows `ttl_expiring_24h` field |
+| Message expired but still in inbox | Sweep hasn't run yet. Grace period is up to 24hr by design | Run `py mailbox-retention.py --once` manually for immediate sweep |
+| `ttl_expired_pending_sweep` grows without bound | Sweep daemon stopped | check `last_sweep_at` in `/health` — if stale, see Phase 5 troubleshooting |
+| `expires_at` returned as `null` from inbox even though sent with TTL | Wire format issue; check that the REST `/send` payload was actually serialized with the field | inspect server logs; the audit log row's `payload_json` shows what was received |
+| Want to clear TTL on a sent message | Not supported — TTL is at send-time only | re-send with no `expires_at` (different message id) |
+
+### What this is NOT
+
+- **Not encryption**: TTL means "delete after time X", not "unreadable after time X". Anyone with read access during the message's lifetime sees the content.
+- **Not undo**: a TTL'd message is still sent + visible to recipients during its lifetime. If you sent something by mistake, "expires in 1m" doesn't pull it back fast enough to matter.
+- **Not Snapchat semantics**: there's no per-recipient "expire on read" — TTL is absolute wall-clock from send.
+
+---
+
 ## What is NOT installed on the spoke
 
 You do **not** need on the laptop:

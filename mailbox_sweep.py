@@ -37,7 +37,10 @@ def sweep_all(
     """Run retention sweep across messages / attachments / blobs / peers.
 
     Order:
-      1. Find message ids past their TTL (split read / unread by separate cutoffs)
+      1. Find message ids past their TTL — three buckets:
+           a. Explicit per-message TTL: `expires_at < now` (overrides read/unread cutoffs)
+           b. Default read TTL: read messages older than read_days
+           c. Default unread TTL: unread messages older than unread_days
       2. Snapshot sha256 set of attachments owned by those messages
       3. Delete attachment rows → delete message rows (in one transaction)
       4. For each snapshot sha, delete blob file if no other attachment now references it
@@ -51,6 +54,7 @@ def sweep_all(
     counters: dict[str, int] = {
         "read_messages_deleted": 0,
         "unread_messages_deleted": 0,
+        "expired_messages_deleted": 0,
         "attachment_rows_deleted": 0,
         "blobs_deleted": 0,
         "blob_bytes_freed": 0,
@@ -74,18 +78,39 @@ def sweep_all(
             "SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?)",
             (f"-{peer_days} days",),
         ).fetchone()[0]
+        now_ts = conn.execute(
+            "SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')"
+        ).fetchone()[0]
 
+        # 1a. Explicit per-message TTL — applies regardless of read state.
+        # Wrapped in try/except so deployment against pre-TTL schemas
+        # (expires_at column not yet present) degrades silently to 0 expired.
+        try:
+            expired_ids = [r[0] for r in conn.execute(
+                "SELECT id FROM messages WHERE expires_at IS NOT NULL AND expires_at < ?",
+                (now_ts,),
+            ).fetchall()]
+        except sqlite3.OperationalError as e:
+            if "no such column" in str(e).lower():
+                expired_ids = []
+            else:
+                raise
+        expired_set = set(expired_ids)
+
+        # 1b/c. Default read/unread cutoffs, excluding rows already flagged by
+        # explicit TTL to avoid double-counting.
         read_ids = [r[0] for r in conn.execute(
             "SELECT id FROM messages WHERE read_at IS NOT NULL AND sent_at < ?",
             (cutoff_read,),
-        ).fetchall()]
+        ).fetchall() if r[0] not in expired_set]
         unread_ids = [r[0] for r in conn.execute(
             "SELECT id FROM messages WHERE read_at IS NULL AND sent_at < ?",
             (cutoff_unread,),
-        ).fetchall()]
-        all_ids = read_ids + unread_ids
+        ).fetchall() if r[0] not in expired_set]
+        all_ids = expired_ids + read_ids + unread_ids
         counters["read_messages_deleted"] = len(read_ids)
         counters["unread_messages_deleted"] = len(unread_ids)
+        counters["expired_messages_deleted"] = len(expired_ids)
 
         # --- Stage 2: snapshot candidate-orphan shas ---
         candidate_shas: set[str] = set()
@@ -205,8 +230,11 @@ def format_summary(counters: dict) -> str:
     """One-line stderr summary used by both daemon and CLI."""
     bytes_freed = counters.get("blob_bytes_freed", 0)
     mb = bytes_freed / 1024 / 1024
+    expired = counters.get("expired_messages_deleted", 0)
+    expired_clause = f"{expired} expired / " if expired else ""
     return (
-        f"deleted {counters['read_messages_deleted']} read / "
+        f"deleted {expired_clause}"
+        f"{counters['read_messages_deleted']} read / "
         f"{counters['unread_messages_deleted']} unread messages, "
         f"{counters['attachment_rows_deleted']} attach rows, "
         f"{counters['blobs_deleted'] + counters['standalone_orphan_blobs_deleted']} blobs "
@@ -229,6 +257,8 @@ def stats(db_path: Path, attachments_dir: Path) -> dict:
         "blob_total_bytes": 0,
         "oldest_message_age_days": None,
         "peer_count": 0,
+        "ttl_expiring_24h": 0,
+        "ttl_expired_pending_sweep": 0,
     }
     try:
         conn = _connect(db_path)
@@ -255,6 +285,20 @@ def stats(db_path: Path, attachments_dir: Path) -> dict:
                     (oldest,),
                 ).fetchone()
                 out["oldest_message_age_days"] = round(age_row[0], 2)
+            # TTL stats — degrade silently if expires_at column not yet present.
+            try:
+                out["ttl_expiring_24h"] = conn.execute(
+                    "SELECT COUNT(*) FROM messages WHERE expires_at IS NOT NULL "
+                    "AND expires_at >= strftime('%Y-%m-%dT%H:%M:%fZ','now') "
+                    "AND expires_at < strftime('%Y-%m-%dT%H:%M:%fZ','now','+24 hours')"
+                ).fetchone()[0]
+                out["ttl_expired_pending_sweep"] = conn.execute(
+                    "SELECT COUNT(*) FROM messages WHERE expires_at IS NOT NULL "
+                    "AND expires_at < strftime('%Y-%m-%dT%H:%M:%fZ','now')"
+                ).fetchone()[0]
+            except sqlite3.OperationalError as e:
+                if "no such column" not in str(e).lower():
+                    raise
         finally:
             conn.close()
     except sqlite3.Error as e:
