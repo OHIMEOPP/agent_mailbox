@@ -10,7 +10,19 @@
 
 ## 🚀 Cold-start checklist（agent 視角：被 user 指示用 mailbox 時讀這段）
 
-### 情境 A：「**開 watcher**」/「啟動 watcher」/「session start」
+### ❓ Hub or spoke? 先回答這題（自 2026-05-22）
+
+| 答案 | 你這台是 | 對應流程 |
+|---|---|---|
+| 我有 mailbox.db on disk + 是大家連線進來的中心 | **HUB** | 走下面 §情境 A 起 local watcher |
+| 我要連到別台機器（DB 不在這） | **SPOKE** | 跳去 [SETUP-CROSS-DEVICE.md](SETUP-CROSS-DEVICE.md) Phase 1，**不要照下面 §A 走**，會建 ghost DB |
+| 不確定 | 看 `.mcp.json` env：有 `CLAUDE_MAILBOX_REMOTE` 就是 spoke | |
+
+**Spoke 必看**：下面 §A 的 「§A.2 驗證 DB 目錄」對 spoke 是反指令——你的 REMOTE env 設好後 server.py 不會碰 local DB，直接 dispatch HTTP；本機沒 mailbox.db 是正確情況。
+
+---
+
+### 情境 A：「**開 watcher**」/「啟動 watcher」/「session start」（hub 端 / 本機 mode）
 
 跑這 4 步：
 
@@ -20,21 +32,25 @@
    ```
    不存在 → 先 `git clone https://github.com/OHIMEOPP/agent_mailbox.git C:/Users/User/Desktop/VSCcode/claude-mailbox`
 
-2. **驗證 DB 目錄**
+2. **驗證 DB 目錄（hub 才需要）**
    ```bash
    ls C:/Users/User/.claude/mailbox/mailbox.db
    ```
-   不存在 → server.py 第一次跑時會自動 mkdir + create；通常已存在
+   不存在 → server.py 第一次跑時會自動 mkdir + create；通常已存在。
+   **Spoke 跳過此步**（spoke 不該有 local DB；若有 legacy DB 留著 orphan OK）。
 
-3. **問自己是誰**：呼叫 `mcp__mailbox__whoami()` 拿 `name` 欄位（如 `wiki` / `koatag` / `koatag-frontend` / `stranger-conv`）
+3. **問自己是誰**：呼叫 `mcp__mailbox__whoami()` 拿 `name` 欄位（如 `wiki` / `koatag` / `koatag-frontend` / `stranger-conv`）。
+   - **跨機**改採 `<role>@<hostname>` 格式（例：`wiki@LAPTOP-XYZ`，看 [SETUP-CROSS-DEVICE.md](SETUP-CROSS-DEVICE.md) §1.6）
 
-4. **啟動 watcher**：用 Monitor tool（preferred）— 完整模板看 [HOW-TO-START-WATCHER.md](HOW-TO-START-WATCHER.md)。一行版：
-   ```yaml
-   tool: Monitor
-   command:     py "C:/Users/User/Desktop/VSCcode/claude-mailbox/mailbox-watch.py" <NAME> --monitor
-   persistent:  true
-   timeout_ms:  3600000
-   ```
+4. **啟動 watcher**：用 Monitor tool（preferred）— 完整模板看 [HOW-TO-START-WATCHER.md](HOW-TO-START-WATCHER.md)。
+   - **Hub / 本機 mode** 一行版：
+     ```yaml
+     tool: Monitor
+     command:     py "C:/Users/User/Desktop/VSCcode/claude-mailbox/mailbox-watch.py" <NAME> --monitor
+     persistent:  true
+     timeout_ms:  3600000
+     ```
+   - **Spoke mode** 看 [SETUP-CROSS-DEVICE.md §1.8](SETUP-CROSS-DEVICE.md)（用 `--remote` 自動 fallback env）
 
 5. 回 user 一句「mailbox watcher 已啟動（stream-mode）」
 
@@ -308,6 +324,8 @@ memory 是 reference + feedback 行為紀律，agent 看了會知道：
 複製到專案根目錄改名 `.mcp.json`，改 NAME。範本看 `examples/mcp.json.{life_wiki,koatag}`。
 
 或 CLI：`claude mcp add mailbox --scope project -e CLAUDE_MAILBOX_NAME=wiki -- uv run "<path>/server.py"`
+
+> **如果這台是 spoke 不是 hub**：上面 env 區塊只有 local-mode 變數。Spoke 還必須加 `CLAUDE_MAILBOX_REMOTE` + `CLAUDE_MAILBOX_TOKEN`，完整 env block 看 [SETUP-CROSS-DEVICE.md §1.7](SETUP-CROSS-DEVICE.md)。沒加 → MCP server 會 fallback 本機 mode 並開始建 ghost SQLite。
 
 ### Step 5 — Bridge container（Discord 整合需要）
 

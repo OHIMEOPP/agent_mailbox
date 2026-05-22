@@ -120,7 +120,11 @@ New-NetFirewallRule -DisplayName "mailbox-server :1905" -Direction Inbound -Prot
 Adjust `-RemoteAddress` to match your network:
 - `192.168.0.0/16` — home Wi-Fi (most common)
 - `10.0.0.0/8` / `172.16.0.0/12` — other private ranges
-- `100.64.0.0/10` — Tailscale-only
+- `100.64.0.0/10` — Tailscale
+- `26.0.0.0/8` — Radmin VPN
+- Multiple VPNs / mixed: create one rule per range (separate `New-NetFirewallRule` calls), or pass an array: `-RemoteAddress @("192.168.0.0/16","100.64.0.0/10")`
+
+**Symptom**: spoke `curl /health` shows `timed out` (not `refused`) — typically firewall blocking. `refused` = server not running. Ping going through but TCP timeout = firewall.
 
 **Verify** (the rule should report `LocalPort=1905` and `Protocol=TCP`):
 ```powershell
@@ -187,6 +191,12 @@ Pick any path — it doesn't have to match the hub's path.
 You need:
 - `<TOKEN>` from `~/.claude/mailbox/token.txt` on the hub
 - `<HUB_IP>` from `ipconfig` step 0.3 (or Tailscale 100.x.y.z)
+- `<HUB_HOSTNAME>` from hub's `$env:COMPUTERNAME` (for sending mail back to hub)
+
+**Typical handoff path**: spoke agent recognizes it needs these three → asks the
+user → user fetches from hub-side agent (or directly from `token.txt` /
+`ipconfig`) → pastes back into spoke chat. Until token auto-pipeline lands
+(see backlog), human-in-the-loop is the channel.
 
 ### 1.5 Pre-flight: verify hub is reachable
 
@@ -243,6 +253,12 @@ mixed convention gets confusing — recommended to be consistent.
 
 ### 1.7 Configure Claude Code MCP
 
+> **Before writing the token**: confirm `.mcp.json` is in `.gitignore` for this
+> project (or the project itself is private). Token is a long-lived secret.
+> Default `life_wiki` / `KOATAG` projects already gitignore `.mcp.json`.
+> If unsure, run `git check-ignore -v .mcp.json` in the project; output means
+> ignored, no output means tracked — fix `.gitignore` first.
+
 In any project on the laptop, create or edit `.mcp.json`:
 
 ```json
@@ -262,6 +278,10 @@ In any project on the laptop, create or edit `.mcp.json`:
 ```
 
 Replace `LAPTOP-XYZ789` with your actual hostname from Phase 1.6.
+
+> ⚠️ **Restart Claude Code session after saving `.mcp.json`** — MCP env is
+> read on session boot, not hot-reloaded. Skip this step → `whoami()` returns
+> `mode: local` instead of `remote` and you'll start a local ghost DB.
 
 Because `CLAUDE_MAILBOX_REMOTE` is set, `server.py` will route every MCP tool
 (`send`, `inbox`, `mark_read`, `peers`, `whoami`) through REST. It will not
@@ -321,6 +341,12 @@ mcp__mailbox__send(to="wiki@DESKTOP-ABC123", body="hello from laptop")
 
 Hub-side wiki watcher sees it. Names always include `@hostname` to avoid
 ambiguity.
+
+> **Hub mixed naming** (bare `wiki` + `wiki@DESKTOP-...` coexist transient):
+> if the hub hasn't migrated yet (see "Transitioning the hub" above), spoke's
+> safer choice is the **bare name** (`wiki`) — it matches what hub's MCP tools
+> stamp as `from_name` and what its watcher subscribes to. Once hub fully
+> migrates, switch to `@hostname` for both sides.
 
 ---
 
@@ -398,7 +424,8 @@ All 6 → cross-device setup complete.
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| `curl /health` connection refused | server not running OR firewall block | Phase 0.4 + 0.5 |
+| `curl /health` connection refused | server not running | Phase 0.4 |
+| `curl /health` timeout (ping VPN OK but TCP timeout) | firewall blocking the VPN range | add VPN range to firewall rule (Phase 0.5 — Radmin `26/8`, Tailscale `100.64/10`, etc) |
 | `curl /peers` returns 401 | wrong token | re-copy token.txt; remove leading/trailing whitespace |
 | `whoami` returns `mode: local` not `remote` | env var not propagated to MCP server | check `.mcp.json` env block; restart Claude Code session |
 | ghost `mailbox.db` appears on laptop | `.mcp.json` missing `CLAUDE_MAILBOX_REMOTE` env | re-check spelling; ensure both REMOTE + TOKEN are set |
