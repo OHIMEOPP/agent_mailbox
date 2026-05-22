@@ -109,14 +109,29 @@ Use this only when diagnosing — e.g. to see live stderr without `docker logs`.
 
 ### 0.5 Allow inbound :1905 in Windows Firewall
 
+Run as **Administrator**. Use one-line form — backtick line-continuation often
+gets eaten when pasted into the PowerShell window (the 2nd/3rd lines run as
+separate commands and the rule ends up wide-open with default values).
+
 ```powershell
-# Run as Administrator
-New-NetFirewallRule -DisplayName "mailbox-server :1905" `
-    -Direction Inbound -Protocol TCP -LocalPort 1905 `
-    -RemoteAddress 192.168.0.0/16 -Action Allow
+New-NetFirewallRule -DisplayName "mailbox-server :1905" -Direction Inbound -Protocol TCP -LocalPort 1905 -RemoteAddress 192.168.0.0/16 -Action Allow
 ```
 
-Adjust `RemoteAddress` to your LAN range (e.g. `100.64.0.0/10` for Tailscale-only).
+Adjust `-RemoteAddress` to match your network:
+- `192.168.0.0/16` — home Wi-Fi (most common)
+- `10.0.0.0/8` / `172.16.0.0/12` — other private ranges
+- `100.64.0.0/10` — Tailscale-only
+
+**Verify** (the rule should report `LocalPort=1905` and `Protocol=TCP`):
+```powershell
+Get-NetFirewallRule -DisplayName "mailbox-server :1905" | Get-NetFirewallPortFilter
+```
+
+If you accidentally created a wide-open rule (default values, no port filter),
+fix with:
+```powershell
+Set-NetFirewallRule -DisplayName "mailbox-server :1905" -Direction Inbound -Protocol TCP -LocalPort 1905 -RemoteAddress 192.168.0.0/16 -Action Allow
+```
 
 ### 0.6 Make it survive reboot
 
