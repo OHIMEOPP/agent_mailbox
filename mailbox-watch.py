@@ -67,23 +67,44 @@ def heartbeat(conn: sqlite3.Connection, name: str) -> None:
     conn.commit()
 
 
+def _count_attachments(conn: sqlite3.Connection, msg_ids: list) -> dict:
+    """Return {message_id: attachment_count}. Returns {} on legacy DBs."""
+    if not msg_ids:
+        return {}
+    try:
+        placeholders = ",".join("?" * len(msg_ids))
+        return {
+            mid: n for mid, n in conn.execute(
+                f"SELECT message_id, COUNT(*) FROM attachments "
+                f"WHERE message_id IN ({placeholders}) GROUP BY message_id",
+                msg_ids,
+            ).fetchall()
+        }
+    except sqlite3.OperationalError:
+        return {}  # legacy DB without attachments table
+
+
 def fetch_unread(conn: sqlite3.Connection, name: str, since_id: int) -> list:
-    return list(conn.execute(
+    rows = list(conn.execute(
         "SELECT id, from_name, sent_at, substr(body, 1, 200) "
         "FROM messages WHERE to_name=? AND read_at IS NULL AND id > ? "
         "ORDER BY id",
         (name, since_id),
     ))
+    counts = _count_attachments(conn, [r[0] for r in rows])
+    return [r + (counts.get(r[0], 0),) for r in rows]
 
 
 def fetch_unread_all(conn: sqlite3.Connection, since_id: int) -> list:
     """Same as fetch_unread but across every to_name (supervisor mode)."""
-    return list(conn.execute(
+    rows = list(conn.execute(
         "SELECT id, from_name, to_name, sent_at, substr(body, 1, 200) "
         "FROM messages WHERE read_at IS NULL AND id > ? "
         "ORDER BY id",
         (since_id,),
     ))
+    counts = _count_attachments(conn, [r[0] for r in rows])
+    return [r + (counts.get(r[0], 0),) for r in rows]
 
 
 def run_exit_mode(args) -> int:
@@ -105,8 +126,9 @@ def run_exit_mode(args) -> int:
             elapsed = int(time.time() - start)
             print(f"[watcher] {len(rows)} new message(s) for "
                   f"'{args.name}' after {elapsed}s:")
-            for mid, sender, sent, preview in rows:
-                print(f"  id={mid} from={sender} at={sent}")
+            for mid, sender, sent, preview, attach_count in rows:
+                tag = f" attach={attach_count}" if attach_count else ""
+                print(f"  id={mid} from={sender} at={sent}{tag}")
                 print(f"    {preview}")
             return 0
 
@@ -172,13 +194,15 @@ def run_monitor_mode(args) -> int:
 
         for row in rows:
             if watch_all:
-                mid, sender, recipient, sent, preview = row
+                mid, sender, recipient, sent, preview, attach_count = row
                 safe_preview = (preview or "").replace("\r", " ").replace("\n", " | ")
-                print(f"MAIL id={mid} from={sender} to={recipient} sent={sent} preview={safe_preview}")
+                tag = f" attach={attach_count}" if attach_count else ""
+                print(f"MAIL id={mid} from={sender} to={recipient} sent={sent}{tag} preview={safe_preview}")
             else:
-                mid, sender, sent, preview = row
+                mid, sender, sent, preview, attach_count = row
                 safe_preview = (preview or "").replace("\r", " ").replace("\n", " | ")
-                print(f"MAIL id={mid} from={sender} sent={sent} preview={safe_preview}")
+                tag = f" attach={attach_count}" if attach_count else ""
+                print(f"MAIL id={mid} from={sender} sent={sent}{tag} preview={safe_preview}")
             last_id = mid
 
         time.sleep(args.tick)
@@ -243,8 +267,10 @@ def run_remote_mode(args) -> int:
                             try:
                                 m = json.loads(data)
                                 preview = m['body'].replace('\n', ' ')[:200]
+                                atts = m.get('attachments') or []
+                                tag = f" attach={len(atts)}" if atts else ""
                                 print(f"MAIL id={m['id']} from={m['from_name']} "
-                                      f"sent={m['sent_at']} preview={preview}",
+                                      f"sent={m['sent_at']}{tag} preview={preview}",
                                       flush=True)
                             except Exception as e:
                                 print(f"[watcher] parse err: {e}", file=sys.stderr)
