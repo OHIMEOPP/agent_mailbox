@@ -30,12 +30,21 @@ def free_port() -> int:
 
 
 def wait_health(url: str, timeout: float = 10.0) -> None:
+    """Wait for server /health endpoint. Since 2026-05-23 it returns JSON;
+    accept either {"ok": true, ...} or legacy text "ok"."""
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
             with urllib.request.urlopen(url + "/health", timeout=1) as r:
-                if r.read().strip() == b"ok":
+                body = r.read().strip()
+                if body == b"ok":
                     return
+                try:
+                    payload = json.loads(body)
+                    if payload.get("ok") is True:
+                        return
+                except json.JSONDecodeError:
+                    pass
         except Exception:
             time.sleep(0.2)
     raise RuntimeError(f"server never came up at {url}")

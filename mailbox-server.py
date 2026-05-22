@@ -6,7 +6,8 @@ Architecture: hub-and-spoke
   - Tailscale / WireGuard adds nothing to the protocol — just changes bind/connect IP
 
 Endpoints:
-  GET  /health                   → "ok" (no auth)
+  GET  /health                   → JSON {ok, unread_count, blob_count, ...}
+                                   (since 2026-05-23 — was plain text "ok")
   POST /send                     → JSON {from, to, body} → {id, sent_at}
   POST /send-file                → multipart (payload_json + files[N]) → {id, sent_at, attachments:[...]}
   GET  /attachment/<id>          → blob bytes + Content-Disposition
@@ -43,6 +44,8 @@ import threading
 import time
 import urllib.parse
 
+import mailbox_sweep
+
 DEFAULT_PORT = 1905
 DEFAULT_DB = pathlib.Path.home() / ".claude" / "mailbox" / "mailbox.db"
 WATCH_POLL_INTERVAL = 2.0  # seconds between SQLite polls for SSE watch
@@ -51,6 +54,13 @@ WATCH_HEARTBEAT_INTERVAL = 30.0  # SSE comment heartbeat to keep conn alive
 MAX_SINGLE_FILE = 100 * 1024 * 1024   # 100 MB per file
 MAX_TOTAL_PAYLOAD = 500 * 1024 * 1024  # 500 MB per request
 MAX_FILES_PER_MSG = 32                 # sanity cap on count
+
+SWEEP_INTERVAL_SECONDS = 86400  # 24 hours
+SWEEP_GRACE_SECONDS = 3600      # delay first sweep by 1hr after boot
+
+# Mutable global tracking last sweep time / counters; read by /health JSON.
+LAST_SWEEP_AT: str | None = None
+LAST_SWEEP_COUNTERS: dict | None = None
 
 
 def db_connect(path: pathlib.Path) -> sqlite3.Connection:
@@ -254,7 +264,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return params[k][0] if k in params and params[k] else default
 
         if path == "/health":
-            return self._send(200, "text/plain", b"ok\n")
+            # Changed 2026-05-23: returns JSON with observability stats instead
+            # of plain text "ok". Old text-equality checks break; substring-
+            # contains checks for "ok" still pass (response contains "ok":true).
+            srv = self.server
+            payload = mailbox_sweep.stats(srv.db_path, srv.attachments_dir)
+            payload["last_sweep_at"] = LAST_SWEEP_AT
+            payload["last_sweep_counters"] = LAST_SWEEP_COUNTERS
+            return self._json(200, payload)
 
         if not self._check_auth():
             return self._json(401, {"error": "missing or invalid bearer token"})
@@ -606,6 +623,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
         sys.stderr.write(f"[mailbox-server] {self.address_string()} {fmt % args}\n")
 
 
+def _sweep_loop(db_path: pathlib.Path, attachments_dir: pathlib.Path,
+                read_days: int, unread_days: int, peer_days: int) -> None:
+    """Daemon thread: 1hr grace period, then sweep every 24hr."""
+    global LAST_SWEEP_AT, LAST_SWEEP_COUNTERS
+    time.sleep(SWEEP_GRACE_SECONDS)
+    while True:
+        try:
+            counters = mailbox_sweep.sweep_all(
+                db_path, attachments_dir,
+                read_days=read_days, unread_days=unread_days, peer_days=peer_days,
+            )
+            LAST_SWEEP_AT = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            LAST_SWEEP_COUNTERS = counters
+            print(f"[sweep] {mailbox_sweep.format_summary(counters)}", file=sys.stderr)
+        except Exception as e:
+            print(f"[sweep] FAILED: {type(e).__name__}: {e}", file=sys.stderr)
+        time.sleep(SWEEP_INTERVAL_SECONDS)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="0.0.0.0",
@@ -635,6 +671,13 @@ def main():
     db_init(args.db)
     args.attachments_dir.mkdir(parents=True, exist_ok=True)
 
+    # Retention config — env vars override the module defaults; kill-switch
+    # disables the daemon entirely (manual CLI sweep still works).
+    retention_disabled = os.environ.get("MAILBOX_RETENTION_DISABLED", "").strip() in ("1", "true", "yes")
+    read_days = int(os.environ.get("MAILBOX_RETENTION_READ_DAYS", mailbox_sweep.DEFAULT_READ_DAYS))
+    unread_days = int(os.environ.get("MAILBOX_RETENTION_UNREAD_DAYS", mailbox_sweep.DEFAULT_UNREAD_DAYS))
+    peer_days = int(os.environ.get("MAILBOX_RETENTION_PEER_DAYS", mailbox_sweep.DEFAULT_PEER_DAYS))
+
     httpd = http.server.ThreadingHTTPServer((args.host, args.port), Handler)
     httpd.token = token
     httpd.db_path = args.db
@@ -643,6 +686,19 @@ def main():
           file=sys.stderr)
     print(f"[mailbox-server] attachments dir: {args.attachments_dir}", file=sys.stderr)
     print(f"[mailbox-server] bearer token: {token[:6]}... (length {len(token)})", file=sys.stderr)
+    if retention_disabled:
+        print("[mailbox-server] retention: DISABLED via MAILBOX_RETENTION_DISABLED", file=sys.stderr)
+    else:
+        print(f"[mailbox-server] retention: read={read_days}d unread={unread_days}d peer={peer_days}d "
+              f"interval={SWEEP_INTERVAL_SECONDS}s grace={SWEEP_GRACE_SECONDS}s", file=sys.stderr)
+        t = threading.Thread(
+            target=_sweep_loop,
+            args=(args.db, args.attachments_dir, read_days, unread_days, peer_days),
+            daemon=True,
+            name="mailbox-sweep",
+        )
+        t.start()
+
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

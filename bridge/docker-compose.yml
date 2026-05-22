@@ -74,9 +74,17 @@ services:
       - TZ=Asia/Taipei
       # Required. Server refuses to start if unset or shorter than 16 chars.
       - CLAUDE_MAILBOX_TOKEN=${CLAUDE_MAILBOX_TOKEN:?CLAUDE_MAILBOX_TOKEN required (see .env.example)}
+      # Retention policy (auto-sweep daily at server boot + 1hr grace).
+      # Defaults applied by mailbox_sweep module; override in .env if needed.
+      - MAILBOX_RETENTION_READ_DAYS=${MAILBOX_RETENTION_READ_DAYS:-7}
+      - MAILBOX_RETENTION_UNREAD_DAYS=${MAILBOX_RETENTION_UNREAD_DAYS:-14}
+      - MAILBOX_RETENTION_PEER_DAYS=${MAILBOX_RETENTION_PEER_DAYS:-30}
+      # Kill-switch (set to 1 to disable auto-sweep; manual CLI sweep still works)
+      - MAILBOX_RETENTION_DISABLED=${MAILBOX_RETENTION_DISABLED:-}
     volumes:
-      # mount the script read-only (../mailbox-server.py is at repo root)
+      # mount the script + sweep module (sibling) read-only
       - ../mailbox-server.py:/app/mailbox-server.py:ro
+      - ../mailbox_sweep.py:/app/mailbox_sweep.py:ro
       # share the SAME mailbox dir as mailbox-bridge so both hit the same db
       - C:/Users/User/.claude/mailbox:/data
     working_dir: /app
