@@ -41,6 +41,8 @@ ACTIONS = frozenset({
     "snooze",     # hide message from inbox until wake_at time
     "unsnooze",   # remove snooze immediately
     "forward",    # forward an existing message to another recipient
+    "mute",       # mute a peer (hide from inbox by default)
+    "unmute",     # remove from mute list
 })
 
 DEFAULT_TAIL_LIMIT = 50

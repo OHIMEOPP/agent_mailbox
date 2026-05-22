@@ -49,6 +49,7 @@ from mailbox import audit as mailbox_audit
 from mailbox import backup as mailbox_backup
 from mailbox import forward as mailbox_forward
 from mailbox import migrations as mailbox_migrations
+from mailbox import mute as mailbox_mute
 from mailbox import pinned as mailbox_pinned
 from mailbox import priority as mailbox_priority
 from mailbox import rate_limit as mailbox_rate_limit
@@ -184,6 +185,8 @@ def db_init(path: pathlib.Path):
     mailbox_scheduled.init_schema(path)
     # Rate-limit buckets: separate table, independent DDL.
     mailbox_rate_limit.init_schema(path)
+    # Mute lists: separate table, independent DDL.
+    mailbox_mute.init_schema(path)
 
 
 def _init_fts(path: pathlib.Path):
@@ -480,6 +483,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # Forward counters
             fwd_stats = mailbox_forward.stats(srv.db_path)
             payload.update(fwd_stats)
+            # Mute counters
+            mute_stats = mailbox_mute.stats(srv.db_path)
+            payload.update(mute_stats)
             return self._json(200, payload)
 
         if not self._check_auth():
@@ -501,6 +507,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except ValueError:
                 return self._json(400, {"error": "min_priority must be int"})
             include_snoozed = first("include_snoozed", "0") in ("1", "true", "yes")
+            include_muted = first("include_muted", "0") in ("1", "true", "yes")
             sql = ("SELECT id, from_name, to_name, body, sent_at, read_at, has_attachments, "
                    "in_reply_to, expires_at, claimed_by, claimed_until, priority, pinned, "
                    "snoozed_until "
@@ -518,6 +525,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not include_snoozed:
                 sql += (" AND (snoozed_until IS NULL "
                         "OR snoozed_until <= strftime('%Y-%m-%dT%H:%M:%fZ','now'))")
+            if not include_muted:
+                muted_list = mailbox_mute.list_mutes(srv.db_path, name)
+                if muted_list:
+                    placeholders = ",".join("?" * len(muted_list))
+                    sql += f" AND from_name NOT IN ({placeholders})"
+                    args.extend(muted_list)
             # Pinned first (always surface), then priority DESC (urgent), then id ASC (FIFO)
             sql += " ORDER BY pinned DESC, priority DESC, id ASC LIMIT ?"
             args.append(limit)
@@ -565,6 +578,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 action="peers", payload={"count": len(rows)},
             )
             return self._json(200, {"peers": rows})
+
+        if path == "/mutes":
+            actor = first("actor").strip()
+            if not actor:
+                return self._json(400, {"error": "missing actor"})
+            muted = mailbox_mute.list_mutes(srv.db_path, actor)
+            return self._json(200, {"actor": actor, "muted_peers": muted})
 
         if path == "/watch":
             return self._sse_watch(first("name").strip(), first("since"))
@@ -929,6 +949,34 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 payload={"new_msg_id": result["id"],
                          "forwarded_from_msg_id": payload["message_id"],
                          "had_note": bool(note)},
+            )
+            return self._json(200, result)
+
+        if path == "/mute":
+            for k in ("actor", "peer"):
+                if k not in payload:
+                    return self._json(400, {"error": f"missing field: {k}"})
+            if not isinstance(payload["actor"], str) or not isinstance(payload["peer"], str):
+                return self._json(400, {"error": "actor + peer must be strings"})
+            result = mailbox_mute.mute(srv.db_path, payload["actor"], payload["peer"])
+            mailbox_audit.log_event(
+                srv.db_path, actor=payload["actor"], action="mute",
+                target=payload["peer"],
+                payload={"was_already_muted": result["was_already_muted"]},
+            )
+            return self._json(200, result)
+
+        if path == "/unmute":
+            for k in ("actor", "peer"):
+                if k not in payload:
+                    return self._json(400, {"error": f"missing field: {k}"})
+            if not isinstance(payload["actor"], str) or not isinstance(payload["peer"], str):
+                return self._json(400, {"error": "actor + peer must be strings"})
+            result = mailbox_mute.unmute(srv.db_path, payload["actor"], payload["peer"])
+            mailbox_audit.log_event(
+                srv.db_path, actor=payload["actor"], action="unmute",
+                target=payload["peer"],
+                payload={"was_muted": result["was_muted"]},
             )
             return self._json(200, result)
 

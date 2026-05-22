@@ -33,6 +33,7 @@ from pathlib import Path
 from mailbox import audit as mailbox_audit
 from mailbox import forward as mailbox_forward
 from mailbox import migrations as mailbox_migrations
+from mailbox import mute as mailbox_mute
 from mailbox import pinned as mailbox_pinned
 from mailbox import priority as mailbox_priority
 from mailbox import reactions as mailbox_reactions
@@ -280,6 +281,7 @@ if not REMOTE:
     _init_fts()
     mailbox_reactions.init_schema(DB_PATH)
     mailbox_scheduled.init_schema(DB_PATH)
+    mailbox_mute.init_schema(DB_PATH)
 
 
 def _write_blob(data: bytes) -> tuple[str, int]:
@@ -585,7 +587,8 @@ def send(to: str, body: str, files: list[str] | None = None,
 def inbox(unread_only: bool = True, limit: int = 50,
           claimable_only: bool = False,
           min_priority: int = 0,
-          include_snoozed: bool = False) -> list[dict]:
+          include_snoozed: bool = False,
+          include_muted: bool = False) -> list[dict]:
     """Fetch messages addressed to this instance.
 
     Args:
@@ -610,10 +613,12 @@ def inbox(unread_only: bool = True, limit: int = 50,
         unread_flag = "1" if unread_only else "0"
         claimable_flag = "1" if claimable_only else "0"
         snoozed_flag = "1" if include_snoozed else "0"
+        muted_flag = "1" if include_muted else "0"
         r = _remote("GET",
                     f"/inbox?name={NAME}&unread={unread_flag}&limit={limit}"
                     f"&claimable={claimable_flag}&min_priority={min_priority}"
-                    f"&include_snoozed={snoozed_flag}")
+                    f"&include_snoozed={snoozed_flag}"
+                    f"&include_muted={muted_flag}")
         return [
             {"id": m["id"], "from": m["from_name"], "body": m["body"],
              "sent_at": m["sent_at"], "read_at": m["read_at"],
@@ -649,6 +654,13 @@ def inbox(unread_only: bool = True, limit: int = 50,
         # so pre-v007 schemas (no column) just no-op the filter.
         sql += (" AND (snoozed_until IS NULL "
                 "OR snoozed_until <= strftime('%Y-%m-%dT%H:%M:%fZ','now'))")
+    if not include_muted:
+        # Hide rows whose from_name is in this actor's mute list.
+        muted_list = mailbox_mute.list_mutes(DB_PATH, NAME)
+        if muted_list:
+            placeholders = ",".join("?" * len(muted_list))
+            sql += f" AND from_name NOT IN ({placeholders})"
+            params.extend(muted_list)
     # Pinned first (always surface), then priority DESC, then id ASC (FIFO within band)
     sql += " ORDER BY pinned DESC, priority DESC, id ASC LIMIT ?"
     params.append(limit)
@@ -1184,6 +1196,63 @@ def forward(message_id: int, to: str, note: str | None = None) -> dict:
                  "had_note": bool(note)},
     )
     return result
+
+
+@mcp.tool()
+def mute_peer(peer: str) -> dict:
+    """Add a peer to your inbox mute list.
+
+    Their messages are hidden from default inbox() until you unmute. Use
+    `inbox(include_muted=True)` to see them anyway. Mute is per-actor —
+    your mute list doesn't affect anyone else's view.
+
+    Args:
+        peer: name of peer to mute (literal — no glob match in this version)
+
+    Returns:
+        {muted: True, was_already_muted: bool, actor, peer}.
+    """
+    if REMOTE:
+        r = _remote("POST", "/mute",
+                    {"actor": NAME, "peer": peer})
+        return r
+    result = mailbox_mute.mute(DB_PATH, NAME, peer)
+    mailbox_audit.log_event(
+        DB_PATH, actor=NAME, action="mute", target=peer,
+        payload={"was_already_muted": result["was_already_muted"]},
+    )
+    return result
+
+
+@mcp.tool()
+def unmute_peer(peer: str) -> dict:
+    """Remove a peer from your inbox mute list — their messages reappear.
+
+    Args:
+        peer: name of peer to unmute
+
+    Returns:
+        {muted: False, was_muted: bool, actor, peer}.
+    """
+    if REMOTE:
+        r = _remote("POST", "/unmute",
+                    {"actor": NAME, "peer": peer})
+        return r
+    result = mailbox_mute.unmute(DB_PATH, NAME, peer)
+    mailbox_audit.log_event(
+        DB_PATH, actor=NAME, action="unmute", target=peer,
+        payload={"was_muted": result["was_muted"]},
+    )
+    return result
+
+
+@mcp.tool()
+def list_muted_peers() -> list[str]:
+    """List the peers you've muted (peers whose messages won't show in default inbox)."""
+    if REMOTE:
+        r = _remote("GET", f"/mutes?actor={NAME}")
+        return r.get("muted_peers", [])
+    return mailbox_mute.list_mutes(DB_PATH, NAME)
 
 
 if __name__ == "__main__":
