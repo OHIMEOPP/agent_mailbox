@@ -900,6 +900,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._json(400, {"error": f"invalid FTS5 query: {e}"})
         finally:
             conn.close()
+        # Audit: use name (the scoped peer) when available; otherwise fall back
+        # to the REST caller IP. Mirrors /inbox actor convention.
+        actor = name if name else f"rest:{self.client_address[0]}"
+        mailbox_audit.log_event(
+            srv.db_path, actor=actor, action="search",
+            payload={"query": q, "scope": scope, "limit": limit,
+                     "returned": len(rows)},
+        )
         return self._json(200, {"results": rows, "query": q, "scope": scope, "count": len(rows)})
 
     def _sse_watch(self, name: str, since: str):
