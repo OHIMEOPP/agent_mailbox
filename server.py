@@ -194,6 +194,8 @@ def _init_db() -> None:
                 body       TEXT NOT NULL,
                 sent_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
                 read_at    TEXT,
+                claimed_by TEXT,
+                claimed_until TEXT,
                 has_attachments INTEGER NOT NULL DEFAULT 0,
                 in_reply_to INTEGER
             );
@@ -565,25 +567,33 @@ def send(to: str, body: str, files: list[str] | None = None,
 
 
 @mcp.tool()
-def inbox(unread_only: bool = True, limit: int = 50) -> list[dict]:
+def inbox(unread_only: bool = True, limit: int = 50,
+          claimable_only: bool = False) -> list[dict]:
     """Fetch messages addressed to this instance.
 
     Args:
         unread_only: if True (default), only return messages not yet marked read
         limit: max messages to return (default 50)
+        claimable_only: if True, skip messages currently claimed by *another*
+                        agent within the visibility-timeout window. Useful for
+                        worker-loop patterns to avoid double-processing.
+                        Messages you've claimed yourself are still returned.
 
     Returns:
-        List of {id, from, body, sent_at, read_at, attachments: [...]}.
-        attachments is [] when message has no files; otherwise each entry is
-        {id, filename, mime, size, sha256}. Use download(attachment_id, save_to)
-        to fetch blob.
+        List of {id, from, body, sent_at, read_at, claimed_by, claimed_until,
+                 in_reply_to, expires_at, attachments: [...], reactions: [...]}.
     """
     if REMOTE:
         unread_flag = "1" if unread_only else "0"
-        r = _remote("GET", f"/inbox?name={NAME}&unread={unread_flag}&limit={limit}")
+        claimable_flag = "1" if claimable_only else "0"
+        r = _remote("GET",
+                    f"/inbox?name={NAME}&unread={unread_flag}&limit={limit}"
+                    f"&claimable={claimable_flag}")
         return [
             {"id": m["id"], "from": m["from_name"], "body": m["body"],
              "sent_at": m["sent_at"], "read_at": m["read_at"],
+             "claimed_by": m.get("claimed_by"),
+             "claimed_until": m.get("claimed_until"),
              "in_reply_to": m.get("in_reply_to"),
              "expires_at": m.get("expires_at"),
              "attachments": m.get("attachments", []),
@@ -591,11 +601,17 @@ def inbox(unread_only: bool = True, limit: int = 50) -> list[dict]:
             for m in r["messages"]
         ]
 
-    sql = ("SELECT id, from_name, body, sent_at, read_at, has_attachments, in_reply_to, expires_at "
+    sql = ("SELECT id, from_name, body, sent_at, read_at, has_attachments, "
+           "in_reply_to, expires_at, claimed_by, claimed_until "
            "FROM messages WHERE to_name = ?")
     params: list = [NAME]
     if unread_only:
         sql += " AND read_at IS NULL"
+    if claimable_only:
+        # Skip claims by OTHER agents still within window; show mine + unclaimed + expired
+        sql += (" AND (claimed_by IS NULL OR claimed_by = ? "
+                "OR claimed_until < strftime('%Y-%m-%dT%H:%M:%fZ','now'))")
+        params.append(NAME)
     sql += " ORDER BY id ASC LIMIT ?"
     params.append(limit)
 
@@ -623,6 +639,8 @@ def inbox(unread_only: bool = True, limit: int = 50) -> list[dict]:
             out.append({
                 "id": r["id"], "from": r["from_name"], "body": r["body"],
                 "sent_at": r["sent_at"], "read_at": r["read_at"],
+                "claimed_by": r["claimed_by"],
+                "claimed_until": r["claimed_until"],
                 "in_reply_to": r["in_reply_to"],
                 "expires_at": r["expires_at"],
                 "attachments": atts_by_msg.get(r["id"], []),
@@ -654,8 +672,10 @@ def mark_read(ids: list[int]) -> dict:
 
     qmarks = ",".join("?" * len(ids))
     with _connect() as c:
+        # Also auto-release any claim — mark_read implies done processing.
         cur = c.execute(
-            f"UPDATE messages SET read_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') "
+            f"UPDATE messages SET read_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), "
+            f"claimed_by = NULL, claimed_until = NULL "
             f"WHERE id IN ({qmarks}) AND to_name = ? AND read_at IS NULL",
             list(ids) + [NAME],
         )
@@ -664,6 +684,82 @@ def mark_read(ids: list[int]) -> dict:
         payload={"ids": list(ids), "marked": cur.rowcount},
     )
     return {"marked": cur.rowcount}
+
+
+@mcp.tool()
+def claim(message_id: int, ttl_seconds: int = 600) -> dict:
+    """Claim a message for exclusive processing (visibility timeout).
+
+    Marks the message as "being processed by you" for ttl_seconds. Other agents
+    that pass claimable_only=True to inbox() will skip it during that window.
+    Re-claiming a message you already hold refreshes its TTL.
+
+    Args:
+        message_id: id from inbox()[].id. Must be addressed to you.
+        ttl_seconds: claim duration (default 600 = 10 min). Caps at 86400 (24h).
+
+    Returns:
+        {ok: True, message_id, claimed_by, claimed_until}
+        OR raises if already claimed by another agent within window.
+    """
+    ttl_seconds = min(max(1, ttl_seconds), 86400)
+    if REMOTE:
+        r = _remote("POST", "/claim",
+                    {"actor": NAME, "message_id": message_id, "ttl_seconds": ttl_seconds})
+        return r
+
+    with _connect() as c:
+        row = c.execute(
+            "UPDATE messages SET claimed_by=?, "
+            "claimed_until=strftime('%Y-%m-%dT%H:%M:%fZ','now', ?) "
+            "WHERE id=? AND to_name=? "
+            "AND (claimed_by IS NULL OR claimed_by=? "
+            "  OR claimed_until < strftime('%Y-%m-%dT%H:%M:%fZ','now')) "
+            "RETURNING id, claimed_by, claimed_until",
+            (NAME, f"+{ttl_seconds} seconds", message_id, NAME, NAME),
+        ).fetchone()
+    if not row:
+        # Find out why — either not addressed to NAME, or claimed by other
+        with _connect() as c:
+            existing = c.execute(
+                "SELECT to_name, claimed_by, claimed_until FROM messages WHERE id=?",
+                (message_id,),
+            ).fetchone()
+        if not existing:
+            raise RuntimeError(f"message {message_id} not found")
+        if existing["to_name"] != NAME:
+            raise RuntimeError(
+                f"message {message_id} addressed to {existing['to_name']}, not {NAME}")
+        raise RuntimeError(
+            f"message {message_id} claimed by {existing['claimed_by']} "
+            f"until {existing['claimed_until']}")
+    mailbox_audit.log_event(
+        DB_PATH, actor=NAME, action="claim", target=str(message_id),
+        payload={"ttl_seconds": ttl_seconds, "claimed_until": row["claimed_until"]},
+    )
+    return {"ok": True, "message_id": row["id"],
+            "claimed_by": row["claimed_by"], "claimed_until": row["claimed_until"]}
+
+
+@mcp.tool()
+def release(message_id: int) -> dict:
+    """Release a claim you hold on a message. Idempotent."""
+    if REMOTE:
+        return _remote("POST", "/release",
+                       {"actor": NAME, "message_id": message_id})
+    with _connect() as c:
+        cur = c.execute(
+            "UPDATE messages SET claimed_by=NULL, claimed_until=NULL "
+            "WHERE id=? AND claimed_by=?",
+            (message_id, NAME),
+        )
+        released = cur.rowcount > 0
+    if released:
+        mailbox_audit.log_event(
+            DB_PATH, actor=NAME, action="release", target=str(message_id),
+            payload={},
+        )
+    return {"ok": True, "message_id": message_id, "released": released}
 
 
 @mcp.tool()

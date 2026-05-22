@@ -131,7 +131,9 @@ def db_init(path: pathlib.Path):
             sent_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
             read_at TEXT,
             has_attachments INTEGER NOT NULL DEFAULT 0,
-            in_reply_to INTEGER
+            in_reply_to INTEGER,
+            claimed_by TEXT,
+            claimed_until TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_to_unread
             ON messages(to_name, read_at);
@@ -445,6 +447,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # Merge rate-limit stats — active scopes / total buckets / limit
             rl_stats = mailbox_rate_limit.stats(srv.db_path)
             payload.update(rl_stats)
+            # Active message claims (visibility timeout still valid)
+            conn_h = db_connect(srv.db_path)
+            try:
+                claim_row = conn_h.execute(
+                    "SELECT COUNT(*) FROM messages "
+                    "WHERE claimed_by IS NOT NULL "
+                    "AND claimed_until > strftime('%Y-%m-%dT%H:%M:%fZ','now')"
+                ).fetchone()
+                payload["messages_claimed_active"] = claim_row[0]
+            except sqlite3.OperationalError:
+                payload["messages_claimed_active"] = 0
+            finally:
+                conn_h.close()
             return self._json(200, payload)
 
         if not self._check_auth():
@@ -459,12 +474,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not self._rate_limit_check(f"name:{name}", "/inbox"):
                 return  # 429 sent
             unread_only = first("unread", "1") in ("1", "true", "yes")
+            claimable_only = first("claimable", "0") in ("1", "true", "yes")
             limit = int(first("limit", "50"))
             sql = ("SELECT id, from_name, to_name, body, sent_at, read_at, has_attachments, "
-                   "in_reply_to, expires_at FROM messages WHERE to_name=?")
+                   "in_reply_to, expires_at, claimed_by, claimed_until "
+                   "FROM messages WHERE to_name=?")
             args: list = [name]
             if unread_only:
                 sql += " AND read_at IS NULL"
+            if claimable_only:
+                sql += (" AND (claimed_by IS NULL OR claimed_by = ? "
+                        "OR claimed_until < strftime('%Y-%m-%dT%H:%M:%fZ','now'))")
+                args.append(name)
             sql += " ORDER BY id DESC LIMIT ?"
             args.append(limit)
             conn = db_connect(srv.db_path)
@@ -694,8 +715,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             placeholders = ",".join("?" for _ in ids)
             conn = db_connect(srv.db_path)
             try:
+                # mark_read auto-releases any active claim — done processing.
                 cur = conn.execute(
-                    f"UPDATE messages SET read_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') "
+                    f"UPDATE messages SET read_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), "
+                    f"claimed_by = NULL, claimed_until = NULL "
                     f"WHERE id IN ({placeholders}) AND read_at IS NULL",
                     ids,
                 )
@@ -753,6 +776,99 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 payload={"emoji": payload["emoji"], "removed": removed},
             )
             return self._json(200, {"removed": removed})
+
+        if path == "/claim":
+            for k in ("actor", "message_id"):
+                if k not in payload:
+                    return self._json(400, {"error": f"missing field: {k}"})
+            if not isinstance(payload["actor"], str):
+                return self._json(400, {"error": "actor must be string"})
+            if not isinstance(payload["message_id"], int):
+                return self._json(400, {"error": "message_id must be int"})
+            ttl = payload.get("ttl_seconds", 600)
+            if not isinstance(ttl, int):
+                return self._json(400, {"error": "ttl_seconds must be int"})
+            ttl = min(max(1, ttl), 86400)
+            if not self._rate_limit_check(f"from:{payload['actor']}", "/claim"):
+                return
+            actor = payload["actor"]
+            msg_id = payload["message_id"]
+            conn = db_connect(srv.db_path)
+            try:
+                row = conn.execute(
+                    "UPDATE messages SET claimed_by=?, "
+                    "claimed_until=strftime('%Y-%m-%dT%H:%M:%fZ','now', ?) "
+                    "WHERE id=? AND to_name=? "
+                    "AND (claimed_by IS NULL OR claimed_by=? "
+                    "  OR claimed_until < strftime('%Y-%m-%dT%H:%M:%fZ','now')) "
+                    "RETURNING id, claimed_by, claimed_until",
+                    (actor, f"+{ttl} seconds", msg_id, actor, actor),
+                ).fetchone()
+                conn.commit()
+                if not row:
+                    existing = conn.execute(
+                        "SELECT to_name, claimed_by, claimed_until FROM messages WHERE id=?",
+                        (msg_id,),
+                    ).fetchone()
+                    if not existing:
+                        return self._json(404, {"error": f"message {msg_id} not found"})
+                    if existing["to_name"] != actor:
+                        return self._json(403, {
+                            "error": f"message {msg_id} addressed to "
+                                     f"{existing['to_name']}, not {actor}"})
+                    mailbox_audit.log_event(
+                        srv.db_path, actor=actor, action="claim",
+                        target=str(msg_id), ok=False,
+                        payload={"reason": "already claimed",
+                                 "claimed_by": existing["claimed_by"],
+                                 "claimed_until": existing["claimed_until"]},
+                    )
+                    return self._json(409, {
+                        "error": f"claimed by {existing['claimed_by']} "
+                                 f"until {existing['claimed_until']}",
+                        "claimed_by": existing["claimed_by"],
+                        "claimed_until": existing["claimed_until"]})
+            finally:
+                conn.close()
+            mailbox_audit.log_event(
+                srv.db_path, actor=actor, action="claim", target=str(msg_id),
+                payload={"ttl_seconds": ttl, "claimed_until": row["claimed_until"]},
+            )
+            return self._json(200, {
+                "ok": True, "message_id": row["id"],
+                "claimed_by": row["claimed_by"],
+                "claimed_until": row["claimed_until"],
+            })
+
+        if path == "/release":
+            for k in ("actor", "message_id"):
+                if k not in payload:
+                    return self._json(400, {"error": f"missing field: {k}"})
+            if not isinstance(payload["actor"], str):
+                return self._json(400, {"error": "actor must be string"})
+            if not isinstance(payload["message_id"], int):
+                return self._json(400, {"error": "message_id must be int"})
+            actor = payload["actor"]
+            msg_id = payload["message_id"]
+            conn = db_connect(srv.db_path)
+            try:
+                cur = conn.execute(
+                    "UPDATE messages SET claimed_by=NULL, claimed_until=NULL "
+                    "WHERE id=? AND claimed_by=?",
+                    (msg_id, actor),
+                )
+                conn.commit()
+                released = cur.rowcount > 0
+            finally:
+                conn.close()
+            if released:
+                mailbox_audit.log_event(
+                    srv.db_path, actor=actor, action="release",
+                    target=str(msg_id), payload={},
+                )
+            return self._json(200, {
+                "ok": True, "message_id": msg_id, "released": released,
+            })
 
         return self._json(404, {"error": "not found"})
 

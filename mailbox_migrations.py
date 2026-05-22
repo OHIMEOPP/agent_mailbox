@@ -99,12 +99,32 @@ def _migration_v003_expires_at(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migration_v004_claim(conn: sqlite3.Connection) -> None:
+    """messages.claimed_by + claimed_until + partial index.
+
+    Added 2026-05-23 message-claim / visibility-timeout feature. Lets one
+    agent grab a message for exclusive processing for a TTL window so two
+    workers don't pick up the same task. Partial index covers active claims
+    only (NULL when unclaimed or claim expired-and-cleared).
+    """
+    cols = _messages_columns(conn)
+    if "claimed_by" not in cols:
+        conn.execute("ALTER TABLE messages ADD COLUMN claimed_by TEXT")
+    if "claimed_until" not in cols:
+        conn.execute("ALTER TABLE messages ADD COLUMN claimed_until TEXT")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_messages_claimed_until "
+        "ON messages(claimed_until) WHERE claimed_until IS NOT NULL"
+    )
+
+
 # Canonical migration list. Append only; never re-order or delete.
 # `version` must be sequential starting from 1.
 MIGRATIONS: list[tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (1, "messages_has_attachments", _migration_v001_has_attachments),
     (2, "messages_in_reply_to_with_partial_index", _migration_v002_in_reply_to),
     (3, "messages_expires_at_with_partial_index", _migration_v003_expires_at),
+    (4, "messages_claim_visibility_timeout", _migration_v004_claim),
 ]
 
 
