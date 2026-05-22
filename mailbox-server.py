@@ -32,6 +32,7 @@ Cross-machine deployment:
 stdlib only.
 """
 import argparse
+import fnmatch
 import hashlib
 import http.server
 import json
@@ -47,6 +48,35 @@ import urllib.parse
 import mailbox_audit
 import mailbox_backup
 import mailbox_sweep
+
+# Mailing-list / glob fanout settings
+ALIAS_ACTIVE_DAYS = 7      # only fanout to peers heartbeat within this window
+ALIAS_MAX_RECIPIENTS = 32  # sanity cap; matches MAX_FILES_PER_MSG ethos
+
+
+def _is_alias_pattern(name: str) -> bool:
+    """True if name contains shell-glob magic (*?[)."""
+    return any(c in name for c in "*?[")
+
+
+def _resolve_alias(conn: sqlite3.Connection, pattern: str) -> list[str]:
+    """Return active peer names matching pattern (case-sensitive fnmatch).
+    Filters to last_seen_at within ALIAS_ACTIVE_DAYS; capped at ALIAS_MAX_RECIPIENTS.
+    For literal names (no glob), returns [pattern] unchanged (caller decides
+    whether the peer must be active — /send is permissive to enable new peers).
+    """
+    if not _is_alias_pattern(pattern):
+        return [pattern]
+    cutoff = conn.execute(
+        "SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?)",
+        (f"-{ALIAS_ACTIVE_DAYS} days",),
+    ).fetchone()[0]
+    rows = conn.execute(
+        "SELECT name FROM peers WHERE last_seen_at >= ? ORDER BY name",
+        (cutoff,),
+    ).fetchall()
+    matched = [r[0] for r in rows if fnmatch.fnmatchcase(r[0], pattern)]
+    return matched[:ALIAS_MAX_RECIPIENTS]
 
 DEFAULT_PORT = 1905
 DEFAULT_DB = pathlib.Path.home() / ".claude" / "mailbox" / "mailbox.db"
@@ -464,14 +494,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
             expires_at = payload.get("expires_at")
             if expires_at is not None and not isinstance(expires_at, str):
                 return self._json(400, {"error": "expires_at must be ISO string or null"})
+
+            to_field = payload["to"]
+            is_pattern = _is_alias_pattern(to_field)
+
             conn = db_connect(srv.db_path)
             try:
-                row = conn.execute(
-                    "INSERT INTO messages(from_name, to_name, body, in_reply_to, expires_at) "
-                    "VALUES(?, ?, ?, ?, ?) RETURNING id, sent_at",
-                    (payload["from"], payload["to"], payload["body"],
-                     in_reply_to, expires_at),
-                ).fetchone()
+                recipients = _resolve_alias(conn, to_field)
+                if not recipients:
+                    return self._json(404, {
+                        "error": f"no active peers (heartbeat ≤{ALIAS_ACTIVE_DAYS}d) match "
+                                 f"pattern '{to_field}'"})
+                # Insert one message row per recipient. Fanout case ≥2 records;
+                # literal single-recipient stays N=1.
+                inserted: list[dict] = []
+                for to_name in recipients:
+                    row = conn.execute(
+                        "INSERT INTO messages(from_name, to_name, body, in_reply_to, expires_at) "
+                        "VALUES(?, ?, ?, ?, ?) RETURNING id, sent_at",
+                        (payload["from"], to_name, payload["body"],
+                         in_reply_to, expires_at),
+                    ).fetchone()
+                    inserted.append({"id": row["id"], "sent_at": row["sent_at"],
+                                     "to": to_name})
                 conn.execute(
                     "INSERT INTO peers(name, last_seen_at) "
                     "VALUES(?, strftime('%Y-%m-%dT%H:%M:%fZ','now')) "
@@ -481,14 +526,31 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 conn.commit()
             finally:
                 conn.close()
-            mailbox_audit.log_event(
-                srv.db_path, actor=payload["from"], action="send",
-                target=payload["to"],
-                payload={"msg_id": row["id"], "body_len": len(payload["body"]),
-                         "files_count": 0, "in_reply_to": in_reply_to,
-                         "expires_at": expires_at},
-            )
-            return self._json(200, {"id": row["id"], "sent_at": row["sent_at"],
+
+            # Audit log — one entry per recipient
+            for rec in inserted:
+                mailbox_audit.log_event(
+                    srv.db_path, actor=payload["from"], action="send",
+                    target=rec["to"],
+                    payload={"msg_id": rec["id"], "body_len": len(payload["body"]),
+                             "files_count": 0, "in_reply_to": in_reply_to,
+                             "expires_at": expires_at,
+                             "alias_pattern": to_field if is_pattern else None},
+                )
+
+            if is_pattern:
+                # New fanout shape — list of {id, sent_at, to}
+                return self._json(200, {
+                    "fanout": True,
+                    "pattern": to_field,
+                    "matched_peers": recipients,
+                    "count": len(inserted),
+                    "messages": inserted,
+                    "expires_at": expires_at,
+                })
+            # Backward-compat single-recipient shape (one inserted)
+            r0 = inserted[0]
+            return self._json(200, {"id": r0["id"], "sent_at": r0["sent_at"],
                                      "expires_at": expires_at})
 
         if path == "/mark_read":
@@ -592,7 +654,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 {"error": f"total attachment size {total} > {MAX_TOTAL_PAYLOAD}"},
             )
 
-        # Write blobs (content-addressed dedup), then DB rows.
+        # Write blobs ONCE (content-addressed dedup), then DB rows per recipient.
+        # Blob layer doesn't care how many recipients; only attachment rows fan out.
         written: list[dict] = []
         for _, part in file_parts:
             filename = part.get("filename") or "unnamed"
@@ -600,28 +663,40 @@ class Handler(http.server.BaseHTTPRequestHandler):
             sha, size = write_blob_atomic(srv.attachments_dir, part["data"])
             written.append({"filename": filename, "mime": mime, "size": size, "sha256": sha})
 
+        to_field = payload["to"]
+        is_pattern = _is_alias_pattern(to_field)
+
         conn = db_connect(srv.db_path)
         try:
-            row = conn.execute(
-                "INSERT INTO messages(from_name, to_name, body, has_attachments, in_reply_to, expires_at) "
-                "VALUES(?, ?, ?, 1, ?, ?) RETURNING id, sent_at",
-                (payload["from"], payload["to"], payload["body"],
-                 in_reply_to, expires_at),
-            ).fetchone()
-            msg_id = row["id"]
-            attach_rows = []
-            for w in written:
-                a = conn.execute(
-                    "INSERT INTO attachments(message_id, filename, mime, size, sha256) "
-                    "VALUES(?, ?, ?, ?, ?) RETURNING id",
-                    (msg_id, w["filename"], w["mime"], w["size"], w["sha256"]),
+            recipients = _resolve_alias(conn, to_field)
+            if not recipients:
+                return self._json(404, {
+                    "error": f"no active peers (heartbeat ≤{ALIAS_ACTIVE_DAYS}d) match "
+                             f"pattern '{to_field}'"})
+
+            fanout_results: list[dict] = []
+            for to_name in recipients:
+                row = conn.execute(
+                    "INSERT INTO messages(from_name, to_name, body, has_attachments, in_reply_to, expires_at) "
+                    "VALUES(?, ?, ?, 1, ?, ?) RETURNING id, sent_at",
+                    (payload["from"], to_name, payload["body"],
+                     in_reply_to, expires_at),
                 ).fetchone()
-                attach_rows.append({
-                    "id": a["id"],
-                    "filename": w["filename"],
-                    "mime": w["mime"],
-                    "size": w["size"],
-                    "sha256": w["sha256"],
+                msg_id = row["id"]
+                attach_rows = []
+                for w in written:
+                    a = conn.execute(
+                        "INSERT INTO attachments(message_id, filename, mime, size, sha256) "
+                        "VALUES(?, ?, ?, ?, ?) RETURNING id",
+                        (msg_id, w["filename"], w["mime"], w["size"], w["sha256"]),
+                    ).fetchone()
+                    attach_rows.append({
+                        "id": a["id"], "filename": w["filename"], "mime": w["mime"],
+                        "size": w["size"], "sha256": w["sha256"],
+                    })
+                fanout_results.append({
+                    "id": msg_id, "sent_at": row["sent_at"], "to": to_name,
+                    "attachments": attach_rows,
                 })
             conn.execute(
                 "INSERT INTO peers(name, last_seen_at) "
@@ -633,19 +708,34 @@ class Handler(http.server.BaseHTTPRequestHandler):
         finally:
             conn.close()
 
-        mailbox_audit.log_event(
-            srv.db_path, actor=payload["from"], action="send",
-            target=payload["to"],
-            payload={"msg_id": msg_id, "body_len": len(payload["body"]),
-                     "files_count": len(attach_rows), "in_reply_to": in_reply_to,
-                     "expires_at": expires_at,
-                     "attachment_ids": [a["id"] for a in attach_rows]},
-        )
+        # Audit log — one row per recipient
+        for rec in fanout_results:
+            mailbox_audit.log_event(
+                srv.db_path, actor=payload["from"], action="send",
+                target=rec["to"],
+                payload={"msg_id": rec["id"], "body_len": len(payload["body"]),
+                         "files_count": len(rec["attachments"]),
+                         "in_reply_to": in_reply_to, "expires_at": expires_at,
+                         "attachment_ids": [a["id"] for a in rec["attachments"]],
+                         "alias_pattern": to_field if is_pattern else None},
+            )
+
+        if is_pattern:
+            return self._json(200, {
+                "fanout": True,
+                "pattern": to_field,
+                "matched_peers": recipients,
+                "count": len(fanout_results),
+                "messages": fanout_results,
+                "expires_at": expires_at,
+            })
+        # Single-recipient (literal to=) — backward compat shape
+        r0 = fanout_results[0]
         return self._json(200, {
-            "id": msg_id,
-            "sent_at": row["sent_at"],
+            "id": r0["id"],
+            "sent_at": r0["sent_at"],
             "expires_at": expires_at,
-            "attachments": attach_rows,
+            "attachments": r0["attachments"],
         })
 
     def _serve_attachment(self, raw_id: str):

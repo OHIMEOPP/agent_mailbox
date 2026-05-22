@@ -20,6 +20,7 @@ Configuration via env vars (set in each project's .mcp.json):
 
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import json
 import mimetypes
@@ -31,6 +32,31 @@ from pathlib import Path
 
 import mailbox_audit
 from mcp.server.fastmcp import FastMCP
+
+# Mailing-list / glob fanout settings (must match mailbox-server.py)
+ALIAS_ACTIVE_DAYS = 7
+ALIAS_MAX_RECIPIENTS = 32
+
+
+def _is_alias_pattern(name: str) -> bool:
+    """True if name contains shell-glob magic (*?[)."""
+    return any(c in name for c in "*?[")
+
+
+def _resolve_alias(conn, pattern: str) -> list[str]:
+    """Local-mode alias resolution. Mirrors mailbox-server.py logic."""
+    if not _is_alias_pattern(pattern):
+        return [pattern]
+    cutoff = conn.execute(
+        "SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?)",
+        (f"-{ALIAS_ACTIVE_DAYS} days",),
+    ).fetchone()[0]
+    rows = conn.execute(
+        "SELECT name FROM peers WHERE last_seen_at >= ? ORDER BY name",
+        (cutoff,),
+    ).fetchall()
+    matched = [r["name"] for r in rows if fnmatch.fnmatchcase(r["name"], pattern)]
+    return matched[:ALIAS_MAX_RECIPIENTS]
 
 # ---------- Configuration ----------
 
@@ -310,7 +336,10 @@ def send(to: str, body: str, files: list[str] | None = None,
     """Send a message (optionally with file attachments) to another Claude Code instance.
 
     Args:
-        to: recipient's CLAUDE_MAILBOX_NAME (e.g. "wiki", "koatag@LAPTOP-XYZ789")
+        to: recipient's CLAUDE_MAILBOX_NAME (e.g. "wiki", "koatag@LAPTOP-XYZ789").
+            ALIAS / fanout: pass a glob like "koatag*" or "*-frontend" to send
+            to all matching active peers (heartbeat within 7 days). Glob magic
+            chars are `*`, `?`, `[`. Capped at 32 recipients. Empty match → error.
         body: message text
         files: optional list of host filesystem paths to attach. Each file up to
                100 MB, total payload up to 500 MB. For folder transfer, zip
@@ -328,7 +357,10 @@ def send(to: str, body: str, files: list[str] | None = None,
                beyond the next sweep.
 
     Returns:
-        {id, sent_at, from, to, in_reply_to?, expires_at?, attachments?: [{id, filename, mime, size, sha256}]}
+        Literal `to`: {id, sent_at, from, to, in_reply_to?, expires_at?, attachments?: [...]}
+        Glob `to` (fanout): {fanout: True, pattern, matched_peers, count,
+                             messages: [{id, sent_at, to, attachments?}, ...],
+                             from, in_reply_to?, expires_at?}
     """
     resolved_expires_at = _resolve_expires_at(expires_at)
     if files:
@@ -350,6 +382,8 @@ def send(to: str, body: str, files: list[str] | None = None,
                 body_payload,
                 file_parts,
             )
+            if r.get("fanout"):
+                return {**r, "from": NAME, "to": to, "in_reply_to": in_reply_to}
             return {
                 "id": r["id"], "sent_at": r["sent_at"], "from": NAME, "to": to,
                 "in_reply_to": in_reply_to,
@@ -357,36 +391,63 @@ def send(to: str, body: str, files: list[str] | None = None,
                 "attachments": r["attachments"],
             }
 
-        # Local mode: write blobs then DB rows
+        # Local mode: write blobs once (sha dedup), then per-recipient rows
+        is_pattern = _is_alias_pattern(to)
         written: list[dict] = []
         for fname, mime, data in file_parts:
             sha, size = _write_blob(data)
             written.append({"filename": fname, "mime": mime, "size": size, "sha256": sha})
         with _connect() as c:
-            row = c.execute(
-                "INSERT INTO messages(from_name, to_name, body, has_attachments, in_reply_to, expires_at) "
-                "VALUES(?, ?, ?, 1, ?, ?) RETURNING id, sent_at",
-                (NAME, to, body, in_reply_to, resolved_expires_at),
-            ).fetchone()
-            msg_id = row["id"]
-            for w in written:
-                r2 = c.execute(
-                    "INSERT INTO attachments(message_id, filename, mime, size, sha256) "
-                    "VALUES(?, ?, ?, ?, ?) RETURNING id",
-                    (msg_id, w["filename"], w["mime"], w["size"], w["sha256"]),
+            recipients = _resolve_alias(c, to)
+            if not recipients:
+                raise RuntimeError(
+                    f"no active peers (heartbeat ≤{ALIAS_ACTIVE_DAYS}d) match "
+                    f"pattern '{to}'")
+            fanout_results: list[dict] = []
+            for to_name in recipients:
+                row = c.execute(
+                    "INSERT INTO messages(from_name, to_name, body, has_attachments, in_reply_to, expires_at) "
+                    "VALUES(?, ?, ?, 1, ?, ?) RETURNING id, sent_at",
+                    (NAME, to_name, body, in_reply_to, resolved_expires_at),
                 ).fetchone()
-                w["id"] = r2["id"]
-        mailbox_audit.log_event(
-            DB_PATH, actor=NAME, action="send", target=to,
-            payload={"msg_id": msg_id, "body_len": len(body),
-                     "files_count": len(written), "in_reply_to": in_reply_to,
-                     "expires_at": resolved_expires_at},
-        )
+                msg_id = row["id"]
+                attach_rows = []
+                for w in written:
+                    r2 = c.execute(
+                        "INSERT INTO attachments(message_id, filename, mime, size, sha256) "
+                        "VALUES(?, ?, ?, ?, ?) RETURNING id",
+                        (msg_id, w["filename"], w["mime"], w["size"], w["sha256"]),
+                    ).fetchone()
+                    attach_rows.append({
+                        "id": r2["id"], "filename": w["filename"], "mime": w["mime"],
+                        "size": w["size"], "sha256": w["sha256"],
+                    })
+                fanout_results.append({"id": msg_id, "sent_at": row["sent_at"],
+                                       "to": to_name, "attachments": attach_rows})
+
+        for rec in fanout_results:
+            mailbox_audit.log_event(
+                DB_PATH, actor=NAME, action="send", target=rec["to"],
+                payload={"msg_id": rec["id"], "body_len": len(body),
+                         "files_count": len(rec["attachments"]),
+                         "in_reply_to": in_reply_to,
+                         "expires_at": resolved_expires_at,
+                         "alias_pattern": to if is_pattern else None},
+            )
+
+        if is_pattern:
+            return {
+                "fanout": True, "pattern": to, "matched_peers": recipients,
+                "count": len(fanout_results), "messages": fanout_results,
+                "from": NAME, "in_reply_to": in_reply_to,
+                "expires_at": resolved_expires_at,
+            }
+        r0 = fanout_results[0]
         return {
-            "id": msg_id, "sent_at": row["sent_at"], "from": NAME, "to": to,
+            "id": r0["id"], "sent_at": r0["sent_at"], "from": NAME, "to": to,
             "in_reply_to": in_reply_to,
             "expires_at": resolved_expires_at,
-            "attachments": written,
+            "attachments": r0["attachments"],
         }
 
     # text-only path
@@ -397,23 +458,48 @@ def send(to: str, body: str, files: list[str] | None = None,
         if resolved_expires_at is not None:
             body_payload2["expires_at"] = resolved_expires_at
         r = _remote("POST", "/send", body_payload2)
+        # Hub handles fanout — surface its shape back. Single recipient gets
+        # {id, sent_at, ...}; pattern gets {fanout: true, messages: [...]}.
+        if r.get("fanout"):
+            return {**r, "from": NAME, "to": to, "in_reply_to": in_reply_to}
         return {"id": r["id"], "sent_at": r["sent_at"], "from": NAME, "to": to,
                 "in_reply_to": in_reply_to,
                 "expires_at": resolved_expires_at}
 
+    is_pattern = _is_alias_pattern(to)
     with _connect() as c:
-        row = c.execute(
-            "INSERT INTO messages(from_name, to_name, body, in_reply_to, expires_at) "
-            "VALUES(?, ?, ?, ?, ?) RETURNING id, sent_at",
-            (NAME, to, body, in_reply_to, resolved_expires_at),
-        ).fetchone()
-    mailbox_audit.log_event(
-        DB_PATH, actor=NAME, action="send", target=to,
-        payload={"msg_id": row["id"], "body_len": len(body),
-                 "files_count": 0, "in_reply_to": in_reply_to,
-                 "expires_at": resolved_expires_at},
-    )
-    return {"id": row["id"], "sent_at": row["sent_at"], "from": NAME, "to": to,
+        recipients = _resolve_alias(c, to)
+        if not recipients:
+            raise RuntimeError(
+                f"no active peers (heartbeat ≤{ALIAS_ACTIVE_DAYS}d) match "
+                f"pattern '{to}'")
+        inserted: list[dict] = []
+        for to_name in recipients:
+            row = c.execute(
+                "INSERT INTO messages(from_name, to_name, body, in_reply_to, expires_at) "
+                "VALUES(?, ?, ?, ?, ?) RETURNING id, sent_at",
+                (NAME, to_name, body, in_reply_to, resolved_expires_at),
+            ).fetchone()
+            inserted.append({"id": row["id"], "sent_at": row["sent_at"], "to": to_name})
+
+    for rec in inserted:
+        mailbox_audit.log_event(
+            DB_PATH, actor=NAME, action="send", target=rec["to"],
+            payload={"msg_id": rec["id"], "body_len": len(body),
+                     "files_count": 0, "in_reply_to": in_reply_to,
+                     "expires_at": resolved_expires_at,
+                     "alias_pattern": to if is_pattern else None},
+        )
+
+    if is_pattern:
+        return {
+            "fanout": True, "pattern": to, "matched_peers": recipients,
+            "count": len(inserted), "messages": inserted,
+            "from": NAME, "in_reply_to": in_reply_to,
+            "expires_at": resolved_expires_at,
+        }
+    r0 = inserted[0]
+    return {"id": r0["id"], "sent_at": r0["sent_at"], "from": NAME, "to": to,
             "in_reply_to": in_reply_to, "expires_at": resolved_expires_at}
 
 
