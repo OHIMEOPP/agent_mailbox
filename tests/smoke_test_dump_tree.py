@@ -40,7 +40,8 @@ def main() -> int:
                 pinned INTEGER NOT NULL DEFAULT 0,
                 priority INTEGER NOT NULL DEFAULT 0,
                 snoozed_until TEXT,
-                expires_at TEXT
+                expires_at TEXT,
+                forwarded_from_msg_id INTEGER
             );
             CREATE TABLE peers (name TEXT PRIMARY KEY, last_seen_at TEXT NOT NULL);
             CREATE TABLE reactions (
@@ -116,6 +117,10 @@ def main() -> int:
         conn.execute(
             "UPDATE messages SET expires_at=strftime('%Y-%m-%dT%H:%M:%fZ','now','+24 hours') "
             "WHERE id=?", (m4,))
+        # m6 (orphan reply) doubles as forward to test the forwarded marker
+        conn.execute(
+            "UPDATE messages SET forwarded_from_msg_id=? WHERE id=?",
+            (m1, m6))
 
         # Scheduled pending: 2 rows
         conn.execute(
@@ -253,7 +258,8 @@ def main() -> int:
         assert " P9 " in out or "P9 [" in out, "missing P9 priority marker"
         assert "😴" in out and "snoozed_until=" in out, "missing snoozed indicator"
         assert "⏳" in out and "expires_at=" in out, "missing TTL indicator"
-        print("[smoke] indicators ok (📌 / P9 / 😴 / ⏳ all rendered)")
+        assert "📨" in out and "forwarded from #" in out, "missing forward indicator"
+        print("[smoke] indicators ok (📌 / P9 / 😴 / ⏳ / 📨 all rendered)")
 
         print(f"\n[smoke] ALL DUMP TREE TESTS PASSED ({6} messages, tree + reactions + scheduled + audit + indicators verified)")
         return 0

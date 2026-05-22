@@ -93,10 +93,12 @@ def _messages_columns(conn: sqlite3.Connection) -> set[str]:
 
 
 def _row_marker_prefix(row: dict) -> str:
-    """Build a marker prefix for the header line: 📌 P9, etc."""
+    """Build a marker prefix for the header line: 📌 P9 📨, etc."""
     parts = []
     if row.get("pinned"):
         parts.append("📌")
+    if row.get("forwarded_from_msg_id"):
+        parts.append("📨")
     prio = row.get("priority")
     if prio is not None and prio > 0:
         parts.append(f"P{prio}")
@@ -104,8 +106,11 @@ def _row_marker_prefix(row: dict) -> str:
 
 
 def _row_footer_lines(row: dict, body_indent: str) -> list[str]:
-    """Build extra footer lines per-message: snoozed / expires."""
+    """Build extra footer lines per-message: forward / snoozed / expires."""
     lines = []
+    fwd = row.get("forwarded_from_msg_id")
+    if fwd:
+        lines.append(f"{body_indent}📨 forwarded from #{fwd}")
     snoozed = row.get("snoozed_until")
     if snoozed:
         # Display as-is; user can eyeball whether it's past or future
@@ -376,7 +381,8 @@ def main() -> int:
         if tree_capable:
             col_list += ", in_reply_to"
         # Optional indicators — only SELECT if column exists (schema-aware)
-        for opt in ("pinned", "priority", "snoozed_until", "expires_at"):
+        for opt in ("pinned", "priority", "snoozed_until", "expires_at",
+                    "forwarded_from_msg_id"):
             if opt in cols:
                 col_list += f", {opt}"
         if args.peer:
