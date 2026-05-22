@@ -26,7 +26,7 @@ from pathlib import Path
 
 # Local import via path manipulation since this file is alongside the module
 sys.path.insert(0, str(Path(__file__).parent.parent))
-import mailbox_sweep  # noqa: E402
+from mailbox import sweep as mailbox_sweep  # noqa: E402
 
 
 def init_schema(db: Path) -> None:

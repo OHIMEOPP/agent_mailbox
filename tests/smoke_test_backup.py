@@ -27,7 +27,7 @@ from pathlib import Path
 
 # Local import via path manipulation since this file is alongside the module
 sys.path.insert(0, str(Path(__file__).parent.parent))
-import mailbox_backup  # noqa: E402
+from mailbox import backup as mailbox_backup  # noqa: E402
 
 
 def _sha256_bytes(b: bytes) -> str:

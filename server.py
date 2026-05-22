@@ -30,11 +30,11 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-import mailbox_audit
-import mailbox_migrations
-import mailbox_priority
-import mailbox_reactions
-import mailbox_scheduled
+from mailbox import audit as mailbox_audit
+from mailbox import migrations as mailbox_migrations
+from mailbox import priority as mailbox_priority
+from mailbox import reactions as mailbox_reactions
+from mailbox import scheduled as mailbox_scheduled
 from mcp.server.fastmcp import FastMCP
 
 # Mailing-list / glob fanout settings (must match mailbox-server.py)

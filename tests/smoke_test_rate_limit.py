@@ -19,7 +19,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-import mailbox_rate_limit  # noqa: E402
+from mailbox import rate_limit as mailbox_rate_limit  # noqa: E402
 
 
 def test_1_ddl_idempotent(db: Path) -> None:

@@ -29,7 +29,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-import mailbox_webhooks  # noqa: E402
+from mailbox import webhooks as mailbox_webhooks  # noqa: E402
 
 
 # Shared global so the request handler can stash received POSTs for the test.

@@ -45,15 +45,15 @@ import threading
 import time
 import urllib.parse
 
-import mailbox_audit
-import mailbox_backup
-import mailbox_migrations
-import mailbox_priority
-import mailbox_rate_limit
-import mailbox_reactions
-import mailbox_scheduled
-import mailbox_sweep
-import mailbox_webhooks
+from mailbox import audit as mailbox_audit
+from mailbox import backup as mailbox_backup
+from mailbox import migrations as mailbox_migrations
+from mailbox import priority as mailbox_priority
+from mailbox import rate_limit as mailbox_rate_limit
+from mailbox import reactions as mailbox_reactions
+from mailbox import scheduled as mailbox_scheduled
+from mailbox import sweep as mailbox_sweep
+from mailbox import webhooks as mailbox_webhooks
 
 SCHEDULED_TICK_SECONDS = mailbox_scheduled.SCHEDULED_TICK_SECONDS
 

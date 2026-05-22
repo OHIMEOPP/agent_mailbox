@@ -19,7 +19,7 @@ import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-import mailbox_priority  # noqa: E402
+from mailbox import priority as mailbox_priority  # noqa: E402
 
 
 def _create_messages_with_priority(db: Path) -> None:

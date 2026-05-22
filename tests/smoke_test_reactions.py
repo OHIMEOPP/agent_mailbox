@@ -15,7 +15,7 @@ import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-import mailbox_reactions  # noqa: E402
+from mailbox import reactions as mailbox_reactions  # noqa: E402
 
 
 def test_1_ddl_idempotent(db: Path) -> None:

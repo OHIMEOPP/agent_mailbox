@@ -19,7 +19,7 @@ import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-import mailbox_migrations  # noqa: E402
+from mailbox import migrations as mailbox_migrations  # noqa: E402
 
 
 def _create_full_messages_table(db: Path) -> None:

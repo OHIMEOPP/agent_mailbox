@@ -19,7 +19,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-import mailbox_sweep
+from mailbox import sweep as mailbox_sweep
 
 DEFAULT_DB = Path.home() / ".claude" / "mailbox" / "mailbox.db"
 
