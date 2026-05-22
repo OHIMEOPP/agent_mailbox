@@ -33,6 +33,8 @@ ACTIONS = frozenset({
     "whoami",     # identity probe
     "peers",      # peer list
     "search",     # FTS5 full-text search (added 2026-05-23 by wiki/FTS5)
+    "react",      # add a reaction (emoji) to a message
+    "unreact",    # remove a reaction
 })
 
 DEFAULT_TAIL_LIMIT = 50

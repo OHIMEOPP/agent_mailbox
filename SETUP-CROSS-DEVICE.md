@@ -1172,6 +1172,106 @@ Webhooks live entirely on the hub. Spokes never write to the webhook tables and 
 
 ---
 
+## Phase 10 — Reactions (since 2026-05-23)
+
+Lightweight ack signal on messages — emoji reactions à la Discord/Slack. Spares the channel from "got it" / "ack" / "👍" reply spam when a structured react row would carry the same info.
+
+### Schema
+
+```sql
+CREATE TABLE reactions (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id INTEGER NOT NULL,    -- no FK; cascades not used so retention works freely
+    actor      TEXT NOT NULL,
+    emoji      TEXT NOT NULL,        -- 1..32 chars, freeform
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    UNIQUE(message_id, actor, emoji)
+);
+CREATE INDEX idx_reactions_message ON reactions(message_id);
+CREATE INDEX idx_reactions_actor   ON reactions(actor);
+```
+
+`UNIQUE(message_id, actor, emoji)` is the dedup key — same actor adding the same emoji to the same message twice is a no-op (returns `{added: false}` with the existing row id).
+
+DDL owned by `mailbox_reactions.init_schema()` — separate executescript block, called from `db_init()` after the messages-table migrations. Avoids partial-index trap (mirrors audit/webhook pattern).
+
+### MCP API (server.py)
+
+```python
+mcp__mailbox__react(message_id=123, emoji="✅")
+# → {added: true, id: 7, created_at: "..."}
+
+mcp__mailbox__react(message_id=123, emoji="✅")
+# → {added: false, id: 7, ...}  -- idempotent, returns existing
+
+mcp__mailbox__unreact(message_id=123, emoji="✅")
+# → {removed: 1}
+```
+
+`emoji` cap = 32 chars to prevent abuse-of-channel via body-text-as-emoji.
+
+### REST API (mailbox-server.py)
+
+```
+POST /react
+Authorization: Bearer <token>
+Content-Type: application/json
+
+{"actor": "wiki", "message_id": 123, "emoji": "✅"}
+→ {"added": true, "id": 7, "created_at": "2026-05-23T02:00:00.000Z"}
+
+POST /unreact
+{"actor": "wiki", "message_id": 123, "emoji": "✅"}
+→ {"removed": 1}
+```
+
+`actor` is required in the REST body because the hub doesn't know which spoke is calling otherwise (unlike the MCP server which has `CLAUDE_MAILBOX_NAME` in its env).
+
+### inbox / SSE shape
+
+Both local-mode `inbox()` and REST `/inbox` add a `reactions: [{actor, emoji, created_at}, ...]` field per message. Empty list when none. Batched fetch: one SQL query covers all returned messages.
+
+SSE `/watch` does NOT yet replay reactions on the live event — reactions are typically added after a message arrives, and SSE only fires once per new message. Future work: separate SSE event types for `reaction.added` / `reaction.removed`.
+
+### Audit
+
+Actions `react` and `unreact` are in the canonical `mailbox_audit.ACTIONS` set. Each call logs:
+
+- `actor`: the reactor's name
+- `action`: react / unreact
+- `target`: str(message_id)
+- `payload`: `{emoji: <str>, added: <bool>}` or `{emoji: <str>, removed: <int>}`
+
+### /health
+
+```bash
+curl http://<HUB_IP>:1905/health
+# {
+#   ...
+#   "reaction_count": 47,
+#   "reaction_unique_emojis": 5
+# }
+```
+
+### What's NOT supported
+
+- **No reaction history per actor view**: `mailbox-dump` doesn't currently render reactions inline. Future work.
+- **No notification on react**: peers don't get pinged when someone reacts to their message. Stays passive — query reactions yourself via inbox.
+- **No "remove all reactions"**: only specific (actor, emoji) tuple. To clear all from a message, iterate.
+- **No FK from reactions.message_id → messages.id**: deliberately omitted so retention sweep doesn't have to chase reaction rows. Reactions on a deleted message become orphans (filterable in queries via JOIN).
+- **No reactions-FTS**: the reactions table isn't searchable via FTS5. Reactions are structured, not free-text.
+
+### Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `inbox()` returns no `reactions` field | Server pre-2026-05-23 or local DB before init_schema ran | `git pull` + restart server; `init_schema()` runs at startup |
+| `react()` returns `added=false` unexpectedly | Same (actor, emoji, message_id) already exists | `unreact()` first, then re-react |
+| `react()` REST returns 400 "emoji must be 1..32" | Empty string or >32 char emoji passed | shorten or pick a real emoji |
+| Reactions on deleted messages | Retention swept the message but reactions are FK-less | manually `DELETE FROM reactions WHERE message_id NOT IN (SELECT id FROM messages)` if you care about the orphans |
+
+---
+
 ## What is NOT installed on the spoke
 
 You do **not** need on the laptop:

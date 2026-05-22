@@ -47,6 +47,7 @@ import urllib.parse
 
 import mailbox_audit
 import mailbox_backup
+import mailbox_reactions
 import mailbox_sweep
 import mailbox_webhooks
 
@@ -165,6 +166,8 @@ def db_init(path: pathlib.Path):
     _init_fts(path)
     # Webhooks: separate tables, independent DDL.
     mailbox_webhooks.init_schema(path)
+    # Reactions: separate table, independent DDL.
+    mailbox_reactions.init_schema(path)
 
 
 def _init_fts(path: pathlib.Path):
@@ -387,6 +390,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # Merge webhook stats — counts of active/pending/failed + last fired
             webhook_stats = mailbox_webhooks.stats(srv.db_path)
             payload.update(webhook_stats)
+            # Merge reaction stats — totals + unique emoji count
+            reaction_stats = mailbox_reactions.stats(srv.db_path)
+            payload.update(reaction_stats)
             return self._json(200, payload)
 
         if not self._check_auth():
@@ -423,6 +429,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         r["attachments"] = []
             finally:
                 conn.close()
+            # Batch-fetch reactions for all returned messages (one round-trip)
+            reactions_by_msg = mailbox_reactions.list_for_messages(
+                srv.db_path, [r["id"] for r in rows],
+            )
+            for r in rows:
+                r["reactions"] = reactions_by_msg.get(r["id"], [])
             mailbox_audit.log_event(
                 srv.db_path, actor=name, action="inbox",
                 payload={"unread_only": unread_only, "limit": limit,
@@ -582,6 +594,47 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 action="mark_read", payload={"ids": ids, "marked": count},
             )
             return self._json(200, {"count": count})
+
+        if path == "/react":
+            for k in ("actor", "message_id", "emoji"):
+                if k not in payload:
+                    return self._json(400, {"error": f"missing field: {k}"})
+            if not isinstance(payload["actor"], str) or not isinstance(payload["emoji"], str):
+                return self._json(400, {"error": "actor + emoji must be strings"})
+            if not isinstance(payload["message_id"], int):
+                return self._json(400, {"error": "message_id must be int"})
+            try:
+                result = mailbox_reactions.react(
+                    srv.db_path, payload["message_id"],
+                    payload["actor"], payload["emoji"],
+                )
+            except ValueError as e:
+                return self._json(400, {"error": str(e)})
+            mailbox_audit.log_event(
+                srv.db_path, actor=payload["actor"], action="react",
+                target=str(payload["message_id"]),
+                payload={"emoji": payload["emoji"], "added": result["added"]},
+            )
+            return self._json(200, result)
+
+        if path == "/unreact":
+            for k in ("actor", "message_id", "emoji"):
+                if k not in payload:
+                    return self._json(400, {"error": f"missing field: {k}"})
+            if not isinstance(payload["actor"], str) or not isinstance(payload["emoji"], str):
+                return self._json(400, {"error": "actor + emoji must be strings"})
+            if not isinstance(payload["message_id"], int):
+                return self._json(400, {"error": "message_id must be int"})
+            removed = mailbox_reactions.unreact(
+                srv.db_path, payload["message_id"],
+                payload["actor"], payload["emoji"],
+            )
+            mailbox_audit.log_event(
+                srv.db_path, actor=payload["actor"], action="unreact",
+                target=str(payload["message_id"]),
+                payload={"emoji": payload["emoji"], "removed": removed},
+            )
+            return self._json(200, {"removed": removed})
 
         return self._json(404, {"error": "not found"})
 

@@ -485,6 +485,30 @@ if not mailbox_webhooks.verify_signature(body, sig, MY_STORED_SECRET):
 
 **Schema**：兩個新表 `webhooks` + `webhook_deliveries`，DDL 走 `mailbox_webhooks.init_schema()` 不塞進 messages executescript（避開 wiki #1 撞到的 partial-index ALTER trap）。
 
+## Reactions（自 2026-05-23）
+
+對訊息加 emoji 反應 — 取代「我看到了」「收到」這種純 ack 短信，減少 mailbox 噪音。Discord/Slack 式輕量信號。
+
+```python
+mcp__mailbox__react(message_id=123, emoji="✅")   # 同 actor 同 emoji 同 msg 只一筆
+mcp__mailbox__react(message_id=123, emoji="🔥")   # 加另一個
+mcp__mailbox__unreact(message_id=123, emoji="✅") # 撤回
+```
+
+**inbox() 結果**裡每筆訊息多一個 `reactions: [{actor, emoji, created_at}]` 欄。Spoke 也通 — 走 REST `/react` `/unreact`。
+
+**Schema**：`reactions(id, message_id, actor, emoji, created_at)` UNIQUE(message_id, actor, emoji) — 二次 react 是 no-op，回 `{added: false, id: <existing>}`。
+
+**REST endpoints**：
+- `POST /react`: body `{actor, message_id, emoji}` → `{added: bool, id, created_at}`
+- `POST /unreact`: same body → `{removed: int}`
+
+**Audit actions** 加 `react` / `unreact`。
+
+**`/health` 多兩欄**：`reaction_count`、`reaction_unique_emojis`。
+
+**Emoji** 是 TEXT 1..32 chars freeform — 慣例是單個 emoji（`👍` `🔥` `👀` `✅`），但短文字標籤（`"ack"`、`"todo"`）也可，client 自由。
+
 ## Bridge / 周邊工具
 
 - `mailbox-discord-bridge.py` — Docker container `mailbox-bridge`（port 1904）。**Inbound only**：Discord DM → mailbox INSERT。Agent **不直接 call** 這個 port，是 Discord bot 自動推進來。看完整 e2e 流程圖：[Discord 整合：兩個 port，分工不對稱](#discord-整合兩個-port分工不對稱)

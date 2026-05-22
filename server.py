@@ -31,6 +31,7 @@ import urllib.request
 from pathlib import Path
 
 import mailbox_audit
+import mailbox_reactions
 from mcp.server.fastmcp import FastMCP
 
 # Mailing-list / glob fanout settings (must match mailbox-server.py)
@@ -272,6 +273,7 @@ if not REMOTE:
     _init_db()
     mailbox_audit.init_schema(DB_PATH)
     _init_fts()
+    mailbox_reactions.init_schema(DB_PATH)
 
 
 def _write_blob(data: bytes) -> tuple[str, int]:
@@ -525,7 +527,8 @@ def inbox(unread_only: bool = True, limit: int = 50) -> list[dict]:
              "sent_at": m["sent_at"], "read_at": m["read_at"],
              "in_reply_to": m.get("in_reply_to"),
              "expires_at": m.get("expires_at"),
-             "attachments": m.get("attachments", [])}
+             "attachments": m.get("attachments", []),
+             "reactions": m.get("reactions", [])}
             for m in r["messages"]
         ]
 
@@ -554,6 +557,9 @@ def inbox(unread_only: bool = True, limit: int = 50) -> list[dict]:
                     "id": a["id"], "filename": a["filename"], "mime": a["mime"],
                     "size": a["size"], "sha256": a["sha256"],
                 })
+        reactions_by_msg = mailbox_reactions.list_for_messages(
+            DB_PATH, [r["id"] for r in rows],
+        )
         for r in rows:
             out.append({
                 "id": r["id"], "from": r["from_name"], "body": r["body"],
@@ -561,6 +567,7 @@ def inbox(unread_only: bool = True, limit: int = 50) -> list[dict]:
                 "in_reply_to": r["in_reply_to"],
                 "expires_at": r["expires_at"],
                 "attachments": atts_by_msg.get(r["id"], []),
+                "reactions": reactions_by_msg.get(r["id"], []),
             })
     mailbox_audit.log_event(
         DB_PATH, actor=NAME, action="inbox",
@@ -771,6 +778,59 @@ def whoami() -> dict:
         payload={"mode": "local"},
     )
     return {"name": NAME, "mode": "local", "db_path": str(DB_PATH.absolute())}
+
+
+@mcp.tool()
+def react(message_id: int, emoji: str) -> dict:
+    """Add a reaction (emoji) to a mailbox message.
+
+    Lightweight ack/triage signal — use instead of sending a full reply when
+    you just want to acknowledge ("got it" = ✅) or flag ("urgent" = 🔥).
+
+    Args:
+        message_id: id from inbox()[].id of the message to react to.
+        emoji: 1..32 chars freeform — convention is a single emoji, but any
+               short label works (e.g. "ack", "👀").
+
+    Returns:
+        {added: bool, id, created_at}. added=False means a reaction with the
+        same (message_id, this_actor, emoji) already exists (idempotent).
+    """
+    if REMOTE:
+        r = _remote("POST", "/react",
+                    {"actor": NAME, "message_id": message_id, "emoji": emoji})
+        return r
+
+    result = mailbox_reactions.react(DB_PATH, message_id, NAME, emoji)
+    mailbox_audit.log_event(
+        DB_PATH, actor=NAME, action="react", target=str(message_id),
+        payload={"emoji": emoji, "added": result["added"]},
+    )
+    return result
+
+
+@mcp.tool()
+def unreact(message_id: int, emoji: str) -> dict:
+    """Remove a reaction previously added by this instance.
+
+    Args:
+        message_id: id of the message to remove the reaction from.
+        emoji: exact emoji string previously passed to react().
+
+    Returns:
+        {removed: int} — 0 if nothing matched, 1 if removed.
+    """
+    if REMOTE:
+        r = _remote("POST", "/unreact",
+                    {"actor": NAME, "message_id": message_id, "emoji": emoji})
+        return r
+
+    removed = mailbox_reactions.unreact(DB_PATH, message_id, NAME, emoji)
+    mailbox_audit.log_event(
+        DB_PATH, actor=NAME, action="unreact", target=str(message_id),
+        payload={"emoji": emoji, "removed": removed},
+    )
+    return {"removed": removed}
 
 
 if __name__ == "__main__":
