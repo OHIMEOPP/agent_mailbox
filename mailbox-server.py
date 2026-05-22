@@ -48,6 +48,7 @@ import urllib.parse
 import mailbox_audit
 import mailbox_backup
 import mailbox_sweep
+import mailbox_webhooks
 
 # Mailing-list / glob fanout settings
 ALIAS_ACTIVE_DAYS = 7      # only fanout to peers heartbeat within this window
@@ -162,6 +163,8 @@ def db_init(path: pathlib.Path):
     # FTS5 search index over messages.body — separate DDL because virtual
     # table + triggers + backfill must run after the messages table exists.
     _init_fts(path)
+    # Webhooks: separate tables, independent DDL.
+    mailbox_webhooks.init_schema(path)
 
 
 def _init_fts(path: pathlib.Path):
@@ -381,6 +384,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             audit_stats = mailbox_audit.stats(srv.db_path)
             payload["audit_count"] = audit_stats["audit_count"]
             payload["audit_last_at"] = audit_stats["audit_last_at"]
+            # Merge webhook stats — counts of active/pending/failed + last fired
+            webhook_stats = mailbox_webhooks.stats(srv.db_path)
+            payload.update(webhook_stats)
             return self._json(200, payload)
 
         if not self._check_auth():
@@ -928,6 +934,45 @@ class Handler(http.server.BaseHTTPRequestHandler):
         sys.stderr.write(f"[mailbox-server] {self.address_string()} {fmt % args}\n")
 
 
+def _webhook_loop(db_path: pathlib.Path) -> None:
+    """Daemon thread: poll for new messages, deliver to active webhooks.
+
+    Tick every DAEMON_TICK_SECONDS (default 5s). Re-reads since_id from
+    persistent webhook_deliveries table on first tick to survive restarts —
+    a (webhook_id, message_id) row that already exists is a no-op enqueue.
+
+    Catches all exceptions per tick so a single bad webhook URL or DB hiccup
+    doesn't kill the loop forever; logs to stderr.
+    """
+    # On startup, set high-water to max(message_id) so we don't replay
+    # historical messages through all webhooks. New webhook + old messages
+    # still works via admin --test command if needed.
+    since_id = 0
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=10.0)
+        try:
+            since_id = conn.execute(
+                "SELECT COALESCE(MAX(id), 0) FROM messages"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+    except sqlite3.Error as e:
+        print(f"[webhook] startup since_id probe failed: {e}", file=sys.stderr)
+
+    print(f"[webhook] daemon start; baseline since_id={since_id}", file=sys.stderr)
+    while True:
+        time.sleep(mailbox_webhooks.DAEMON_TICK_SECONDS)
+        try:
+            counters = mailbox_webhooks.deliver_pending(db_path, since_id)
+            since_id = max(since_id, counters["new_since_id"])
+            if counters["deliveries_enqueued"] or counters["deliveries_succeeded"] \
+                    or counters["deliveries_failed"]:
+                print(f"[webhook] {counters}", file=sys.stderr)
+        except Exception as e:
+            print(f"[webhook] tick failed: {type(e).__name__}: {e}",
+                  file=sys.stderr)
+
+
 def _sweep_loop(db_path: pathlib.Path, attachments_dir: pathlib.Path,
                 read_days: int, unread_days: int, peer_days: int,
                 backup_dir: pathlib.Path | None,
@@ -1057,6 +1102,24 @@ def main():
             name="mailbox-sweep-backup",
         )
         t.start()
+
+    # Webhook delivery daemon — kept separate from sweep/backup. Independent
+    # cadence (5s tick) because webhook latency matters; sweep/backup is daily.
+    webhook_disabled = os.environ.get(
+        "MAILBOX_WEBHOOKS_DISABLED", "").strip() in ("1", "true", "yes")
+    if webhook_disabled:
+        print("[mailbox-server] webhooks: DISABLED via MAILBOX_WEBHOOKS_DISABLED",
+              file=sys.stderr)
+    else:
+        wh_thread = threading.Thread(
+            target=_webhook_loop,
+            args=(args.db,),
+            daemon=True,
+            name="mailbox-webhook-deliver",
+        )
+        wh_thread.start()
+        print(f"[mailbox-server] webhooks: deliver-tick={mailbox_webhooks.DAEMON_TICK_SECONDS}s",
+              file=sys.stderr)
 
     try:
         httpd.serve_forever()

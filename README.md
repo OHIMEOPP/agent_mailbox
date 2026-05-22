@@ -418,6 +418,73 @@ Relative：`30m` / `1h` / `7d`，由 hub/server 時鐘 + 該單位計算。null/
 
 **Schema**: `messages.expires_at TEXT` (nullable) + partial index `WHERE expires_at IS NOT NULL`。Forward-compat — 舊 DB 自動 ALTER on init。
 
+## Webhook 出站（自 2026-05-23）
+
+當有新訊息進 mailbox.db，註冊的 webhook 會收到 POST。讓外部系統（Slack、dashboard、custom bot）能對 mailbox 活動做 reactive 而不用各自輪詢 DB。
+
+**為什麼是 daemon polling 不是 inline /send hook**：避免跟 send-path features（mailing list aliases / TTL / 之後的 features）互鎖；deliver_pending 在 mailbox-server.py daemon thread 每 ~5s 跑一次。
+
+**註冊一個 webhook**：
+
+```bash
+py mailbox-webhooks.py --add my-slack --url https://hooks.slack.com/services/...
+# 輸出會印出 secret_hmac — 記下來，receiver 端要用它驗 HMAC
+
+# 帶 glob filter — 只 fire 給特定 to/from
+py mailbox-webhooks.py --add koatag-only \
+    --url https://x.example.com \
+    --to-glob 'koatag*'
+
+py mailbox-webhooks.py --list
+py mailbox-webhooks.py --deactivate 3   # 不刪、暫停
+py mailbox-webhooks.py --delete 3       # 真刪（連 deliveries 一起 CASCADE）
+py mailbox-webhooks.py --tail-deliveries --status failed   # debug
+py mailbox-webhooks.py --stats
+```
+
+**POST body** receiver 收到：
+
+```json
+{
+  "event": "mail",
+  "message": {
+    "id": 123, "from": "wiki", "to": "koatag",
+    "body": "...", "sent_at": "2026-05-23T01:30:00.000Z",
+    "in_reply_to": null, "expires_at": null, "has_attachments": false
+  },
+  "delivered_at": "2026-05-23T01:30:01.234Z"
+}
+```
+
+**Headers**：
+- `X-Mailbox-Sig: sha256=<hex hmac of body using webhook secret>`
+- `X-Mailbox-Webhook-Id: <int>`
+- `X-Mailbox-Delivery-Id: <int>`
+
+**Receiver 驗 HMAC 範例**：
+
+```python
+import mailbox_webhooks
+body = request.get_data()
+sig = request.headers.get("X-Mailbox-Sig", "")
+if not mailbox_webhooks.verify_signature(body, sig, MY_STORED_SECRET):
+    abort(401)
+```
+
+**Env vars**：
+
+| Var | Default | Purpose |
+|---|---|---|
+| `MAILBOX_WEBHOOKS_DISABLED` | (unset) | `1` = daemon idle，不 deliver。CLI register/list 仍可用 |
+
+**Retry**：每筆 delivery 最多重試 `MAX_ATTEMPTS=5` 次（每 daemon tick 嘗試一次，目前固定 5s tick = 25s total window）。超過就標 `failed`，留在 `webhook_deliveries` 表做 forensics，admin 可 `--test` 手動再 fire。
+
+**Filter**：`--to-glob` / `--from-glob` 用 `fnmatch` 比 message recipient/sender。兩個都 None = fire 所有訊息。
+
+**`/health` 多 4 欄**：`webhook_count`、`webhook_pending_deliveries`、`webhook_failed_deliveries`、`webhook_last_fired_at`。
+
+**Schema**：兩個新表 `webhooks` + `webhook_deliveries`，DDL 走 `mailbox_webhooks.init_schema()` 不塞進 messages executescript（避開 wiki #1 撞到的 partial-index ALTER trap）。
+
 ## Bridge / 周邊工具
 
 - `mailbox-discord-bridge.py` — Docker container `mailbox-bridge`（port 1904）。**Inbound only**：Discord DM → mailbox INSERT。Agent **不直接 call** 這個 port，是 Discord bot 自動推進來。看完整 e2e 流程圖：[Discord 整合：兩個 port，分工不對稱](#discord-整合兩個-port分工不對稱)
@@ -426,6 +493,7 @@ Relative：`30m` / `1h` / `7d`，由 hub/server 時鐘 + 該單位計算。null/
 - `mailbox-retention.py` — CLI，手動 trigger retention sweep / 看 stats / dry-run（hub-only）
 - `mailbox-backup.py` — CLI，手動打 backup / list / restore / stats（hub-only）
 - `mailbox-audit.py` — CLI，tail / filter / stats audit log（hub-only）
+- `mailbox-webhooks.py` — CLI，register/list/delete/tail outbound webhooks（hub-only）
 - `mailbox-dump.py` — 撈 mailbox 歷史；wiki session 有 slash command `/mblog` 跟 `/觀看紀錄` 包好
 - `mailbox-whitelist.py` — Discord 來源信任名單 CLI（trusted / approved / pending），see [discord-stranger-chat](https://github.com/OHIMEOPP/discord-stranger-chat) 設計
 

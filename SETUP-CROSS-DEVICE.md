@@ -999,6 +999,179 @@ py mailbox-retention.py --stats --json
 
 ---
 
+## Phase 9 — Outbound webhooks (since 2026-05-23)
+
+Register HTTP endpoints to receive a POST for every new mailbox message. Enables fan-out to Slack, custom dashboards, alerting systems, or any HTTP-aware bot — no polling the SQLite DB from the outside.
+
+### Architecture
+
+Daemon thread inside `mailbox-server.py` ticks every 5 seconds:
+
+1. Poll `messages` for `id > since_id` (high-water mark in memory; re-initialized to MAX(id) on server start)
+2. For each new message × each active webhook → INSERT into `webhook_deliveries` (deduped on `(webhook_id, message_id)` so re-runs are idempotent)
+3. For each row in `webhook_deliveries` with `status='pending'` and `attempts < MAX_ATTEMPTS=5`:
+   - Build payload + HMAC-SHA256 sig
+   - POST to webhook URL (10s timeout)
+   - On 2xx → mark `success`
+   - On error → bump `attempts`, retry next tick; mark `failed` once attempts exhausted
+
+This is **not** a `/send` inline hook — it's a polling daemon. Trade-off: ~2.5s average latency for ~zero contention with the write path (mailing-list fanout, TTL, FTS5 triggers, etc all keep their own performance budgets).
+
+### Schema
+
+```sql
+CREATE TABLE webhooks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    url TEXT NOT NULL,
+    secret_hmac TEXT NOT NULL,        -- shared key for HMAC sigs; treat as private
+    filter_to_glob TEXT,               -- fnmatch glob; null = match all `to`
+    filter_from_glob TEXT,             -- fnmatch glob; null = match all `from`
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    last_fired_at TEXT,
+    total_fires INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT
+);
+
+CREATE TABLE webhook_deliveries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    webhook_id INTEGER NOT NULL REFERENCES webhooks(id) ON DELETE CASCADE,
+    message_id INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',  -- pending | success | failed | skipped
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_attempt_at TEXT,
+    response_code INTEGER,
+    response_body TEXT,                -- truncated to 2048 chars
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE INDEX idx_webhook_deliveries_status ON webhook_deliveries(status, webhook_id);
+```
+
+Idempotent CREATE — safe on existing DBs. Owned by `mailbox_webhooks.init_schema()`, called from `db_init()` after the messages-table block (separate executescript to avoid ALTER traps, mirroring the audit_log pattern).
+
+### Wire format
+
+```
+POST <webhook.url>
+Content-Type: application/json; charset=utf-8
+X-Mailbox-Sig: sha256=<hex hmac of body using webhook.secret_hmac>
+X-Mailbox-Webhook-Id: <int>
+X-Mailbox-Delivery-Id: <int>
+
+{
+  "event": "mail",
+  "message": {
+    "id": 123,
+    "from": "wiki",
+    "to": "koatag",
+    "body": "...",
+    "sent_at": "2026-05-23T01:30:00.000Z",
+    "in_reply_to": null,
+    "expires_at": null,
+    "has_attachments": false
+  },
+  "delivered_at": "2026-05-23T01:30:01.234Z"
+}
+```
+
+### Config (env vars)
+
+| Var | Default | Purpose |
+|---|---|---|
+| `MAILBOX_WEBHOOKS_DISABLED` | (unset) | `1` = daemon idle; CLI still works |
+
+### Manual CLI (`mailbox-webhooks.py`)
+
+Hub-only. Operates directly on the DB:
+
+```powershell
+py mailbox-webhooks.py --add my-slack --url https://hooks.slack.com/...
+# Returns the generated secret_hmac — record it; receiver needs it to verify.
+
+py mailbox-webhooks.py --add koatag-only \
+    --url http://internal.example.com/hook \
+    --to-glob 'koatag*' --from-glob 'wiki'
+
+py mailbox-webhooks.py --list
+py mailbox-webhooks.py --list --show-secret   # dangerous, default masks it
+py mailbox-webhooks.py --tail-deliveries --status failed --limit 10
+py mailbox-webhooks.py --stats
+py mailbox-webhooks.py --deactivate 3
+py mailbox-webhooks.py --delete 3            # cascades deliveries
+
+py mailbox-webhooks.py --test 3              # run one delivery cycle now
+                                              # useful after fixing a failed receiver
+```
+
+### Receiver signature verification
+
+```python
+import mailbox_webhooks
+
+# Flask example
+@app.route('/mailbox-hook', methods=['POST'])
+def receive():
+    body = request.get_data()
+    sig = request.headers.get('X-Mailbox-Sig', '')
+    if not mailbox_webhooks.verify_signature(body, sig, MY_STORED_SECRET):
+        abort(401)
+    payload = request.get_json()
+    handle(payload)
+    return '', 204
+```
+
+`verify_signature()` uses `hmac.compare_digest` → constant-time, safe against timing attacks.
+
+### /health observability
+
+```bash
+curl http://<HUB_IP>:1905/health
+# {
+#   ...
+#   "webhook_count": 2,
+#   "webhook_pending_deliveries": 0,
+#   "webhook_failed_deliveries": 0,
+#   "webhook_last_fired_at": "2026-05-23T01:30:01.234Z"
+# }
+```
+
+`webhook_pending_deliveries` should stay near zero on healthy systems. If it grows persistently, either the daemon is stuck (check `MAILBOX_WEBHOOKS_DISABLED` env, restart server) or all your webhook URLs are dead.
+
+### Retry semantics
+
+- Max 5 attempts per delivery, one attempt per daemon tick (~5s apart)
+- Total retry window ≈ 25s for transient receiver failures
+- After exhaustion: `status='failed'`, frozen until admin `--test` re-fires
+- Webhook's `last_error` field captures the last failure message for forensics
+
+### What's NOT supported
+
+- **Exponential backoff**: simple linear retry; suitable for LAN/intranet receivers, less ideal for flaky public APIs. Future work.
+- **Custom payload templates**: payload shape is fixed. To transform, point the webhook at a thin adapter you control.
+- **Per-event-type filtering**: only `to` / `from` glob filters; `expires_at`-only or `in_reply_to`-only filters would need extending.
+- **TLS client cert auth**: HMAC + URL only. For mTLS, terminate at a reverse-proxy that adds the cert and rewrite scheme to `http`.
+- **Auto-disable on persistent failure**: a webhook with 100 failed deliveries keeps trying forever (well, MAX_ATTEMPTS each). Future work: auto-deactivate after N consecutive failures.
+- **Replay protection on receiver side**: receiver sees `delivered_at` + `delivery_id` headers, but mailbox doesn't reject replays itself. Receiver must dedup on `message.id` if relevant.
+
+### Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Webhook registered, no deliveries | `MAILBOX_WEBHOOKS_DISABLED=1` set; daemon idle | `unset` the env; restart server |
+| `webhook_pending_deliveries` grows unboundedly | Daemon dead OR all webhook URLs dead | `--tail-deliveries --status failed` shows last_error per row |
+| Receiver gets 0 POSTs after registration but DB has new messages | Filter glob excludes them | `py mailbox-webhooks.py --list` shows the glob; widen or null it |
+| HMAC verify fails on receiver | Wrong secret stored client-side OR body modified by intermediate proxy | re-fetch secret via `--list --show-secret`; rule out proxy rewrite |
+| `last_error: HTTP 500` after many attempts | Receiver crashed | fix receiver, then `--test <id>` to re-fire (creates a new tick, but failed rows stay failed; new messages trigger new deliveries) |
+| Message stays "pending" forever, attempts=0 | Daemon thread never started (server log will show no `[webhook] daemon start` line) | check for early exception in main() — usually a missing dependency. Restart with stderr captured. |
+| Deliveries succeed but show `attempts=N>1` | Receiver returned non-2xx on first try then 2xx | normal; the retry worked. inspect `response_code` history isn't kept — only last. |
+
+### What's NOT installed on the spoke
+
+Webhooks live entirely on the hub. Spokes never write to the webhook tables and have no daemon. The admin CLI `mailbox-webhooks.py` is hub-only.
+
+---
+
 ## What is NOT installed on the spoke
 
 You do **not** need on the laptop:
@@ -1009,6 +1182,7 @@ You do **not** need on the laptop:
 - `mailbox-retention.py` (hub-only — operates on hub's DB; spoke has no local DB)
 - `mailbox-backup.py` (hub-only — same reason as retention)
 - `mailbox-audit.py` (hub-only — spoke has no local audit table)
+- `mailbox-webhooks.py` (hub-only — webhook daemon + tables live on the hub)
 
 Just `server.py` (MCP, with REMOTE env) + `mailbox-watch.py` (SSE client).
 That's it.
