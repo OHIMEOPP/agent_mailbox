@@ -1,15 +1,20 @@
 """Send a Discord DM with file attachment(s) via the bridge.
 
+(Renamed 2026-05 from mailbox-send-file.py — that name was ambiguous because
+the cross-device mailbox now also has file transfer. This script ONLY targets
+the Discord bridge at :1904; for cross-device peer-to-peer file transfer over
+LAN/VPN see mailbox-attach.py.)
+
 Agent-side CLI (runs on host, reads files from host filesystem, POSTs as
 multipart to bridge :1904/agent-notify-file). Bridge then forwards via
 Discord REST API. No container mount changes needed — bytes go through the
 HTTP body.
 
 Usage:
-    py mailbox-send-file.py --task "screenshot" --detail "..." \\
+    py mailbox-discord-file.py --task "screenshot" --detail "..." \\
         --files C:/path/to/foo.png C:/path/to/bar.pdf
 
-    py mailbox-send-file.py --task "..." --files foo.png --channel <id> \\
+    py mailbox-discord-file.py --task "..." --files foo.png --channel <id> \\
         --agent wiki --status done
 
 Discord file size limit: 25 MB / file (50 MB Nitro Basic, 500 MB Nitro).

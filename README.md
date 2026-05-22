@@ -239,19 +239,59 @@ NOTIFY_URL = os.environ.get("CLAUDE_NOTIFY_URL", "http://localhost:1904/agent-no
 
 ---
 
-## MCP 工具（5 個）
+## MCP 工具（6 個）
 
 | Tool | 用途 |
 |---|---|
-| `send(to, body)` | 寄給某 instance |
-| `inbox(unread_only=true, limit=50)` | 收信 |
+| `send(to, body, files?=[])` | 寄給某 instance；`files` 是 host filesystem 路徑列表，多附件一起送 |
+| `inbox(unread_only=true, limit=50)` | 收信；每則訊息額外帶 `attachments: [{id, filename, mime, size, sha256}]` |
 | `mark_read(ids)` | 標記已讀 |
 | `peers()` | 列出曾連線過的 instance |
+| `download(attachment_id, save_to)` | 把附件 blob 拉到 local file path |
 | `whoami()` | 確認自己是誰、DB 在哪 |
+
+## 檔案 / Zip 傳輸（自 2026-05-23）
+
+Mailbox 可以順著訊息附帶檔案，hub ↔ spoke 之間用同一條 LAN/VPN 通道傳，不需要另外開 SMB / Syncthing。
+
+**邊界**：本質是 **event/message 附件**，不是 file sync engine。
+- ✅ 適合：screenshot / PDF / log / 設定檔；資料夾**自己 zip** 後當單檔送
+- ❌ 不適合：folder ongoing sync（兩台機器持續鏡像目錄 — 那是 Syncthing / Tailscale Drive 的工作）
+
+**限制**：單檔 100 MB、總 payload 500 MB、單訊息最多 32 個附件。超過會回 413。
+
+**Spoke watcher 預設不自動下載**——只在 stdout MAIL line 加 `attach=N` 提示。Agent 自己決定要不要呼 `download()` 拉 blob，避免 idle inbox 把 spoke 硬碟塞爆。
+
+**API surface**：
+```
+# 從 agent 內傳
+mcp__mailbox__send(to="wiki@LAPTOP", body="see attached zip",
+                   files=["C:/snapshots/wiki-2026-05-23.zip"])
+
+# 對端收到
+inbox()
+# → [{id: 42, from: "wiki@DESKTOP", body: "see attached zip",
+#     attachments: [{id: 7, filename: "wiki-2026-05-23.zip",
+#                    size: 4_521_887, sha256: "abc123..."}]}]
+
+mcp__mailbox__download(attachment_id=7, save_to="C:/tmp/wiki.zip")
+# → {path: "C:/tmp/wiki.zip", size: 4521887, sha256: "abc123..."}
+```
+
+**Shell-only CLI**（不經 MCP，直接打 hub HTTP endpoint）：
+```bash
+py mailbox-attach.py --from wiki@DESKTOP --to wiki@LAPTOP \
+    --body "snapshot" --files C:/tmp/wiki.zip
+```
+詳見 `mailbox-attach.py --help`。**注意**：別跟 `mailbox-discord-file.py`（推檔到 Discord DM 的，port 1904）搞混 — 那個 2026-05-23 改名了，這個 `mailbox-attach.py` 才是 cross-device peer ↔ peer 的。
+
+**Blob 儲存**：hub 端用 content-addressed 路徑 `<mailbox-dir>/attachments/<sha256[:2]>/<sha256>`，同 hash 自動 dedup。SSE event payload 加 `attachments: [{id, filename, mime, size}]` 欄位（additive，舊 spoke 不認該欄不會炸）。
 
 ## Bridge / 周邊工具
 
 - `mailbox-discord-bridge.py` — Docker container `mailbox-bridge`（port 1904）。**Inbound only**：Discord DM → mailbox INSERT。Agent **不直接 call** 這個 port，是 Discord bot 自動推進來。看完整 e2e 流程圖：[Discord 整合：兩個 port，分工不對稱](#discord-整合兩個-port分工不對稱)
+- `mailbox-discord-file.py` — CLI，推檔到使用者 Discord DM（port 1904 bridge），**走 Discord REST API**。跟下面 `mailbox-attach.py` 不同：那個是 agent ↔ agent，這個是 agent → Discord user。
+- `mailbox-attach.py` — CLI，cross-device 寄訊息+檔案到 peer agent mailbox（port 1905 hub server）。MCP `send(files=[...])` 的 shell 等價物。
 - `mailbox-dump.py` — 撈 mailbox 歷史；wiki session 有 slash command `/mblog` 跟 `/觀看紀錄` 包好
 - `mailbox-whitelist.py` — Discord 來源信任名單 CLI（trusted / approved / pending），see [discord-stranger-chat](https://github.com/OHIMEOPP/discord-stranger-chat) 設計
 

@@ -432,6 +432,102 @@ All 6 → cross-device setup complete.
 
 ---
 
+## Phase 4 — File / zip transfer (since 2026-05-23)
+
+Once cross-device mailbox is up, you can also push files between hub and spoke through the same `:1905` server. No extra container or port.
+
+### Endpoints
+
+```
+POST /send-file (multipart/form-data)
+  payload_json:  JSON {from, to, body}
+  files[0..N]:   one form-data part per file (any field name starting with "files")
+  → 200 {id, sent_at, attachments: [{id, filename, mime, size, sha256}]}
+
+GET /attachment/<id>
+  → 200 binary blob
+  Content-Disposition: attachment; filename="<ascii>"; filename*=UTF-8''<percent-encoded>
+  X-Mailbox-Sha256: <hex>
+```
+
+### Limits
+
+| | Default |
+|---|---|
+| Per-file | 100 MB |
+| Total payload | 500 MB |
+| Files per message | 32 |
+
+Set higher? Edit `MAX_SINGLE_FILE` / `MAX_TOTAL_PAYLOAD` / `MAX_FILES_PER_MSG` constants at the top of `mailbox-server.py` and restart the container.
+
+### Blob storage
+
+Content-addressed under `<db-parent>/attachments/<sha256[:2]>/<sha256>` (so in default deploy: `C:/Users/User/.claude/mailbox/attachments/...`). Same SHA across messages = same blob on disk (automatic dedup). Hub-only — spoke never stores blobs locally.
+
+### MCP tool surface
+
+`send(to, body, files=[...])` — same tool, optional `files` list of host filesystem paths.
+`download(attachment_id, save_to)` — explicit fetch; spoke watcher never auto-downloads.
+
+```python
+# Hub agent:
+mcp__mailbox__send(to="wiki@LAPTOP-XYZ", body="snapshot zip",
+                   files=["C:/tmp/snapshot.zip"])
+
+# Spoke agent later:
+inbox = mcp__mailbox__inbox()
+# → [{id, from, body, attachments: [{id, filename, size, sha256}]}]
+mcp__mailbox__download(attachment_id=N, save_to="C:/tmp/snapshot.zip")
+# → verifies sha256 against server-reported hash before saving
+```
+
+### CLI tool (no MCP)
+
+`mailbox-attach.py` — shell equivalent of `send(files=[...])`. Posts multipart to hub `/send-file`.
+
+```powershell
+py mailbox-attach.py --from wiki@DESKTOP-ABC --to wiki@LAPTOP-XYZ `
+    --body "config snapshot" --files C:/cfg/foo.json C:/cfg/bar.toml `
+    --hub http://192.168.1.10:1905 --token <bearer>
+```
+
+`--hub` / `--token` fall back to `CLAUDE_MAILBOX_REMOTE` / `CLAUDE_MAILBOX_TOKEN` env vars.
+
+> Don't confuse with `mailbox-discord-file.py` — that one pushes to Discord DM via the `:1904` bridge. `mailbox-attach.py` is peer ↔ peer mailbox over the `:1905` cross-device server.
+
+### Watcher behavior
+
+Stream-mode watcher emits `attach=N` on the MAIL stdout line when the message has attachments:
+
+```
+MAIL id=42 from=wiki@DESKTOP-ABC sent=2026-05-23T... attach=1 preview=snapshot zip
+```
+
+The watcher does NOT auto-download. Agent calls `download()` explicitly. Reason: an idle inbox shouldn't be able to fill the spoke's disk.
+
+### What about folders?
+
+The protocol takes individual files, not directories. For folder transfer, zip first:
+
+```powershell
+Compress-Archive -Path C:/wiki -DestinationPath C:/tmp/wiki.zip
+py mailbox-attach.py --from wiki@hub --to wiki@laptop --body "wiki snapshot" --files C:/tmp/wiki.zip
+```
+
+This is intentional — mailbox is a message queue with attachments, not a sync engine. For ongoing folder sync use Syncthing / Tailscale Drive instead.
+
+### Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| 413 on `/send-file` | exceeded MAX_SINGLE_FILE (100 MB) or MAX_TOTAL_PAYLOAD (500 MB) | split into multiple messages, or bump constants + restart server |
+| 400 "multipart parse failed" | client sent malformed multipart (boundary mismatch, missing `\r\n`) | use `mailbox-attach.py` or MCP `send(files=...)` — both use proven encoders |
+| Spoke watcher fires MAIL but no `attach=N` | spoke is on old `mailbox-watch.py` (pre-2026-05-23) | `git pull` mailbox repo on spoke, restart Monitor; SSE payload is backwards-compatible so old watcher still works, just doesn't print the tag |
+| `download()` returns sha256 mismatch error | network corruption mid-transfer (rare on LAN, possible over Tailscale on lossy link) | retry — server verifies file on disk has the original hash before serving |
+| Blob file missing on `/attachment/<id>` (500) | someone deleted from `<dir>/attachments/` manually | rare; investigate before re-sending. Server logs the path |
+
+---
+
 ## Troubleshooting
 
 | Symptom | Likely cause | Fix |
