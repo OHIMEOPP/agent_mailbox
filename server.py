@@ -164,7 +164,8 @@ def _init_db() -> None:
                 body       TEXT NOT NULL,
                 sent_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
                 read_at    TEXT,
-                has_attachments INTEGER NOT NULL DEFAULT 0
+                has_attachments INTEGER NOT NULL DEFAULT 0,
+                in_reply_to INTEGER
             );
             CREATE INDEX IF NOT EXISTS idx_messages_to_unread
                 ON messages(to_name, read_at);
@@ -187,10 +188,15 @@ def _init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_attach_sha ON attachments(sha256);
             """
         )
-        # Forward-compat: messages.has_attachments added later
+        # Forward-compat: idempotent column adds for existing DBs
         cols = {r[1] for r in c.execute("PRAGMA table_info(messages)").fetchall()}
         if "has_attachments" not in cols:
             c.execute("ALTER TABLE messages ADD COLUMN has_attachments INTEGER NOT NULL DEFAULT 0")
+        if "in_reply_to" not in cols:
+            c.execute("ALTER TABLE messages ADD COLUMN in_reply_to INTEGER")
+        # Index after ALTER (column may have just been added); IF NOT EXISTS safe.
+        c.execute("CREATE INDEX IF NOT EXISTS idx_messages_in_reply_to "
+                  "ON messages(in_reply_to) WHERE in_reply_to IS NOT NULL")
         c.execute(
             "INSERT INTO peers(name, last_seen_at) "
             "VALUES(?, strftime('%Y-%m-%dT%H:%M:%fZ','now')) "
@@ -226,7 +232,8 @@ mcp = FastMCP("mailbox")
 
 
 @mcp.tool()
-def send(to: str, body: str, files: list[str] | None = None) -> dict:
+def send(to: str, body: str, files: list[str] | None = None,
+         in_reply_to: int | None = None) -> dict:
     """Send a message (optionally with file attachments) to another Claude Code instance.
 
     Args:
@@ -235,9 +242,14 @@ def send(to: str, body: str, files: list[str] | None = None) -> dict:
         files: optional list of host filesystem paths to attach. Each file up to
                100 MB, total payload up to 500 MB. For folder transfer, zip
                first then attach the zip.
+        in_reply_to: optional message id this message is a reply to. Used by
+               mailbox-dump tree view to render conversation threads. Pass the
+               `id` from a prior inbox() entry. No FK enforcement — if the
+               parent was retention-pruned, the field becomes a broken chain
+               (rendered as orphan in dump).
 
     Returns:
-        {id, sent_at, from, to, attachments?: [{id, filename, mime, size, sha256}]}
+        {id, sent_at, from, to, in_reply_to?, attachments?: [{id, filename, mime, size, sha256}]}
     """
     if files:
         file_parts: list[tuple[str, str, bytes]] = []
@@ -248,13 +260,17 @@ def send(to: str, body: str, files: list[str] | None = None) -> dict:
             file_parts.append((p.name, _guess_mime(p.name), p.read_bytes()))
 
         if REMOTE:
+            body_payload: dict = {"from": NAME, "to": to, "body": body}
+            if in_reply_to is not None:
+                body_payload["in_reply_to"] = in_reply_to
             r = _remote_multipart(
                 "/send-file",
-                {"from": NAME, "to": to, "body": body},
+                body_payload,
                 file_parts,
             )
             return {
                 "id": r["id"], "sent_at": r["sent_at"], "from": NAME, "to": to,
+                "in_reply_to": in_reply_to,
                 "attachments": r["attachments"],
             }
 
@@ -265,9 +281,9 @@ def send(to: str, body: str, files: list[str] | None = None) -> dict:
             written.append({"filename": fname, "mime": mime, "size": size, "sha256": sha})
         with _connect() as c:
             row = c.execute(
-                "INSERT INTO messages(from_name, to_name, body, has_attachments) "
-                "VALUES(?, ?, ?, 1) RETURNING id, sent_at",
-                (NAME, to, body),
+                "INSERT INTO messages(from_name, to_name, body, has_attachments, in_reply_to) "
+                "VALUES(?, ?, ?, 1, ?) RETURNING id, sent_at",
+                (NAME, to, body, in_reply_to),
             ).fetchone()
             msg_id = row["id"]
             for w in written:
@@ -279,21 +295,27 @@ def send(to: str, body: str, files: list[str] | None = None) -> dict:
                 w["id"] = r2["id"]
         return {
             "id": msg_id, "sent_at": row["sent_at"], "from": NAME, "to": to,
+            "in_reply_to": in_reply_to,
             "attachments": written,
         }
 
-    # text-only path (unchanged behavior)
+    # text-only path
     if REMOTE:
-        r = _remote("POST", "/send", {"from": NAME, "to": to, "body": body})
-        return {"id": r["id"], "sent_at": r["sent_at"], "from": NAME, "to": to}
+        body_payload2: dict = {"from": NAME, "to": to, "body": body}
+        if in_reply_to is not None:
+            body_payload2["in_reply_to"] = in_reply_to
+        r = _remote("POST", "/send", body_payload2)
+        return {"id": r["id"], "sent_at": r["sent_at"], "from": NAME, "to": to,
+                "in_reply_to": in_reply_to}
 
     with _connect() as c:
         row = c.execute(
-            "INSERT INTO messages(from_name, to_name, body) "
-            "VALUES(?, ?, ?) RETURNING id, sent_at",
-            (NAME, to, body),
+            "INSERT INTO messages(from_name, to_name, body, in_reply_to) "
+            "VALUES(?, ?, ?, ?) RETURNING id, sent_at",
+            (NAME, to, body, in_reply_to),
         ).fetchone()
-    return {"id": row["id"], "sent_at": row["sent_at"], "from": NAME, "to": to}
+    return {"id": row["id"], "sent_at": row["sent_at"], "from": NAME, "to": to,
+            "in_reply_to": in_reply_to}
 
 
 @mcp.tool()
@@ -316,11 +338,12 @@ def inbox(unread_only: bool = True, limit: int = 50) -> list[dict]:
         return [
             {"id": m["id"], "from": m["from_name"], "body": m["body"],
              "sent_at": m["sent_at"], "read_at": m["read_at"],
+             "in_reply_to": m.get("in_reply_to"),
              "attachments": m.get("attachments", [])}
             for m in r["messages"]
         ]
 
-    sql = ("SELECT id, from_name, body, sent_at, read_at, has_attachments "
+    sql = ("SELECT id, from_name, body, sent_at, read_at, has_attachments, in_reply_to "
            "FROM messages WHERE to_name = ?")
     params: list = [NAME]
     if unread_only:
@@ -349,6 +372,7 @@ def inbox(unread_only: bool = True, limit: int = 50) -> list[dict]:
             out.append({
                 "id": r["id"], "from": r["from_name"], "body": r["body"],
                 "sent_at": r["sent_at"], "read_at": r["read_at"],
+                "in_reply_to": r["in_reply_to"],
                 "attachments": atts_by_msg.get(r["id"], []),
             })
     return out

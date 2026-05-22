@@ -88,7 +88,8 @@ def db_init(path: pathlib.Path):
             body TEXT NOT NULL,
             sent_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
             read_at TEXT,
-            has_attachments INTEGER NOT NULL DEFAULT 0
+            has_attachments INTEGER NOT NULL DEFAULT 0,
+            in_reply_to INTEGER
         );
         CREATE INDEX IF NOT EXISTS idx_to_unread
             ON messages(to_name, read_at);
@@ -108,10 +109,16 @@ def db_init(path: pathlib.Path):
         CREATE INDEX IF NOT EXISTS idx_attach_msg ON attachments(message_id);
         CREATE INDEX IF NOT EXISTS idx_attach_sha ON attachments(sha256);
     """)
-    # Forward-compat: if table existed before this column was added, add it.
+    # Forward-compat: idempotent column adds for existing DBs.
     cols = {r[1] for r in conn.execute("PRAGMA table_info(messages)").fetchall()}
     if "has_attachments" not in cols:
         conn.execute("ALTER TABLE messages ADD COLUMN has_attachments INTEGER NOT NULL DEFAULT 0")
+    if "in_reply_to" not in cols:
+        conn.execute("ALTER TABLE messages ADD COLUMN in_reply_to INTEGER")
+    # Index creation MUST come after ALTER (column may have just been added).
+    # Safe to always run — IF NOT EXISTS prevents duplicate-creation.
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_in_reply_to "
+                 "ON messages(in_reply_to) WHERE in_reply_to IS NOT NULL")
     conn.commit()
     conn.close()
 
@@ -292,8 +299,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._json(400, {"error": "missing name"})
             unread_only = first("unread", "1") in ("1", "true", "yes")
             limit = int(first("limit", "50"))
-            sql = ("SELECT id, from_name, to_name, body, sent_at, read_at, has_attachments "
-                   "FROM messages WHERE to_name=?")
+            sql = ("SELECT id, from_name, to_name, body, sent_at, read_at, has_attachments, "
+                   "in_reply_to FROM messages WHERE to_name=?")
             args: list = [name]
             if unread_only:
                 sql += " AND read_at IS NULL"
@@ -356,12 +363,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             for k in ("from", "to", "body"):
                 if k not in payload or not isinstance(payload[k], str):
                     return self._json(400, {"error": f"missing or non-string field: {k}"})
+            in_reply_to = payload.get("in_reply_to")
+            if in_reply_to is not None and not isinstance(in_reply_to, int):
+                return self._json(400, {"error": "in_reply_to must be integer or null"})
             conn = db_connect(srv.db_path)
             try:
                 row = conn.execute(
-                    "INSERT INTO messages(from_name, to_name, body) VALUES(?, ?, ?) "
+                    "INSERT INTO messages(from_name, to_name, body, in_reply_to) VALUES(?, ?, ?, ?) "
                     "RETURNING id, sent_at",
-                    (payload["from"], payload["to"], payload["body"]),
+                    (payload["from"], payload["to"], payload["body"], in_reply_to),
                 ).fetchone()
                 conn.execute(
                     "INSERT INTO peers(name, last_seen_at) "
@@ -432,6 +442,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         for k in ("from", "to", "body"):
             if k not in payload or not isinstance(payload[k], str):
                 return self._json(400, {"error": f"payload missing or non-string: {k}"})
+        in_reply_to = payload.get("in_reply_to")
+        if in_reply_to is not None and not isinstance(in_reply_to, int):
+            return self._json(400, {"error": "in_reply_to must be integer or null"})
 
         # Collect file parts: any field name like files[0], files[1], ... or "files"
         file_parts: list[tuple[str, dict]] = []
@@ -476,9 +489,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         conn = db_connect(srv.db_path)
         try:
             row = conn.execute(
-                "INSERT INTO messages(from_name, to_name, body, has_attachments) "
-                "VALUES(?, ?, ?, 1) RETURNING id, sent_at",
-                (payload["from"], payload["to"], payload["body"]),
+                "INSERT INTO messages(from_name, to_name, body, has_attachments, in_reply_to) "
+                "VALUES(?, ?, ?, 1, ?) RETURNING id, sent_at",
+                (payload["from"], payload["to"], payload["body"], in_reply_to),
             ).fetchone()
             msg_id = row["id"]
             attach_rows = []
@@ -583,7 +596,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 conn = db_connect(srv.db_path)
                 try:
                     rows = conn.execute(
-                        "SELECT id, from_name, to_name, body, sent_at, has_attachments "
+                        "SELECT id, from_name, to_name, body, sent_at, has_attachments, in_reply_to "
                         "FROM messages WHERE to_name=? AND id>? ORDER BY id ASC",
                         (name, last_id),
                     ).fetchall()
