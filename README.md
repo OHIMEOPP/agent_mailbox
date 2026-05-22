@@ -348,6 +348,48 @@ py mailbox-backup.py --restore 20260523-020000 --yes
 
 設定 / tuning 細節：[SETUP-CROSS-DEVICE.md Phase 6](SETUP-CROSS-DEVICE.md#phase-6--backup-since-2026-05-23)
 
+## 稽核 / Audit log（自 2026-05-23）
+
+Passive audit log — 所有 mailbox MCP tool call 跟 REST endpoint 都會在 `audit_log` 表留一筆 row（actor / action / target / payload_json / ok / ts）。事故重建、debug "誰寄了什麼"、找 download 流量分布都靠這個。
+
+| Action | Logged from |
+|---|---|
+| `send` | MCP `send()` + REST `/send` + `/send-file`（payload 帶 `msg_id` / `files_count` / `in_reply_to`） |
+| `inbox` | MCP `inbox()` + REST `/inbox`（payload 帶 `returned` 數量） |
+| `mark_read` | MCP `mark_read()` + REST `/mark_read`（payload 帶 `ids` / `marked`） |
+| `download` | MCP `download()` + REST `/attachment/<id>`（含失敗 case，`ok=0`） |
+| `whoami` | MCP `whoami()`（only local mode） |
+| `peers` | MCP `peers()` + REST `/peers` |
+
+**Actor 命名**：MCP local mode 寫 `CLAUDE_MAILBOX_NAME`（譬如 `wiki`、`koatag@LAPTOP-XYZ`）；REST endpoint 拿不到 caller 身分時用 `rest:<client-ip>`（譬如 `rest:192.168.1.50`），有 `from` 欄位的 endpoint（`/send`、`/send-file`）就用 `from` 值。
+
+**手動 CLI**：
+```bash
+py mailbox-audit.py --tail                  # 最近 50 筆
+py mailbox-audit.py --tail --limit 200
+py mailbox-audit.py --since 1h              # 相對時間：15m / 1h / 24h / 7d
+py mailbox-audit.py --actor wiki            # 只看某 actor
+py mailbox-audit.py --action send           # 只看某動作
+py mailbox-audit.py --actor wiki --action send --since 1h
+py mailbox-audit.py --stats                 # count + first/last + by_action 分布
+py mailbox-audit.py --tail --json           # machine-readable
+```
+
+**Env vars**：
+
+| Var | Default | Purpose |
+|---|---|---|
+| `MAILBOX_AUDIT_DISABLED` | (unset) | `1` = hot path 不寫 audit（讀仍 OK）。除非真的有 perf 顧慮否則別開 |
+
+**REST endpoint**：`/audit?since=...&until=...&actor=...&action=...&limit=N`，跟 CLI 同 filter（hub bearer auth 保護）。Spoke 想看 hub 端的 audit log 走這個。
+
+**`/health` 多出兩欄**：`audit_count`、`audit_last_at`。
+
+**設計約束**：
+- 表是 append-only — app code 沒 UPDATE/DELETE path（retention sweep 之後可加，但目前審計留全份）
+- `log_event()` 內部 catch all exceptions 不外拋 — audit 必須**不可以**讓被審計的 operation 失敗
+- Spoke (`CLAUDE_MAILBOX_REMOTE` 設了的 MCP server) **不**寫 local audit log — 它的 call 都進 hub，hub 已記。本機沒 DB 也沒 audit table。
+
 ## Bridge / 周邊工具
 
 - `mailbox-discord-bridge.py` — Docker container `mailbox-bridge`（port 1904）。**Inbound only**：Discord DM → mailbox INSERT。Agent **不直接 call** 這個 port，是 Discord bot 自動推進來。看完整 e2e 流程圖：[Discord 整合：兩個 port，分工不對稱](#discord-整合兩個-port分工不對稱)
@@ -355,6 +397,7 @@ py mailbox-backup.py --restore 20260523-020000 --yes
 - `mailbox-attach.py` — CLI，cross-device 寄訊息+檔案到 peer agent mailbox（port 1905 hub server）。MCP `send(files=[...])` 的 shell 等價物。
 - `mailbox-retention.py` — CLI，手動 trigger retention sweep / 看 stats / dry-run（hub-only）
 - `mailbox-backup.py` — CLI，手動打 backup / list / restore / stats（hub-only）
+- `mailbox-audit.py` — CLI，tail / filter / stats audit log（hub-only）
 - `mailbox-dump.py` — 撈 mailbox 歷史；wiki session 有 slash command `/mblog` 跟 `/觀看紀錄` 包好
 - `mailbox-whitelist.py` — Discord 來源信任名單 CLI（trusted / approved / pending），see [discord-stranger-chat](https://github.com/OHIMEOPP/discord-stranger-chat) 設計
 

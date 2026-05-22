@@ -29,6 +29,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+import mailbox_audit
 from mcp.server.fastmcp import FastMCP
 
 # ---------- Configuration ----------
@@ -207,6 +208,7 @@ def _init_db() -> None:
 
 if not REMOTE:
     _init_db()
+    mailbox_audit.init_schema(DB_PATH)
 
 
 def _write_blob(data: bytes) -> tuple[str, int]:
@@ -293,6 +295,11 @@ def send(to: str, body: str, files: list[str] | None = None,
                     (msg_id, w["filename"], w["mime"], w["size"], w["sha256"]),
                 ).fetchone()
                 w["id"] = r2["id"]
+        mailbox_audit.log_event(
+            DB_PATH, actor=NAME, action="send", target=to,
+            payload={"msg_id": msg_id, "body_len": len(body),
+                     "files_count": len(written), "in_reply_to": in_reply_to},
+        )
         return {
             "id": msg_id, "sent_at": row["sent_at"], "from": NAME, "to": to,
             "in_reply_to": in_reply_to,
@@ -314,6 +321,11 @@ def send(to: str, body: str, files: list[str] | None = None,
             "VALUES(?, ?, ?, ?) RETURNING id, sent_at",
             (NAME, to, body, in_reply_to),
         ).fetchone()
+    mailbox_audit.log_event(
+        DB_PATH, actor=NAME, action="send", target=to,
+        payload={"msg_id": row["id"], "body_len": len(body),
+                 "files_count": 0, "in_reply_to": in_reply_to},
+    )
     return {"id": row["id"], "sent_at": row["sent_at"], "from": NAME, "to": to,
             "in_reply_to": in_reply_to}
 
@@ -375,6 +387,10 @@ def inbox(unread_only: bool = True, limit: int = 50) -> list[dict]:
                 "in_reply_to": r["in_reply_to"],
                 "attachments": atts_by_msg.get(r["id"], []),
             })
+    mailbox_audit.log_event(
+        DB_PATH, actor=NAME, action="inbox",
+        payload={"unread_only": unread_only, "limit": limit, "returned": len(out)},
+    )
     return out
 
 
@@ -402,6 +418,10 @@ def mark_read(ids: list[int]) -> dict:
             f"WHERE id IN ({qmarks}) AND to_name = ? AND read_at IS NULL",
             list(ids) + [NAME],
         )
+    mailbox_audit.log_event(
+        DB_PATH, actor=NAME, action="mark_read",
+        payload={"ids": list(ids), "marked": cur.rowcount},
+    )
     return {"marked": cur.rowcount}
 
 
@@ -420,6 +440,10 @@ def peers() -> list[dict]:
         rows = c.execute(
             "SELECT name, last_seen_at FROM peers ORDER BY last_seen_at DESC"
         ).fetchall()
+    mailbox_audit.log_event(
+        DB_PATH, actor=NAME, action="peers",
+        payload={"count": len(rows)},
+    )
     return [{"name": r["name"], "last_seen_at": r["last_seen_at"]} for r in rows]
 
 
@@ -465,12 +489,28 @@ def download(attachment_id: int, save_to: str) -> dict:
             (attachment_id,),
         ).fetchone()
     if not row:
+        mailbox_audit.log_event(
+            DB_PATH, actor=NAME, action="download",
+            target=str(attachment_id),
+            payload={"error": "not_found"}, ok=False,
+        )
         raise RuntimeError(f"attachment {attachment_id} not found")
     assert ATTACHMENTS_DIR is not None
     src = ATTACHMENTS_DIR / row["sha256"][:2] / row["sha256"]
     if not src.exists():
+        mailbox_audit.log_event(
+            DB_PATH, actor=NAME, action="download",
+            target=str(attachment_id),
+            payload={"error": "blob_missing", "expected": str(src)}, ok=False,
+        )
         raise RuntimeError(f"blob missing at {src}")
     save_path.write_bytes(src.read_bytes())
+    mailbox_audit.log_event(
+        DB_PATH, actor=NAME, action="download",
+        target=str(attachment_id),
+        payload={"size": row["size"], "sha256": row["sha256"],
+                 "filename": row["filename"]},
+    )
     return {
         "path": str(save_path.absolute()),
         "size": row["size"],
@@ -483,6 +523,10 @@ def whoami() -> dict:
     """Return this instance's identity and where it reads/writes."""
     if REMOTE:
         return {"name": NAME, "mode": "remote", "hub": REMOTE}
+    mailbox_audit.log_event(
+        DB_PATH, actor=NAME, action="whoami",
+        payload={"mode": "local"},
+    )
     return {"name": NAME, "mode": "local", "db_path": str(DB_PATH.absolute())}
 
 

@@ -44,6 +44,7 @@ import threading
 import time
 import urllib.parse
 
+import mailbox_audit
 import mailbox_backup
 import mailbox_sweep
 
@@ -121,6 +122,9 @@ def db_init(path: pathlib.Path):
                  "ON messages(in_reply_to) WHERE in_reply_to IS NOT NULL")
     conn.commit()
     conn.close()
+    # Audit log is a separate concern — its own idempotent DDL; doesn't share
+    # the executescript above because mailbox_audit owns the table shape.
+    mailbox_audit.init_schema(path)
 
 
 def blob_path(attachments_dir: pathlib.Path, sha256: str) -> pathlib.Path:
@@ -286,6 +290,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 bk_stats = mailbox_backup.stats(srv.backup_dir)
                 payload.update(bk_stats)
                 payload["last_backup_counters"] = LAST_BACKUP_COUNTERS
+            # Merge audit stats — count + first/last + by_action breakdown
+            audit_stats = mailbox_audit.stats(srv.db_path)
+            payload["audit_count"] = audit_stats["audit_count"]
+            payload["audit_last_at"] = audit_stats["audit_last_at"]
             return self._json(200, payload)
 
         if not self._check_auth():
@@ -322,6 +330,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         r["attachments"] = []
             finally:
                 conn.close()
+            mailbox_audit.log_event(
+                srv.db_path, actor=name, action="inbox",
+                payload={"unread_only": unread_only, "limit": limit,
+                         "returned": len(rows)},
+            )
             return self._json(200, {"messages": rows})
 
         if path == "/peers":
@@ -331,10 +344,32 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         conn.execute("SELECT name, last_seen_at FROM peers ORDER BY last_seen_at DESC").fetchall()]
             finally:
                 conn.close()
+            mailbox_audit.log_event(
+                srv.db_path, actor=f"rest:{self.client_address[0]}",
+                action="peers", payload={"count": len(rows)},
+            )
             return self._json(200, {"peers": rows})
 
         if path == "/watch":
             return self._sse_watch(first("name").strip(), first("since"))
+
+        if path == "/audit":
+            # Filtered audit query. Limit hard-capped to avoid huge dumps over
+            # HTTP — paginate via since=<last_ts> for deeper history.
+            try:
+                limit = min(int(first("limit", "50")), 500)
+            except ValueError:
+                return self._json(400, {"error": "limit must be int"})
+            rows = mailbox_audit.query_audit(
+                srv.db_path,
+                since=first("since") or None,
+                until=first("until") or None,
+                actor=first("actor") or None,
+                action=first("action") or None,
+                limit=limit,
+                order_desc=first("asc") not in ("1", "true", "yes"),
+            )
+            return self._json(200, {"rows": rows, "count": len(rows)})
 
         # /attachment/<id>
         if path.startswith("/attachment/"):
@@ -382,6 +417,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 conn.commit()
             finally:
                 conn.close()
+            mailbox_audit.log_event(
+                srv.db_path, actor=payload["from"], action="send",
+                target=payload["to"],
+                payload={"msg_id": row["id"], "body_len": len(payload["body"]),
+                         "files_count": 0, "in_reply_to": in_reply_to},
+            )
             return self._json(200, {"id": row["id"], "sent_at": row["sent_at"]})
 
         if path == "/mark_read":
@@ -402,6 +443,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 count = cur.rowcount
             finally:
                 conn.close()
+            mailbox_audit.log_event(
+                srv.db_path, actor=f"rest:{self.client_address[0]}",
+                action="mark_read", payload={"ids": ids, "marked": count},
+            )
             return self._json(200, {"count": count})
 
         return self._json(404, {"error": "not found"})
@@ -518,6 +563,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         finally:
             conn.close()
 
+        mailbox_audit.log_event(
+            srv.db_path, actor=payload["from"], action="send",
+            target=payload["to"],
+            payload={"msg_id": msg_id, "body_len": len(payload["body"]),
+                     "files_count": len(attach_rows), "in_reply_to": in_reply_to,
+                     "attachment_ids": [a["id"] for a in attach_rows]},
+        )
         return self._json(200, {
             "id": msg_id,
             "sent_at": row["sent_at"],
@@ -541,10 +593,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
         finally:
             conn.close()
         if not row:
+            mailbox_audit.log_event(
+                srv.db_path, actor=f"rest:{self.client_address[0]}",
+                action="download", target=str(attach_id),
+                payload={"error": "not_found"}, ok=False,
+            )
             return self._json(404, {"error": "attachment not found"})
 
         path = blob_path(srv.attachments_dir, row["sha256"])
         if not path.exists():
+            mailbox_audit.log_event(
+                srv.db_path, actor=f"rest:{self.client_address[0]}",
+                action="download", target=str(attach_id),
+                payload={"error": "blob_missing", "expected": str(path)},
+                ok=False,
+            )
             return self._json(500, {"error": f"blob missing at {path}"})
 
         data = path.read_bytes()
@@ -554,6 +617,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         utf8_pct = urllib.parse.quote(filename, safe="")
         cd = f'attachment; filename="{ascii_fallback}"; filename*=UTF-8\'\'{utf8_pct}'
         mime = row["mime"] or "application/octet-stream"
+        mailbox_audit.log_event(
+            srv.db_path, actor=f"rest:{self.client_address[0]}",
+            action="download", target=str(attach_id),
+            payload={"size": row["size"], "sha256": row["sha256"],
+                     "filename": filename},
+        )
         return self._send_bytes(200, mime, data, extra_headers={
             "Content-Disposition": cd,
             "X-Mailbox-Sha256": row["sha256"],

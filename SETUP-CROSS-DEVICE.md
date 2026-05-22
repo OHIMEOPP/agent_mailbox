@@ -793,6 +793,113 @@ docker logs mailbox-server | grep backup
 
 ---
 
+## Phase 7 — Audit log (since 2026-05-23)
+
+Passive trail of every mailbox operation, written into `audit_log` alongside `messages`/`peers`/`attachments`. Powers forensics, "who downloaded this", "why is the send rate spiking", and post-mortem of any DB anomaly.
+
+### Schema
+
+```sql
+CREATE TABLE audit_log (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    actor        TEXT NOT NULL,        -- who did this
+    action       TEXT NOT NULL,        -- one of send/inbox/mark_read/download/whoami/peers
+    target       TEXT,                 -- recipient name / msg id / attachment id
+    payload_json TEXT,                 -- JSON blob, shape per action
+    ok           INTEGER NOT NULL DEFAULT 1
+);
+-- Plus three indexes: ts, (actor, ts), (action, ts)
+```
+
+DDL is idempotent (`CREATE TABLE IF NOT EXISTS`) and **not** in the same executescript as the messages-table migrations — `mailbox_audit.init_schema()` owns its table shape, called once at startup by both `server.py` and `mailbox-server.py`.
+
+### Write points
+
+| Where | When | Actor convention |
+|---|---|---|
+| `server.py` (MCP local mode) | each tool call after success | `NAME` env (e.g. `wiki`) |
+| `server.py` (MCP remote mode) | (not logged on spoke; hub records via REST endpoint) | n/a |
+| `mailbox-server.py` `/send` `/send-file` | after successful insert | payload `from` |
+| `mailbox-server.py` `/inbox` | after select | query-string `name` |
+| `mailbox-server.py` `/mark_read` | after update | `rest:<client-ip>` |
+| `mailbox-server.py` `/peers` | after select | `rest:<client-ip>` |
+| `mailbox-server.py` `/attachment/<id>` | success **and** failure (ok=0) | `rest:<client-ip>` |
+
+`log_event()` swallows all exceptions internally — audit must never break the audited operation. Failures go to stderr only.
+
+### Config (env vars)
+
+| Var | Default | Purpose |
+|---|---|---|
+| `MAILBOX_AUDIT_DISABLED` | (unset) | set to `1` to skip all `log_event()` writes (reads still work) |
+
+Use with care — without audit you lose forensic capability. Only flip when you have a documented perf problem.
+
+### REST endpoint
+
+```
+GET /audit?since=<ts>&until=<ts>&actor=<name>&action=<name>&limit=N&asc=0
+Authorization: Bearer <token>
+→ {rows: [{id, ts, actor, action, target, payload, ok}, ...], count: N}
+```
+
+`limit` hard-capped at 500 to prevent giant dumps. Paginate older history with `since=<last-ts-from-previous-page>`. `asc=1` to reverse order.
+
+### Manual CLI (`mailbox-audit.py`)
+
+Hub-only. Operates directly on the SQLite DB:
+
+```powershell
+py mailbox-audit.py --tail
+# default — last 50 rows, newest first
+
+py mailbox-audit.py --tail --limit 200 --since 24h
+
+py mailbox-audit.py --tail --actor wiki --action send --json
+
+py mailbox-audit.py --stats
+# audit_count + first_at + last_at + by_action breakdown
+```
+
+`--since` accepts ISO timestamps **or** relative (`15m` / `1h` / `24h` / `7d`).
+
+### /health observability
+
+```bash
+curl http://<HUB_IP>:1905/health
+# {
+#   ...
+#   "audit_count": 1247,
+#   "audit_last_at": "2026-05-22T22:14:33.881Z"
+# }
+```
+
+Use `audit_last_at` to spot stuck servers — if it falls far behind wall-clock during traffic, a connection / write path is broken.
+
+### Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `--tail` returns `(no audit rows matching filters)` after server traffic | `MAILBOX_AUDIT_DISABLED=1` set in server env, or you're querying a DB the server doesn't write to | check `docker compose config` for the env var; verify `--db` path matches the server's runtime db |
+| `[audit] log_event failed: ...` in server stderr | the audit module caught a DB error (lock / disk full / corrupt) and swallowed it | watch for repeat lines — single occurrence is fine, persistent failure means the underlying DB is unhealthy |
+| `audit_count` grows but disk barely moves | each row is ~150 bytes — even 1M rows is ~150 MB | not a problem; if it is, set `MAILBOX_AUDIT_DISABLED=1` and add to retention sweep |
+| `--action foo` rejected with rc=2 | `foo` not in the canonical action set | valid actions: `send / inbox / mark_read / download / whoami / peers` |
+| `/audit` returns 401 | missing `Authorization: Bearer <token>` header | same auth as all other REST endpoints (Phase 0) |
+| Spoke `mcp__mailbox__whoami()` doesn't show up in audit | spoke is in remote-mode and doesn't write local audit — the call hits the hub but `whoami` is not a REST endpoint | by design; whoami is identity introspection, not a state mutation, and the hub never sees it |
+
+### What's NOT audited
+
+- `/health` — public endpoint, polled by monitors; would drown the log
+- SSE `/watch` connections — these are long-poll fan-out; would log every poll tick
+- `mailbox_sweep` / `mailbox_backup` daemon actions — separate `/health` metrics already track these (`last_sweep_at`, `last_backup_at`)
+
+### Retention of the audit log itself
+
+Currently the audit table grows unbounded. When this becomes a problem, extend `mailbox_sweep.sweep_all()` to prune `audit_log` rows older than N days (env: `MAILBOX_AUDIT_RETENTION_DAYS` once implemented). For now: manually `DELETE FROM audit_log WHERE ts < ?` if needed.
+
+---
+
 ## What is NOT installed on the spoke
 
 You do **not** need on the laptop:
@@ -802,6 +909,7 @@ You do **not** need on the laptop:
 - `mailbox-whitelist.py` (admin tool — hub-only)
 - `mailbox-retention.py` (hub-only — operates on hub's DB; spoke has no local DB)
 - `mailbox-backup.py` (hub-only — same reason as retention)
+- `mailbox-audit.py` (hub-only — spoke has no local audit table)
 
 Just `server.py` (MCP, with REMOTE env) + `mailbox-watch.py` (SSE client).
 That's it.
