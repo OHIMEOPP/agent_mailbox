@@ -382,7 +382,10 @@ async def handle_zip_selected(request: web.Request) -> web.StreamResponse:
         return _forbidden()
 
     data = await request.post()
-    raw_ids = data.getall("ids") if hasattr(data, "getall") else []
+    # `getall(key)` raises KeyError when the key is absent (aiohttp's
+    # MultiDict semantics differ from MultiDictProxy here); pass an
+    # explicit default so an empty POST returns a clean 400 instead of 500.
+    raw_ids = data.getall("ids", []) if hasattr(data, "getall") else []
     attach_id_set: set[int] = set()
     for raw in raw_ids:
         if not raw.isdigit():
@@ -426,7 +429,9 @@ async def handle_delete(request: web.Request) -> web.Response:
         return _forbidden()
 
     data = await request.post()
-    ids = data.getall("ids") if hasattr(data, "getall") else []
+    # Same KeyError trap as handle_zip_selected — pass [] default so an
+    # empty form lands on the 400 below instead of a stack-trace 500.
+    ids = data.getall("ids", []) if hasattr(data, "getall") else []
     if not ids:
         return web.Response(status=400, text="no ids specified\n")
 
