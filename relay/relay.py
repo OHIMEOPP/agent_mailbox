@@ -11,7 +11,6 @@ Endpoints (all phone-side requests gated by `?token=<RELAY_TOKEN>`):
   GET  /thumb/<id>    → streaming proxy of hub /thumb/<id> (JPEG, cached on hub)
   GET  /zip/<ids>     → stream a zip of every attachment for one or more
                         comma-separated msg_ids (e.g. /zip/1090 or /zip/1117,1120)
-  POST /zip-selected  → form: ids=N&ids=M → stream zip of those attachments
   POST /delete        → form: ids=N&ids=M → DELETE each on hub → 303 → /list
 
 Env (set in docker-compose .env):
@@ -27,6 +26,7 @@ import asyncio
 import datetime
 import html
 import io
+import json
 import os
 import re
 import sys
@@ -370,60 +370,6 @@ async def _stream_zip_response(
     return resp
 
 
-async def handle_zip_selected(request: web.Request) -> web.StreamResponse:
-    """POST /zip-selected — zip a user-checked subset of attachments.
-
-    Form body: repeated `ids=<attachment_id>` from /list's bulk-form
-    (same checkbox set that feeds /delete). Streams a zip whose name
-    encodes the count + a short timestamp so multiple sequential
-    selections don't collide in the phone's Downloads folder.
-    """
-    if not _token_ok(request):
-        return _forbidden()
-
-    data = await request.post()
-    # `getall(key)` raises KeyError when the key is absent (aiohttp's
-    # MultiDict semantics differ from MultiDictProxy here); pass an
-    # explicit default so an empty POST returns a clean 400 instead of 500.
-    raw_ids = data.getall("ids", []) if hasattr(data, "getall") else []
-    attach_id_set: set[int] = set()
-    for raw in raw_ids:
-        if not raw.isdigit():
-            return web.Response(
-                status=400, text=f"ids must be integers, got {raw!r}\n")
-        attach_id_set.add(int(raw))
-    if not attach_id_set:
-        return web.Response(status=400, text="no ids selected\n")
-
-    session = request.app["session"]
-    list_url = f"{HUB_BASE}/attachments?to={MAILBOX_RECIPIENT}&limit=500"
-    try:
-        async with session.get(list_url, headers=HUB_HEADERS, timeout=10) as r:
-            if r.status != 200:
-                body = await r.text()
-                return web.Response(
-                    status=502,
-                    text=f"upstream /attachments returned {r.status}\n{body}\n",
-                )
-            data_j = await r.json()
-    except aiohttp.ClientError as e:
-        return web.Response(status=502, text=f"upstream unreachable: {e}\n")
-
-    target = [
-        a for a in data_j.get("attachments", [])
-        if int(a.get("id", -1)) in attach_id_set
-    ]
-    if not target:
-        return web.Response(
-            status=404,
-            text=f"no attachments for ids={sorted(attach_id_set)}\n",
-        )
-
-    ts = datetime.datetime.now().strftime("%m%d-%H%M")
-    zip_name = f"selection-{len(target)}files-{ts}.zip"
-    return await _stream_zip_response(request, session, target, zip_name)
-
-
 async def handle_delete(request: web.Request) -> web.Response:
     if not _token_ok(request):
         return _forbidden()
@@ -590,13 +536,17 @@ def _render_list_html(rows: list[dict]) -> str:
                 f'</details>'
             )
 
-        # Single form, two submit buttons via formaction. The bulk-form
-        # itself has no action (defaults to the page URL) so /list still
-        # works as a fallback if a button is missing its formaction.
+        # Bulk-form keeps the delete submit (POST → server-side fan-out
+        # delete via hub). "Download selected" used to also submit-zip but
+        # user wanted individual files, not a single archive, so that
+        # button now runs client-side JS that triggers one /file/<id>
+        # download per checked id (200ms stagger so mobile browsers don't
+        # dedupe the consecutive clicks). The per-group 📦 zip-link is
+        # still available for cases where a single archive is preferable.
         body = (
             f'<form id="bulk-form" method="post">'
-            f'<button type="submit" class="btn-download" '
-            f'formaction="/zip-selected{qs_token}">⬇️ 下載選取</button>'
+            f'<button type="button" class="btn-download" '
+            f'onclick="downloadSelected()">⬇️ 下載選取</button>'
             f'<button type="submit" class="btn-delete" '
             f'formaction="/delete{qs_token}" '
             f'onclick="return confirm(\'刪除選取的附件？此動作會清空 hub blob（無其他引用時）+ DB row，不影響 sender 原檔。\');">'
@@ -776,8 +726,26 @@ def _render_list_html(rows: list[dict]) -> str:
 </head>
 <body>
 <h1>📦 {html.escape(MAILBOX_RECIPIENT)} 收到的附件</h1>
-<p class="meta">{len(rows)} 個檔案 · 點檔名下載 · 勾選後按下方按鈕刪除</p>
+<p class="meta">{len(rows)} 個檔案 · 點檔名下載 · 勾選後上方按鈕「下載」逐檔抓 / 「刪除」清除</p>
 {body}
+<script>
+  const RELAY_TOKEN_Q = {json.dumps('?token=' + RELAY_TOKEN)};
+  function downloadSelected() {{
+    const checked = document.querySelectorAll('input[name="ids"]:checked');
+    if (checked.length === 0) {{ alert('沒選任何檔案'); return; }}
+    Array.from(checked).forEach((c, idx) => {{
+      setTimeout(() => {{
+        const a = document.createElement('a');
+        a.href = '/file/' + c.value + RELAY_TOKEN_Q;
+        a.setAttribute('download', '');
+        a.rel = 'noopener';
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+      }}, idx * 250);
+    }});
+  }}
+</script>
 </body>
 </html>
 """
@@ -808,7 +776,6 @@ def main() -> None:
     app.router.add_get(r"/file/{id:[0-9]+}", handle_file)
     app.router.add_get(r"/thumb/{id:[0-9]+}", handle_thumb)
     app.router.add_get(r"/zip/{msg_ids:[0-9,]+}", handle_zip)
-    app.router.add_post("/zip-selected", handle_zip_selected)
     app.router.add_post("/delete", handle_delete)
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
