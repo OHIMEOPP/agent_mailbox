@@ -8,6 +8,7 @@ Endpoints (all phone-side requests gated by `?token=<RELAY_TOKEN>`):
   GET  /health        → 200 "ok" (no token required)
   GET  /list          → HTML page listing attachments for MAILBOX_RECIPIENT
   GET  /file/<id>     → streaming proxy of hub /attachment/<id>
+  GET  /thumb/<id>    → streaming proxy of hub /thumb/<id> (JPEG, cached on hub)
   GET  /zip/<ids>     → stream a zip of every attachment for one or more
                         comma-separated msg_ids (e.g. /zip/1090 or /zip/1117,1120)
   POST /delete        → form: ids=N&ids=M → DELETE each on hub → 303 → /list
@@ -163,6 +164,54 @@ async def handle_file(request: web.Request) -> web.StreamResponse:
         await resp.prepare(request)
 
         async for chunk in upstream.content.iter_chunked(64 * 1024):
+            await resp.write(chunk)
+        await resp.write_eof()
+        return resp
+    finally:
+        await upstream_ctx.__aexit__(None, None, None)
+
+
+async def handle_thumb(request: web.Request) -> web.StreamResponse:
+    if not _token_ok(request):
+        return _forbidden()
+
+    attach_id = request.match_info["id"]
+    if not attach_id.isdigit():
+        return web.Response(status=400, text="attachment id must be integer\n")
+
+    width = request.query.get("w", "200")
+    if not width.isdigit():
+        return web.Response(status=400, text="w must be integer\n")
+
+    session = request.app["session"]
+    url = f"{HUB_BASE}/thumb/{attach_id}?w={width}"
+
+    try:
+        upstream_ctx = session.get(url, headers=HUB_HEADERS, timeout=30)
+        upstream = await upstream_ctx.__aenter__()
+    except aiohttp.ClientError as e:
+        return web.Response(status=502, text=f"upstream unreachable: {e}\n")
+
+    try:
+        if upstream.status != 200:
+            body = await upstream.read()
+            return web.Response(status=upstream.status, body=body)
+
+        headers = {
+            "Content-Type": upstream.headers.get("Content-Type", "image/jpeg"),
+            # Mirror hub's 24h cache so the phone browser stops re-fetching
+            # thumbs on every /list refresh.
+            "Cache-Control": upstream.headers.get(
+                "Cache-Control", "public, max-age=86400"
+            ),
+        }
+        cl = upstream.headers.get("Content-Length")
+        if cl:
+            headers["Content-Length"] = cl
+        resp = web.StreamResponse(status=200, headers=headers)
+        await resp.prepare(request)
+
+        async for chunk in upstream.content.iter_chunked(32 * 1024):
             await resp.write(chunk)
         await resp.write_eof()
         return resp
@@ -419,12 +468,15 @@ def _render_list_html(rows: list[dict]) -> str:
                 size = _human_size(r["size"])
                 row_when = _short_when(r["sent_at"])
                 file_href = f"/file/{r['id']}{qs_token}"
-                # Inline thumbnail for image MIME types. Same /file/<id> URL,
-                # phone scales it via CSS max-width — no server-side resize.
+                # Inline thumbnail for image MIME types. Pulls from hub's
+                # /thumb/<id> which Pillow-resizes + JPEG-caches (~10-30KB
+                # each) instead of sending the full original — phones loaded
+                # 50+ multi-MB PNGs in the original CSS-only build.
                 if (r["mime"] or "").startswith("image/"):
+                    thumb_src = f"/thumb/{r['id']}{qs_token}&w=200"
                     thumb_html = (
                         f'<a class="thumb-link" href="{file_href}">'
-                        f'<img class="thumb" src="{file_href}" alt="" '
+                        f'<img class="thumb" src="{thumb_src}" alt="" '
                         f'loading="lazy"></a> '
                     )
                 else:
@@ -673,6 +725,7 @@ def main() -> None:
     app.router.add_get("/health", handle_health)
     app.router.add_get("/list", handle_list)
     app.router.add_get(r"/file/{id:[0-9]+}", handle_file)
+    app.router.add_get(r"/thumb/{id:[0-9]+}", handle_thumb)
     app.router.add_get(r"/zip/{msg_ids:[0-9,]+}", handle_zip)
     app.router.add_post("/delete", handle_delete)
     app.on_startup.append(on_startup)

@@ -73,7 +73,8 @@ services:
 
   mailbox-server:
     # Cross-device REST + SSE for spoke agents (laptop, VPS, etc).
-    # Pure stdlib Python; no dependencies to install.
+    # Pillow is the only non-stdlib dep; installs at startup into the
+    # mailbox-server-pip-cache volume so container recreates are fast.
     image: python:3.12-slim
     container_name: mailbox-server
     restart: always
@@ -81,6 +82,9 @@ services:
       - "1905:1905"
     environment:
       - TZ=Asia/Taipei
+      # pip cache mount (see volumes:) so re-creating the container doesn't
+      # re-download Pillow's wheels every time.
+      - PIP_CACHE_DIR=/cache/pip
       # Required. Server refuses to start if unset or shorter than 16 chars.
       - CLAUDE_MAILBOX_TOKEN=${CLAUDE_MAILBOX_TOKEN:?CLAUDE_MAILBOX_TOKEN required (see .env.example)}
       # Retention policy (auto-sweep daily at server boot + 1hr grace).
@@ -108,18 +112,18 @@ services:
       # share the SAME mailbox dir as mailbox-bridge so both hit the same db
       # (backup dir defaults to /data/backups → host ~/.claude/mailbox/backups)
       - C:/Users/User/.claude/mailbox:/data
+      # named volume for pip cache so Pillow install survives recreate
+      - mailbox-server-pip-cache:/cache/pip
     working_dir: /app
     command:
-      - "python"
-      - "mailbox-server.py"
-      - "--host"
-      - "0.0.0.0"
-      - "--port"
-      - "1905"
-      - "--db"
-      - "/data/mailbox.db"
+      - "bash"
+      - "-c"
+      - "pip install --quiet 'Pillow>=11,<13' && exec python mailbox-server.py --host 0.0.0.0 --port 1905 --db /data/mailbox.db"
     networks:
       - animesite_other-networks-main
+
+volumes:
+  mailbox-server-pip-cache:
 
 networks:
   animesite_other-networks-main:

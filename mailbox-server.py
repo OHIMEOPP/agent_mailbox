@@ -13,6 +13,7 @@ Endpoints:
   GET  /attachment/<id>          → blob bytes + Content-Disposition
   DELETE /attachment/<id>        → remove DB row + blob (dedup-aware refcount)
   GET  /attachments?to=X&limit=N → flat attachment list for recipient X (DESC by id)
+  GET  /thumb/<id>?w=N           → resized JPEG (image/* only, cached by sha+w)
   GET  /inbox?name=X&unread=1    → list of messages (unread=0/1, limit=50)
   POST /mark_read                → JSON {ids:[...]} → {count}
   GET  /peers                    → list of known peers + last_seen_at
@@ -612,6 +613,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # /attachment/<id>
         if path.startswith("/attachment/"):
             return self._serve_attachment(path[len("/attachment/"):])
+
+        # /thumb/<id>?w=N — resized JPEG thumbnail of an image attachment.
+        if path.startswith("/thumb/"):
+            return self._serve_thumb(path[len("/thumb/"):], first("w", "200"))
 
         # /attachments?to=X&limit=N — flat list of attachments addressed to X.
         # Unlike /inbox (paginated by message, ORDER id ASC) this is paginated
@@ -1333,6 +1338,75 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return self._send_bytes(200, mime, data, extra_headers={
             "Content-Disposition": cd,
             "X-Mailbox-Sha256": row["sha256"],
+        })
+
+    def _serve_thumb(self, raw_id: str, raw_width: str):
+        """GET /thumb/<id>?w=N — resized JPEG thumbnail of an image attachment.
+
+        Thumbnails are content-addressed by (sha256, width) and cached on
+        disk under `<attachments_dir>/_thumbs/`, so each (blob, size) is
+        only encoded once. Aspect ratio is preserved via Pillow's
+        `Image.thumbnail` (longest edge fit inside the requested square).
+        Non-image MIMEs are rejected with 400.
+        """
+        srv = self.server
+        try:
+            attach_id = int(raw_id)
+        except ValueError:
+            return self._json(400, {"error": "attachment id must be integer"})
+        try:
+            width = int(raw_width)
+        except ValueError:
+            return self._json(400, {"error": "w must be integer"})
+        width = max(32, min(width, 512))
+
+        conn = db_connect(srv.db_path)
+        try:
+            row = conn.execute(
+                "SELECT filename, mime, sha256 FROM attachments WHERE id=?",
+                (attach_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+        if not row:
+            return self._json(404, {"error": "attachment not found"})
+        mime = (row["mime"] or "")
+        if not mime.startswith("image/"):
+            return self._json(400, {"error": "not an image",
+                                    "mime": mime or None})
+
+        sha = row["sha256"]
+        blob = blob_path(srv.attachments_dir, sha)
+        if not blob.exists():
+            return self._json(500, {"error": f"blob missing at {blob}"})
+
+        thumb_dir = pathlib.Path(srv.attachments_dir) / "_thumbs"
+        thumb_dir.mkdir(parents=True, exist_ok=True)
+        thumb_file = thumb_dir / f"{sha}_{width}.jpg"
+
+        if not thumb_file.exists():
+            try:
+                from PIL import Image, ImageOps
+            except ImportError:
+                return self._json(500, {"error": "Pillow not installed on hub"})
+            try:
+                with Image.open(blob) as im:
+                    im = ImageOps.exif_transpose(im)
+                    im.thumbnail((width, width), Image.LANCZOS)
+                    if im.mode not in ("RGB", "L"):
+                        im = im.convert("RGB")
+                    tmp = thumb_file.with_suffix(".jpg.tmp")
+                    im.save(tmp, "JPEG", quality=78, optimize=True,
+                            progressive=True)
+                tmp.replace(thumb_file)
+            except Exception as e:
+                return self._json(500, {"error": f"thumb encode failed: {e}"})
+
+        data = thumb_file.read_bytes()
+        return self._send_bytes(200, "image/jpeg", data, extra_headers={
+            # 24h browser cache — thumbs are immutable per (sha, width).
+            "Cache-Control": "public, max-age=86400",
+            "X-Mailbox-Sha256": sha,
         })
 
     def _delete_attachment(self, raw_id: str):
