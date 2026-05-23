@@ -266,17 +266,20 @@ def _render_list_html(rows: list[dict]) -> str:
                     f'<td class="when">{row_when}</td>'
                     f'</tr>'
                 )
+            # Default open if small group (≤5 files), collapsed otherwise to
+            # keep the page scannable when batches are large (e.g. 47 PNGs).
+            open_attr = " open" if count <= 5 else ""
             sections.append(
-                f'<section class="group">'
-                f'<h2 class="group-head">'
+                f'<details class="group"{open_attr}>'
+                f'<summary class="group-head">'
                 f'<span class="group-title">{html.escape(header_text)}</span>'
                 f'<span class="group-meta">{count} 檔 · {sender} · {when}</span>'
-                f'</h2>'
+                f'</summary>'
                 f'<table>'
                 f'<thead><tr><th></th><th>檔名</th><th>大小</th><th>類型</th><th>From</th><th>時間</th></tr></thead>'
                 f'<tbody>{"".join(tr_lines)}</tbody>'
                 f'</table>'
-                f'</section>'
+                f'</details>'
             )
 
         body = (
@@ -354,12 +357,12 @@ def _render_list_html(rows: list[dict]) -> str:
     cursor: pointer;
     accent-color: var(--link);
   }}
-  section.group {{ margin: 14px 0 22px; }}
-  h2.group-head {{
+  details.group {{ margin: 14px 0 22px; }}
+  details.group > summary.group-head {{
     font-size: 14px;
     font-weight: 600;
     margin: 0 0 8px;
-    padding: 8px 12px;
+    padding: 10px 12px 10px 36px;
     background: var(--head-bg);
     border-radius: 8px;
     display: flex;
@@ -367,7 +370,25 @@ def _render_list_html(rows: list[dict]) -> str:
     flex-wrap: wrap;
     align-items: baseline;
     line-height: 1.4;
+    cursor: pointer;
+    list-style: none;
+    position: relative;
+    user-select: none;
+    -webkit-tap-highlight-color: transparent;
   }}
+  details.group > summary.group-head::-webkit-details-marker {{ display: none; }}
+  details.group > summary.group-head::before {{
+    content: "▶";
+    position: absolute;
+    left: 14px;
+    top: 50%;
+    transform: translateY(-50%);
+    font-size: 11px;
+    color: var(--muted);
+    transition: transform 0.15s ease;
+  }}
+  details.group[open] > summary.group-head::before {{ transform: translateY(-50%) rotate(90deg); }}
+  details.group > summary.group-head:hover {{ filter: brightness(1.05); }}
   .group-title {{ white-space: pre-wrap; word-break: break-word; flex: 1 1 auto; min-width: 0; }}
   .group-meta {{ color: var(--muted); font-size: 12px; font-weight: 400; white-space: nowrap; }}
 
