@@ -11,6 +11,8 @@ Endpoints:
   POST /send                     → JSON {from, to, body} → {id, sent_at}
   POST /send-file                → multipart (payload_json + files[N]) → {id, sent_at, attachments:[...]}
   GET  /attachment/<id>          → blob bytes + Content-Disposition
+  DELETE /attachment/<id>        → remove DB row + blob (dedup-aware refcount)
+  GET  /attachments?to=X&limit=N → flat attachment list for recipient X (DESC by id)
   GET  /inbox?name=X&unread=1    → list of messages (unread=0/1, limit=50)
   POST /mark_read                → JSON {ids:[...]} → {count}
   GET  /peers                    → list of known peers + last_seen_at
@@ -611,6 +613,35 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path.startswith("/attachment/"):
             return self._serve_attachment(path[len("/attachment/"):])
 
+        # /attachments?to=X&limit=N — flat list of attachments addressed to X.
+        # Unlike /inbox (paginated by message, ORDER id ASC) this is paginated
+        # by attachment id DESC so newest files come first — what list-page
+        # UI consumers actually want.
+        if path == "/attachments":
+            name = first("to").strip()
+            if not name:
+                return self._json(400, {"error": "missing to"})
+            try:
+                limit = min(int(first("limit", "100")), 500)
+            except ValueError:
+                return self._json(400, {"error": "limit must be integer"})
+            conn = db_connect(srv.db_path)
+            try:
+                rows = conn.execute(
+                    "SELECT a.id, a.filename, a.mime, a.size, a.sha256, "
+                    "a.message_id, m.from_name, m.sent_at "
+                    "FROM attachments a JOIN messages m ON a.message_id=m.id "
+                    "WHERE m.to_name=? "
+                    "ORDER BY a.id DESC LIMIT ?",
+                    (name, limit),
+                ).fetchall()
+            finally:
+                conn.close()
+            return self._json(200, {
+                "attachments": [dict(r) for r in rows],
+                "count": len(rows),
+            })
+
         return self._json(404, {"error": "not found"})
 
     def do_POST(self):
@@ -1075,6 +1106,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         return self._json(404, {"error": "not found"})
 
+    def do_DELETE(self):
+        path, _, _ = self.path.partition("?")
+
+        if not self._check_auth():
+            return self._json(401, {"error": "missing or invalid bearer token"})
+
+        # /attachment/<id> — remove DB row + blob (if dedup-refcount == 0).
+        if path.startswith("/attachment/"):
+            return self._delete_attachment(path[len("/attachment/"):])
+
+        return self._json(404, {"error": "not found"})
+
     def _handle_send_file(self):
         """POST /send-file — multipart with payload_json + files[N]."""
         srv = self.server
@@ -1290,6 +1333,86 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return self._send_bytes(200, mime, data, extra_headers={
             "Content-Disposition": cd,
             "X-Mailbox-Sha256": row["sha256"],
+        })
+
+    def _delete_attachment(self, raw_id: str):
+        """DELETE /attachment/<id> — remove DB row + blob if last reference.
+
+        The blob is content-addressed (one file on disk per unique sha256),
+        and multiple attachment rows can share the same sha (mailbox dedups
+        identical bytes). So the blob is only safe to unlink when no other
+        row references it.
+        """
+        srv = self.server
+        try:
+            attach_id = int(raw_id)
+        except ValueError:
+            return self._json(400, {"error": "attachment id must be integer"})
+
+        conn = db_connect(srv.db_path)
+        try:
+            row = conn.execute(
+                "SELECT filename, size, sha256 FROM attachments WHERE id=?",
+                (attach_id,),
+            ).fetchone()
+            if not row:
+                conn.close()
+                mailbox_audit.log_event(
+                    srv.db_path, actor=f"rest:{self.client_address[0]}",
+                    action="delete_attachment", target=str(attach_id),
+                    payload={"error": "not_found"}, ok=False,
+                )
+                return self._json(404, {"error": "attachment not found"})
+
+            sha = row["sha256"]
+            filename = row["filename"]
+            size = row["size"]
+
+            # Count OTHER rows that still reference this blob.
+            other_refs = conn.execute(
+                "SELECT COUNT(*) FROM attachments WHERE sha256=? AND id<>?",
+                (sha, attach_id),
+            ).fetchone()[0]
+
+            conn.execute("DELETE FROM attachments WHERE id=?", (attach_id,))
+            conn.commit()
+        finally:
+            conn.close()
+
+        blob_deleted = False
+        path = blob_path(srv.attachments_dir, sha)
+        if other_refs == 0 and path.exists():
+            try:
+                path.unlink()
+                blob_deleted = True
+            except OSError as e:
+                # DB row already removed; surface the disk error in audit
+                # but still return success (the user-facing reference is gone).
+                mailbox_audit.log_event(
+                    srv.db_path, actor=f"rest:{self.client_address[0]}",
+                    action="delete_attachment_blob_unlink_failed",
+                    target=str(attach_id),
+                    payload={"sha256": sha, "path": str(path), "errno": e.errno,
+                             "msg": str(e)},
+                    ok=False,
+                )
+
+        mailbox_audit.log_event(
+            srv.db_path, actor=f"rest:{self.client_address[0]}",
+            action="delete_attachment", target=str(attach_id),
+            payload={
+                "filename": filename, "size": size, "sha256": sha,
+                "other_refs": other_refs, "blob_deleted": blob_deleted,
+            },
+        )
+        return self._json(200, {
+            "ok": True,
+            "id": attach_id,
+            "filename": filename,
+            "size": size,
+            "sha256": sha,
+            "other_refs": other_refs,
+            "blob_deleted": blob_deleted,
         })
 
     def _handle_search(self, first):
