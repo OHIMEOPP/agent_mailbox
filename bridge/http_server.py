@@ -12,6 +12,7 @@ import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from .config import DISCORD_DEFAULT_CHANNEL
+from .gateway import gateway_state
 from .inbound import process_discord_inbound
 from .notify import discord_send_dm, format_notify_message
 
@@ -170,7 +171,12 @@ def make_handler(db_path):
 
         def do_GET(self):
             if self.path == '/healthz':
-                return self._json(200, {'ok': True, 'db': db_path})
+                gs = gateway_state()
+                # If we expected a gateway (token + lib present) and it's not
+                # online, fail healthcheck so docker / orchestration sees it.
+                ok = not (gs["expected"] and not gs["online"])
+                code = 200 if ok else 503
+                return self._json(code, {'ok': ok, 'db': db_path, 'gateway': gs})
             return self._json(404, {'ok': False})
 
     return Handler
