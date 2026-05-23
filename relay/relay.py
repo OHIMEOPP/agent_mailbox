@@ -8,7 +8,8 @@ Endpoints (all phone-side requests gated by `?token=<RELAY_TOKEN>`):
   GET  /health        → 200 "ok" (no token required)
   GET  /list          → HTML page listing attachments for MAILBOX_RECIPIENT
   GET  /file/<id>     → streaming proxy of hub /attachment/<id>
-  GET  /zip/<msg_id>  → stream a zip of every attachment in that message group
+  GET  /zip/<ids>     → stream a zip of every attachment for one or more
+                        comma-separated msg_ids (e.g. /zip/1090 or /zip/1117,1120)
   POST /delete        → form: ids=N&ids=M → DELETE each on hub → 303 → /list
 
 Env (set in docker-compose .env):
@@ -173,14 +174,21 @@ async def handle_zip(request: web.Request) -> web.StreamResponse:
     if not _token_ok(request):
         return _forbidden()
 
-    msg_id = request.match_info["msg_id"]
-    if not msg_id.isdigit():
-        return web.Response(status=400, text="msg_id must be integer\n")
+    raw = request.match_info["msg_ids"]
+    msg_id_set: set[int] = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if not part.isdigit():
+            return web.Response(
+                status=400,
+                text=f"msg_ids must be comma-separated integers, got {part!r}\n",
+            )
+        msg_id_set.add(int(part))
 
     session = request.app["session"]
-    # Fetch the same flat attachment list /list uses, then filter to this group.
-    # limit=500 covers our largest observed batch (ComfyUI/output 47 PNGs); if
-    # someone ever sends >500 in one message we'd lose tail — fine for now.
+    # Fetch the same flat attachment list /list uses, then filter to the union
+    # of requested msg_ids. limit=500 covers our largest observed batch
+    # (ComfyUI/output 47 PNGs); if someone ever sends >500 we'd lose tail.
     list_url = f"{HUB_BASE}/attachments?to={MAILBOX_RECIPIENT}&limit=500"
     try:
         async with session.get(list_url, headers=HUB_HEADERS, timeout=10) as r:
@@ -196,18 +204,23 @@ async def handle_zip(request: web.Request) -> web.StreamResponse:
 
     target = [
         a for a in data.get("attachments", [])
-        if str(a.get("message_id")) == msg_id
+        if int(a.get("message_id", -1)) in msg_id_set
     ]
     if not target:
-        return web.Response(status=404, text=f"no attachments for msg_id={msg_id}\n")
+        return web.Response(
+            status=404,
+            text=f"no attachments for msg_ids={sorted(msg_id_set)}\n",
+        )
 
-    # Derive a friendly zip filename from the message body's first line, else
-    # fall back to msg-<id>. Strip anything that isn't word/CJK/dash/underscore
-    # so the Content-Disposition value stays sane across phone download UIs.
-    msg_body = (target[0].get("message_body") or "").strip()
-    first_line = msg_body.splitlines()[0] if msg_body else ""
-    safe = re.sub(r"[^\w\-一-鿿]+", "_", first_line).strip("_")[:60]
-    zip_name = f"{safe or f'msg-{msg_id}'}.zip"
+    # Derive a friendly zip filename from the first message body's normalized
+    # first line. _normalize_body strips per-message variable counts so
+    # "ComfyUI/output (auto-sync, 4 檔)" → "ComfyUI/output". Sanitise so the
+    # Content-Disposition value stays sane across phone download UIs.
+    msg_body = (target[0].get("message_body") or "")
+    label = _normalize_body(msg_body)
+    safe = re.sub(r"[^\w\-一-鿿]+", "_", label).strip("_")[:60]
+    fallback = f"msg-{min(msg_id_set)}"
+    zip_name = f"{safe or fallback}.zip"
     ascii_fallback = zip_name.encode("ascii", errors="replace").decode("ascii")
     cd = (
         f'attachment; filename="{ascii_fallback}"; '
@@ -343,35 +356,58 @@ def _short_when(iso: str) -> str:
         return iso[:16]
 
 
+def _normalize_body(body: str) -> str:
+    """Reduce a message body to a stable group title.
+
+    Strips parentheticals that carry a per-message variable count (e.g.
+    folder-sync's "ComfyUI/output (auto-sync, 4 檔)") so successive sends
+    with different counts collapse into one group.
+    """
+    first_line = (body or "").strip().splitlines()[0] if body else ""
+    first_line = re.sub(
+        r"\s*\([^()]*\d+\s*(檔|files?)\s*[^()]*\)\s*$",
+        "",
+        first_line,
+    ).strip()
+    if len(first_line) > 80:
+        first_line = first_line[:80] + "…"
+    return first_line
+
+
 def _render_list_html(rows: list[dict]) -> str:
     qs_token = f"?token={RELAY_TOKEN}"
     if not rows:
         body = '<p class="empty">沒有附件。</p>'
     else:
-        # Group consecutive rows sharing the same msg_id. Hub returns
-        # ORDER BY a.id DESC; attachments of a single send share msg_id
-        # and adjacent ids, so this groups them into one section labelled
-        # by the message body (which the sender chose as the "folder").
+        # Group rows by (sender, normalized_body). Same source + same logical
+        # "folder name" merge into one section regardless of how many separate
+        # mailbox messages it took (folder-sync emits one message per detected
+        # batch, so a single logical "folder" gets sliced across many msg_ids).
+        # Order = first appearance in the DESC stream → newest groups on top.
         groups: list[dict] = []
-        current: dict | None = None
+        groups_by_key: dict[tuple, dict] = {}
         for r in rows:
-            if current is None or current["msg_id"] != r["msg_id"]:
-                current = {
-                    "msg_id": r["msg_id"],
+            key = (r["from"], _normalize_body(r["msg_body"]))
+            g = groups_by_key.get(key)
+            if g is None:
+                g = {
                     "from": r["from"],
+                    "title": key[1] or "(沒有訊息標題)",
                     "sent_at": r["sent_at"],
-                    "body": r["msg_body"],
+                    "msg_ids": set(),
                     "rows": [],
                 }
-                groups.append(current)
-            current["rows"].append(r)
+                groups_by_key[key] = g
+                groups.append(g)
+            g["rows"].append(r)
+            g["msg_ids"].add(r["msg_id"])
+            # Latest sent_at across the merged messages — surfaced in header.
+            if r["sent_at"] and r["sent_at"] > g["sent_at"]:
+                g["sent_at"] = r["sent_at"]
 
         sections = []
         for g in groups:
-            raw_body = (g["body"] or "").strip()
-            header_text = raw_body.splitlines()[0] if raw_body else "(沒有訊息標題)"
-            if len(header_text) > 80:
-                header_text = header_text[:80] + "…"
+            header_text = g["title"]
             sender = html.escape(g["from"])
             when = _short_when(g["sent_at"])
             count = len(g["rows"])
@@ -407,8 +443,11 @@ def _render_list_html(rows: list[dict]) -> str:
             # keep the page scannable when batches are large (e.g. 47 PNGs).
             open_attr = " open" if count <= 5 else ""
             # Zip-all link sits inside <summary> with stopPropagation so the
-            # click downloads without toggling the group open/closed.
-            zip_href = f"/zip/{g['msg_id']}{qs_token}"
+            # click downloads without toggling the group open/closed. Path is
+            # comma-joined msg_ids so handle_zip can fan-out one DB query and
+            # filter on the union — folder-sync merged groups end up here too.
+            msg_ids_path = ",".join(str(m) for m in sorted(g["msg_ids"]))
+            zip_href = f"/zip/{msg_ids_path}{qs_token}"
             zip_link = (
                 f'<a class="zip-link" href="{zip_href}" '
                 f'onclick="event.stopPropagation()">📦 打包下載</a>'
@@ -634,7 +673,7 @@ def main() -> None:
     app.router.add_get("/health", handle_health)
     app.router.add_get("/list", handle_list)
     app.router.add_get(r"/file/{id:[0-9]+}", handle_file)
-    app.router.add_get(r"/zip/{msg_id:[0-9]+}", handle_zip)
+    app.router.add_get(r"/zip/{msg_ids:[0-9,]+}", handle_zip)
     app.router.add_post("/delete", handle_delete)
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
