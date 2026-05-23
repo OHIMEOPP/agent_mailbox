@@ -1,0 +1,48 @@
+# mailbox-relay — spoke-side streaming proxy.
+#
+# Phone (on spoke's hotspot LAN) hits this; nginx streams the file from
+# hub's mailbox-server :1905/attachment/<id> over VPN. Bytes pass through
+# RAM only — no file lands on this spoke's disk.
+#
+# This is SPOKE-side. Hub doesn't need it (hub already serves on 1905).
+#
+# Setup (on a spoke machine):
+#   1. cp .env.example .env
+#   2. Edit .env — set RELAY_TOKEN (random secret) + HUB_VPN_IP +
+#      HUB_TOKEN (same as your spoke's CLAUDE_MAILBOX_TOKEN)
+#   3. docker compose up -d
+#   4. From phone (connected to this spoke's hotspot), open browser:
+#      http://<spoke-hotspot-ip>:1906/file/<attach-id>?token=<RELAY_TOKEN>
+#
+# Apply config changes (after editing .env or templates/):
+#   docker compose up -d --force-recreate
+
+services:
+  mailbox-relay:
+    image: nginx:stable-alpine
+    container_name: mailbox-relay
+    restart: always
+    ports:
+      - "${RELAY_PORT:-1906}:80"
+    environment:
+      - TZ=Asia/Taipei
+      # Phone-side shared secret. Generate with: openssl rand -hex 24
+      - RELAY_TOKEN=${RELAY_TOKEN:?RELAY_TOKEN required — see .env.example}
+      # Hub address reachable from this spoke (VPN IP). Get it from hub:
+      #   tailscale ip   (or  ipconfig / ifconfig for LAN)
+      - HUB_VPN_IP=${HUB_VPN_IP:?HUB_VPN_IP required — see .env.example}
+      - HUB_PORT=${HUB_PORT:-1905}
+      # Hub mailbox-server Bearer token. Same as your spoke's
+      # CLAUDE_MAILBOX_TOKEN env (the one your spoke's MCP server uses).
+      - HUB_TOKEN=${HUB_TOKEN:?HUB_TOKEN required — see .env.example}
+      # Limit envsubst to OUR variables — leave nginx's $arg_token, $1,
+      # $remote_addr, etc untouched at config render time.
+      - NGINX_ENVSUBST_FILTER=^(RELAY_|HUB_)
+    volumes:
+      - ./templates:/etc/nginx/templates:ro
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
