@@ -8,6 +8,7 @@ Endpoints (all phone-side requests gated by `?token=<RELAY_TOKEN>`):
   GET  /health        → 200 "ok" (no token required)
   GET  /list          → HTML page listing attachments for MAILBOX_RECIPIENT
   GET  /file/<id>     → streaming proxy of hub /attachment/<id>
+  GET  /zip/<msg_id>  → stream a zip of every attachment in that message group
   POST /delete        → form: ids=N&ids=M → DELETE each on hub → 303 → /list
 
 Env (set in docker-compose .env):
@@ -22,9 +23,12 @@ Env (set in docker-compose .env):
 import asyncio
 import datetime
 import html
+import io
 import os
+import re
 import sys
-from urllib.parse import urlencode
+import zipfile
+from urllib.parse import quote, urlencode
 
 import aiohttp
 from aiohttp import web
@@ -165,6 +169,129 @@ async def handle_file(request: web.Request) -> web.StreamResponse:
         await upstream_ctx.__aexit__(None, None, None)
 
 
+async def handle_zip(request: web.Request) -> web.StreamResponse:
+    if not _token_ok(request):
+        return _forbidden()
+
+    msg_id = request.match_info["msg_id"]
+    if not msg_id.isdigit():
+        return web.Response(status=400, text="msg_id must be integer\n")
+
+    session = request.app["session"]
+    # Fetch the same flat attachment list /list uses, then filter to this group.
+    # limit=500 covers our largest observed batch (ComfyUI/output 47 PNGs); if
+    # someone ever sends >500 in one message we'd lose tail — fine for now.
+    list_url = f"{HUB_BASE}/attachments?to={MAILBOX_RECIPIENT}&limit=500"
+    try:
+        async with session.get(list_url, headers=HUB_HEADERS, timeout=10) as r:
+            if r.status != 200:
+                body = await r.text()
+                return web.Response(
+                    status=502,
+                    text=f"upstream /attachments returned {r.status}\n{body}\n",
+                )
+            data = await r.json()
+    except aiohttp.ClientError as e:
+        return web.Response(status=502, text=f"upstream unreachable: {e}\n")
+
+    target = [
+        a for a in data.get("attachments", [])
+        if str(a.get("message_id")) == msg_id
+    ]
+    if not target:
+        return web.Response(status=404, text=f"no attachments for msg_id={msg_id}\n")
+
+    # Derive a friendly zip filename from the message body's first line, else
+    # fall back to msg-<id>. Strip anything that isn't word/CJK/dash/underscore
+    # so the Content-Disposition value stays sane across phone download UIs.
+    msg_body = (target[0].get("message_body") or "").strip()
+    first_line = msg_body.splitlines()[0] if msg_body else ""
+    safe = re.sub(r"[^\w\-一-鿿]+", "_", first_line).strip("_")[:60]
+    zip_name = f"{safe or f'msg-{msg_id}'}.zip"
+    ascii_fallback = zip_name.encode("ascii", errors="replace").decode("ascii")
+    cd = (
+        f'attachment; filename="{ascii_fallback}"; '
+        f"filename*=UTF-8''{quote(zip_name, safe='')}"
+    )
+
+    resp = web.StreamResponse(
+        status=200,
+        headers={
+            "Content-Type": "application/zip",
+            "Cache-Control": "no-store",
+            "Content-Disposition": cd,
+        },
+    )
+    # Length unknown ahead of time → chunked encoding (aiohttp default when
+    # no Content-Length set).
+    await resp.prepare(request)
+
+    # Streaming zip: write each entry to an in-memory buffer (ZIP_STORED, no
+    # compression — PNG/zip payloads aren't worth re-compressing), flush the
+    # buffer to the response after each entry, then write the central
+    # directory at end. Peak RAM = largest single attachment.
+    buf = io.BytesIO()
+    zf = zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_STORED,
+                         allowZip64=True)
+
+    async def _flush() -> None:
+        chunk = buf.getvalue()
+        if chunk:
+            await resp.write(chunk)
+        buf.seek(0)
+        buf.truncate(0)
+
+    seen_names: dict[str, int] = {}
+    for a in target:
+        attach_id = a["id"]
+        raw_name = a.get("filename") or f"attach-{attach_id}"
+        # Dedupe within the zip — if the same filename appears twice, suffix
+        # the second occurrence so unzip tools don't silently overwrite.
+        n = seen_names.get(raw_name, 0)
+        if n > 0:
+            stem, dot, ext = raw_name.rpartition(".")
+            if dot:
+                fname = f"{stem}_{n}.{ext}"
+            else:
+                fname = f"{raw_name}_{n}"
+        else:
+            fname = raw_name
+        seen_names[raw_name] = n + 1
+
+        file_url = f"{HUB_BASE}/attachment/{attach_id}"
+        try:
+            async with session.get(file_url, headers=HUB_HEADERS,
+                                   timeout=120) as upstream:
+                if upstream.status != 200:
+                    # Skip with a stub entry so user sees which file failed.
+                    zf.writestr(
+                        f"{fname}.ERROR.txt",
+                        f"hub /attachment/{attach_id} returned "
+                        f"{upstream.status}\n",
+                    )
+                    await _flush()
+                    continue
+                chunks: list[bytes] = []
+                async for c in upstream.content.iter_chunked(64 * 1024):
+                    chunks.append(c)
+                payload = b"".join(chunks)
+        except aiohttp.ClientError as e:
+            zf.writestr(
+                f"{fname}.ERROR.txt",
+                f"hub /attachment/{attach_id} unreachable: {e}\n",
+            )
+            await _flush()
+            continue
+
+        zf.writestr(fname, payload)
+        await _flush()
+
+    zf.close()
+    await _flush()
+    await resp.write_eof()
+    return resp
+
+
 async def handle_delete(request: web.Request) -> web.Response:
     if not _token_ok(request):
         return _forbidden()
@@ -256,10 +383,20 @@ def _render_list_html(rows: list[dict]) -> str:
                 size = _human_size(r["size"])
                 row_when = _short_when(r["sent_at"])
                 file_href = f"/file/{r['id']}{qs_token}"
+                # Inline thumbnail for image MIME types. Same /file/<id> URL,
+                # phone scales it via CSS max-width — no server-side resize.
+                if (r["mime"] or "").startswith("image/"):
+                    thumb_html = (
+                        f'<a class="thumb-link" href="{file_href}">'
+                        f'<img class="thumb" src="{file_href}" alt="" '
+                        f'loading="lazy"></a> '
+                    )
+                else:
+                    thumb_html = ""
                 tr_lines.append(
                     f'<tr>'
                     f'<td><input type="checkbox" name="ids" value="{r["id"]}" form="del-form"></td>'
-                    f'<td><a href="{file_href}">{fname}</a></td>'
+                    f'<td class="name-cell">{thumb_html}<a href="{file_href}">{fname}</a></td>'
                     f'<td class="size">{size}</td>'
                     f'<td class="mime">{mime}</td>'
                     f'<td class="from">{row_sender}</td>'
@@ -269,11 +406,19 @@ def _render_list_html(rows: list[dict]) -> str:
             # Default open if small group (≤5 files), collapsed otherwise to
             # keep the page scannable when batches are large (e.g. 47 PNGs).
             open_attr = " open" if count <= 5 else ""
+            # Zip-all link sits inside <summary> with stopPropagation so the
+            # click downloads without toggling the group open/closed.
+            zip_href = f"/zip/{g['msg_id']}{qs_token}"
+            zip_link = (
+                f'<a class="zip-link" href="{zip_href}" '
+                f'onclick="event.stopPropagation()">📦 打包下載</a>'
+            )
             sections.append(
                 f'<details class="group"{open_attr}>'
                 f'<summary class="group-head">'
                 f'<span class="group-title">{html.escape(header_text)}</span>'
                 f'<span class="group-meta">{count} 檔 · {sender} · {when}</span>'
+                f'{zip_link}'
                 f'</summary>'
                 f'<table>'
                 f'<thead><tr><th></th><th>檔名</th><th>大小</th><th>類型</th><th>From</th><th>時間</th></tr></thead>'
@@ -391,6 +536,32 @@ def _render_list_html(rows: list[dict]) -> str:
   details.group > summary.group-head:hover {{ filter: brightness(1.05); }}
   .group-title {{ white-space: pre-wrap; word-break: break-word; flex: 1 1 auto; min-width: 0; }}
   .group-meta {{ color: var(--muted); font-size: 12px; font-weight: 400; white-space: nowrap; }}
+  .zip-link {{
+    font-size: 12px;
+    font-weight: 500;
+    padding: 6px 10px;
+    background: var(--link);
+    color: var(--bg);
+    border-radius: 6px;
+    white-space: nowrap;
+    flex: 0 0 auto;
+    text-decoration: none;
+    min-height: 28px;
+    display: inline-flex;
+    align-items: center;
+  }}
+  .zip-link:hover {{ filter: brightness(1.1); }}
+  .zip-link:active {{ filter: brightness(0.9); color: var(--bg); }}
+  img.thumb {{
+    max-width: 64px;
+    max-height: 64px;
+    vertical-align: middle;
+    margin-right: 8px;
+    border-radius: 4px;
+    background: var(--row-alt);
+    object-fit: cover;
+  }}
+  .thumb-link {{ display: inline-block; vertical-align: middle; }}
 
   /* ---------- desktop / tablet (≥600px): table layout ---------- */
   @media (min-width: 600px) {{
@@ -422,6 +593,7 @@ def _render_list_html(rows: list[dict]) -> str:
     tr td:nth-child(1) {{ grid-area: check; align-self: start; padding-top: 4px; }}
     tr td:nth-child(2) {{ grid-area: name; font-size: 16px; line-height: 1.4; }}
     tr td:nth-child(2) a {{ display: inline-block; padding: 6px 0; min-height: 32px; }}
+    tr td:nth-child(2) img.thumb {{ max-width: 96px; max-height: 96px; display: block; margin: 0 0 6px; }}
     tr td:nth-child(3) {{ grid-area: size; color: var(--muted); font-size: 12px; }}
     tr td:nth-child(6) {{ grid-area: when; color: var(--muted); font-size: 12px; text-align: right; white-space: nowrap; }}
     /* hide mime + from on phone (low signal, eat space) */
@@ -462,6 +634,7 @@ def main() -> None:
     app.router.add_get("/health", handle_health)
     app.router.add_get("/list", handle_list)
     app.router.add_get(r"/file/{id:[0-9]+}", handle_file)
+    app.router.add_get(r"/zip/{msg_id:[0-9]+}", handle_zip)
     app.router.add_post("/delete", handle_delete)
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
