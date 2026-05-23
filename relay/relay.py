@@ -545,6 +545,8 @@ def _render_list_html(rows: list[dict]) -> str:
         # still available for cases where a single archive is preferable.
         body = (
             f'<form id="bulk-form" method="post">'
+            f'<button type="button" class="btn-selectall" '
+            f'onclick="toggleAll()">☑️ 全選 / 全不選</button>'
             f'<button type="button" class="btn-download" '
             f'onclick="downloadSelected()">⬇️ 下載選取</button>'
             f'<button type="submit" class="btn-delete" '
@@ -613,9 +615,10 @@ def _render_list_html(rows: list[dict]) -> str:
     min-height: 44px;
     touch-action: manipulation;
   }}
+  .btn-selectall {{ background: var(--muted); }}
   .btn-download {{ background: var(--link); }}
   .btn-delete {{ background: var(--danger); }}
-  .btn-download:active, .btn-delete:active {{ filter: brightness(0.9); }}
+  .btn-selectall:active, .btn-download:active, .btn-delete:active {{ filter: brightness(0.9); }}
   .empty {{ color: var(--muted); text-align: center; padding: 40px 0; }}
   input[type="checkbox"] {{
     width: 22px;
@@ -730,6 +733,11 @@ def _render_list_html(rows: list[dict]) -> str:
 {body}
 <script>
   const RELAY_TOKEN_Q = {json.dumps('?token=' + RELAY_TOKEN)};
+  function toggleAll() {{
+    const boxes = document.querySelectorAll('input[name="ids"]');
+    const allChecked = boxes.length > 0 && Array.from(boxes).every(b => b.checked);
+    boxes.forEach(b => {{ b.checked = !allChecked; }});
+  }}
   function downloadSelected() {{
     const checked = document.querySelectorAll('input[name="ids"]:checked');
     if (checked.length === 0) {{ alert('沒選任何檔案'); return; }}
