@@ -11,6 +11,7 @@ Endpoints (all phone-side requests gated by `?token=<RELAY_TOKEN>`):
   GET  /thumb/<id>    → streaming proxy of hub /thumb/<id> (JPEG, cached on hub)
   GET  /zip/<ids>     → stream a zip of every attachment for one or more
                         comma-separated msg_ids (e.g. /zip/1090 or /zip/1117,1120)
+  POST /zip-selected  → form: ids=N&ids=M → stream zip of those attachments
   POST /delete        → form: ids=N&ids=M → DELETE each on hub → 303 → /list
 
 Env (set in docker-compose .env):
@@ -276,6 +277,26 @@ async def handle_zip(request: web.Request) -> web.StreamResponse:
         f"filename*=UTF-8''{quote(zip_name, safe='')}"
     )
 
+    return await _stream_zip_response(request, session, target, zip_name)
+
+
+async def _stream_zip_response(
+    request: web.Request,
+    session: aiohttp.ClientSession,
+    attachments: list[dict],
+    zip_name: str,
+) -> web.StreamResponse:
+    """Stream a ZIP_STORED archive of `attachments` (list of dicts with at
+    least `id` and `filename`). Bytes flow chunk-by-chunk; peak RAM = the
+    largest single attachment because each entry needs a CRC computed up
+    front before we can flush.
+    """
+    ascii_fallback = zip_name.encode("ascii", errors="replace").decode("ascii")
+    cd = (
+        f'attachment; filename="{ascii_fallback}"; '
+        f"filename*=UTF-8''{quote(zip_name, safe='')}"
+    )
+
     resp = web.StreamResponse(
         status=200,
         headers={
@@ -288,10 +309,6 @@ async def handle_zip(request: web.Request) -> web.StreamResponse:
     # no Content-Length set).
     await resp.prepare(request)
 
-    # Streaming zip: write each entry to an in-memory buffer (ZIP_STORED, no
-    # compression — PNG/zip payloads aren't worth re-compressing), flush the
-    # buffer to the response after each entry, then write the central
-    # directory at end. Peak RAM = largest single attachment.
     buf = io.BytesIO()
     zf = zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_STORED,
                          allowZip64=True)
@@ -304,11 +321,11 @@ async def handle_zip(request: web.Request) -> web.StreamResponse:
         buf.truncate(0)
 
     seen_names: dict[str, int] = {}
-    for a in target:
+    for a in attachments:
         attach_id = a["id"]
         raw_name = a.get("filename") or f"attach-{attach_id}"
-        # Dedupe within the zip — if the same filename appears twice, suffix
-        # the second occurrence so unzip tools don't silently overwrite.
+        # Dedupe within the zip — same filename twice gets a numbered
+        # suffix so unzip tools don't silently overwrite.
         n = seen_names.get(raw_name, 0)
         if n > 0:
             stem, dot, ext = raw_name.rpartition(".")
@@ -325,7 +342,6 @@ async def handle_zip(request: web.Request) -> web.StreamResponse:
             async with session.get(file_url, headers=HUB_HEADERS,
                                    timeout=120) as upstream:
                 if upstream.status != 200:
-                    # Skip with a stub entry so user sees which file failed.
                     zf.writestr(
                         f"{fname}.ERROR.txt",
                         f"hub /attachment/{attach_id} returned "
@@ -352,6 +368,57 @@ async def handle_zip(request: web.Request) -> web.StreamResponse:
     await _flush()
     await resp.write_eof()
     return resp
+
+
+async def handle_zip_selected(request: web.Request) -> web.StreamResponse:
+    """POST /zip-selected — zip a user-checked subset of attachments.
+
+    Form body: repeated `ids=<attachment_id>` from /list's bulk-form
+    (same checkbox set that feeds /delete). Streams a zip whose name
+    encodes the count + a short timestamp so multiple sequential
+    selections don't collide in the phone's Downloads folder.
+    """
+    if not _token_ok(request):
+        return _forbidden()
+
+    data = await request.post()
+    raw_ids = data.getall("ids") if hasattr(data, "getall") else []
+    attach_id_set: set[int] = set()
+    for raw in raw_ids:
+        if not raw.isdigit():
+            return web.Response(
+                status=400, text=f"ids must be integers, got {raw!r}\n")
+        attach_id_set.add(int(raw))
+    if not attach_id_set:
+        return web.Response(status=400, text="no ids selected\n")
+
+    session = request.app["session"]
+    list_url = f"{HUB_BASE}/attachments?to={MAILBOX_RECIPIENT}&limit=500"
+    try:
+        async with session.get(list_url, headers=HUB_HEADERS, timeout=10) as r:
+            if r.status != 200:
+                body = await r.text()
+                return web.Response(
+                    status=502,
+                    text=f"upstream /attachments returned {r.status}\n{body}\n",
+                )
+            data_j = await r.json()
+    except aiohttp.ClientError as e:
+        return web.Response(status=502, text=f"upstream unreachable: {e}\n")
+
+    target = [
+        a for a in data_j.get("attachments", [])
+        if int(a.get("id", -1)) in attach_id_set
+    ]
+    if not target:
+        return web.Response(
+            status=404,
+            text=f"no attachments for ids={sorted(attach_id_set)}\n",
+        )
+
+    ts = datetime.datetime.now().strftime("%m%d-%H%M")
+    zip_name = f"selection-{len(target)}files-{ts}.zip"
+    return await _stream_zip_response(request, session, target, zip_name)
 
 
 async def handle_delete(request: web.Request) -> web.Response:
@@ -483,7 +550,7 @@ def _render_list_html(rows: list[dict]) -> str:
                     thumb_html = ""
                 tr_lines.append(
                     f'<tr>'
-                    f'<td><input type="checkbox" name="ids" value="{r["id"]}" form="del-form"></td>'
+                    f'<td><input type="checkbox" name="ids" value="{r["id"]}" form="bulk-form"></td>'
                     f'<td class="name-cell">{thumb_html}<a href="{file_href}">{fname}</a></td>'
                     f'<td class="size">{size}</td>'
                     f'<td class="mime">{mime}</td>'
@@ -518,10 +585,17 @@ def _render_list_html(rows: list[dict]) -> str:
                 f'</details>'
             )
 
+        # Single form, two submit buttons via formaction. The bulk-form
+        # itself has no action (defaults to the page URL) so /list still
+        # works as a fallback if a button is missing its formaction.
         body = (
-            f'<form id="del-form" method="post" action="/delete{qs_token}" '
-            f'onsubmit="return confirm(\'刪除選取的附件？此動作會清空 hub blob（無其他引用時）+ DB row，不影響 sender 原檔。\');">'
-            f'<button type="submit">🗑️ 刪除選取</button>'
+            f'<form id="bulk-form" method="post">'
+            f'<button type="submit" class="btn-download" '
+            f'formaction="/zip-selected{qs_token}">⬇️ 下載選取</button>'
+            f'<button type="submit" class="btn-delete" '
+            f'formaction="/delete{qs_token}" '
+            f'onclick="return confirm(\'刪除選取的附件？此動作會清空 hub blob（無其他引用時）+ DB row，不影響 sender 原檔。\');">'
+            f'🗑️ 刪除選取</button>'
             f'</form>'
             + "".join(sections)
         )
@@ -577,14 +651,16 @@ def _render_list_html(rows: list[dict]) -> str:
   button {{
     font-size: 15px;
     padding: 12px 18px;
-    margin: 8px 0;
-    background: var(--danger);
+    margin: 8px 6px 8px 0;
     color: var(--danger-fg);
     border: none;
     border-radius: 8px;
     min-height: 44px;
     touch-action: manipulation;
   }}
+  .btn-download {{ background: var(--link); }}
+  .btn-delete {{ background: var(--danger); }}
+  .btn-download:active, .btn-delete:active {{ filter: brightness(0.9); }}
   .empty {{ color: var(--muted); text-align: center; padding: 40px 0; }}
   input[type="checkbox"] {{
     width: 22px;
@@ -727,6 +803,7 @@ def main() -> None:
     app.router.add_get(r"/file/{id:[0-9]+}", handle_file)
     app.router.add_get(r"/thumb/{id:[0-9]+}", handle_thumb)
     app.router.add_get(r"/zip/{msg_ids:[0-9,]+}", handle_zip)
+    app.router.add_post("/zip-selected", handle_zip_selected)
     app.router.add_post("/delete", handle_delete)
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
