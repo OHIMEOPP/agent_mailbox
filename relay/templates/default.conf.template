@@ -13,16 +13,16 @@ server {
     listen 80 default_server;
     server_name _;
 
-    # DNS resolver for proxy_pass when HUB_VPN_IP is a hostname (not an IP).
-    # nginx forces runtime DNS when proxy_pass URL contains variables, so this
-    # is required even though the container can resolve via libc. 127.0.0.11
-    # is Docker's embedded DNS; replace if running outside Docker.
+    # DNS resolver needed because proxy_pass below contains an nginx capture
+    # variable (`$1`), which forces nginx into runtime DNS regardless of
+    # whether HUB_VPN_IP itself is a hostname or a literal IP after envsubst.
+    # 127.0.0.11 is Docker's embedded DNS; replace if running outside Docker.
     resolver 127.0.0.11 valid=30s ipv6=off;
 
-    # Tiny landing page so phones that hit the root see something useful.
+    # Root returns 404 to avoid leaking product name / path hints to anyone
+    # who happens to scan the hotspot. Legit users always hit /file/<id>?token.
     location = / {
-        default_type text/plain;
-        return 200 "mailbox-relay\nUse /file/<attachment-id>?token=...\n";
+        return 404;
     }
 
     # Liveness probe (used by docker healthcheck).
@@ -33,6 +33,12 @@ server {
 
     # The actual streaming relay. Phone hits this with the attachment id.
     location ~ ^/file/([0-9]+)$ {
+        # Don't log the ?token= query string — it's a shared secret. Default
+        # access_log writes the full URI including args; if the spoke machine
+        # is later seized / logs uploaded, the token would be exposed.
+        # /health and other paths keep logging via the server-level default.
+        access_log off;
+
         # Phone-side token check. Cheap defense against random hotspot guests.
         # For stronger auth, layer one-time tokens or TLS+client-cert.
         if ($arg_token != "${RELAY_TOKEN}") {
@@ -44,7 +50,9 @@ server {
         # connection; phone never sees hub's token.
         proxy_pass http://${HUB_VPN_IP}:${HUB_PORT}/attachment/$1;
         proxy_set_header Authorization "Bearer ${HUB_TOKEN}";
-        proxy_set_header Host $host;
+        # Set Host to hub's address (not phone's $host), so any hub-side Host
+        # validation passes and audit logs reflect the actual upstream.
+        proxy_set_header Host "${HUB_VPN_IP}:${HUB_PORT}";
         proxy_set_header X-Forwarded-For $remote_addr;
 
         # Streaming: do NOT buffer the upstream response to disk.
