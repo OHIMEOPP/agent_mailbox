@@ -253,20 +253,106 @@ def _render_list_html(rows: list[dict]) -> str:
 <html lang="zh-Hant">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>mailbox 附件</title>
 <style>
-  body {{ font-family: -apple-system, "Segoe UI", sans-serif; padding: 12px; max-width: 720px; margin: 0 auto; }}
+  :root {{
+    --bg: #ffffff;
+    --fg: #1a1a1a;
+    --muted: #666;
+    --border: #e5e5e5;
+    --row-alt: #fafafa;
+    --link: #0066cc;
+    --link-active: #cc4400;
+    --danger: #d33;
+    --danger-fg: #ffffff;
+    --head-bg: #f6f6f6;
+  }}
+  @media (prefers-color-scheme: dark) {{
+    :root {{
+      --bg: #1a1a1a;
+      --fg: #e8e8e8;
+      --muted: #999;
+      --border: #333;
+      --row-alt: #222;
+      --link: #4ea1ff;
+      --link-active: #ff8a3d;
+      --danger: #c44;
+      --head-bg: #2a2a2a;
+    }}
+  }}
+  * {{ box-sizing: border-box; }}
+  html, body {{ background: var(--bg); color: var(--fg); }}
+  body {{
+    font-family: -apple-system, "Segoe UI", "Noto Sans CJK TC", sans-serif;
+    padding: 12px;
+    padding-left: max(12px, env(safe-area-inset-left));
+    padding-right: max(12px, env(safe-area-inset-right));
+    padding-bottom: max(12px, env(safe-area-inset-bottom));
+    max-width: 720px;
+    margin: 0 auto;
+    -webkit-text-size-adjust: 100%;
+  }}
   h1 {{ font-size: 18px; margin: 0 0 12px; }}
-  .meta {{ color: #666; font-size: 12px; margin-bottom: 12px; }}
-  table {{ width: 100%; border-collapse: collapse; }}
-  th, td {{ text-align: left; padding: 8px 6px; border-bottom: 1px solid #eee; font-size: 13px; }}
-  th {{ background: #f6f6f6; }}
-  td.size, td.mime, td.when, td.from {{ color: #555; font-size: 12px; white-space: nowrap; }}
-  a {{ color: #0077cc; text-decoration: none; word-break: break-all; }}
-  a:active {{ color: #cc4400; }}
-  button {{ font-size: 14px; padding: 8px 14px; margin: 8px 0; background: #d33; color: white; border: none; border-radius: 6px; }}
-  .empty {{ color: #888; text-align: center; padding: 40px 0; }}
+  .meta {{ color: var(--muted); font-size: 12px; margin-bottom: 12px; }}
+  a {{ color: var(--link); text-decoration: none; word-break: break-all; }}
+  a:active {{ color: var(--link-active); }}
+  button {{
+    font-size: 15px;
+    padding: 12px 18px;
+    margin: 8px 0;
+    background: var(--danger);
+    color: var(--danger-fg);
+    border: none;
+    border-radius: 8px;
+    min-height: 44px;
+    touch-action: manipulation;
+  }}
+  .empty {{ color: var(--muted); text-align: center; padding: 40px 0; }}
+  input[type="checkbox"] {{
+    width: 22px;
+    height: 22px;
+    margin: 0;
+    cursor: pointer;
+    accent-color: var(--link);
+  }}
+
+  /* ---------- desktop / tablet (≥600px): table layout ---------- */
+  @media (min-width: 600px) {{
+    table {{ width: 100%; border-collapse: collapse; }}
+    th, td {{ text-align: left; padding: 10px 6px; border-bottom: 1px solid var(--border); font-size: 13px; vertical-align: middle; }}
+    th {{ background: var(--head-bg); }}
+    td.size, td.mime, td.when, td.from {{ color: var(--muted); font-size: 12px; white-space: nowrap; }}
+    tr:hover td {{ background: var(--row-alt); }}
+  }}
+
+  /* ---------- phone (<600px): card layout ---------- */
+  @media (max-width: 599px) {{
+    table, tbody {{ display: block; width: 100%; }}
+    thead {{ display: none; }}
+    tr {{
+      display: grid;
+      grid-template-columns: 32px 1fr auto;
+      grid-template-areas:
+        "check name name"
+        "check size when";
+      gap: 2px 10px;
+      align-items: center;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 12px;
+      margin-bottom: 10px;
+    }}
+    tr td {{ padding: 0; border: none; display: block; }}
+    tr td:nth-child(1) {{ grid-area: check; align-self: start; padding-top: 4px; }}
+    tr td:nth-child(2) {{ grid-area: name; font-size: 16px; line-height: 1.4; }}
+    tr td:nth-child(2) a {{ display: inline-block; padding: 6px 0; min-height: 32px; }}
+    tr td:nth-child(3) {{ grid-area: size; color: var(--muted); font-size: 12px; }}
+    tr td:nth-child(6) {{ grid-area: when; color: var(--muted); font-size: 12px; text-align: right; white-space: nowrap; }}
+    /* hide mime + from on phone (low signal, eat space) */
+    tr td:nth-child(4), tr td:nth-child(5) {{ display: none; }}
+    tr td:nth-child(1) input[type="checkbox"] {{ width: 26px; height: 26px; }}
+  }}
 </style>
 </head>
 <body>
