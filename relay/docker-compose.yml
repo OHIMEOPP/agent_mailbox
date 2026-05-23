@@ -41,7 +41,12 @@ services:
     volumes:
       - ./templates:/etc/nginx/templates:ro
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost/health"]
+      # Use 127.0.0.1 explicitly, not "localhost". Alpine's musl resolves
+      # "localhost" via /etc/hosts which only has the ::1 (IPv6) line, but
+      # nginx here only listens on `0.0.0.0:80` (IPv4) — wget would get
+      # ECONNREFUSED and the container would stay (unhealthy) forever.
+      # Spotted by wiki@LAPTOP-MQ1OGSN5 during first real deploy.
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/health"]
       interval: 30s
       timeout: 5s
       retries: 3
