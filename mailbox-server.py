@@ -629,7 +629,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             try:
                 rows = conn.execute(
                     "SELECT a.id, a.filename, a.mime, a.size, a.sha256, "
-                    "a.message_id, m.from_name, m.sent_at "
+                    "a.message_id, m.from_name, m.sent_at, m.body AS message_body "
                     "FROM attachments a JOIN messages m ON a.message_id=m.id "
                     "WHERE m.to_name=? "
                     "ORDER BY a.id DESC LIMIT ?",

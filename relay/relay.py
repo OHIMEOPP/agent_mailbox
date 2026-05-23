@@ -107,6 +107,7 @@ async def handle_list(request: web.Request) -> web.Response:
             "mime": a.get("mime") or "?",
             "size": a.get("size") or 0,
             "msg_id": a.get("message_id"),
+            "msg_body": a.get("message_body") or "",
             "from": a.get("from_name") or "?",
             "sent_at": a.get("sent_at") or "",
         })
@@ -220,33 +221,70 @@ def _render_list_html(rows: list[dict]) -> str:
     if not rows:
         body = '<p class="empty">沒有附件。</p>'
     else:
-        lines = []
+        # Group consecutive rows sharing the same msg_id. Hub returns
+        # ORDER BY a.id DESC; attachments of a single send share msg_id
+        # and adjacent ids, so this groups them into one section labelled
+        # by the message body (which the sender chose as the "folder").
+        groups: list[dict] = []
+        current: dict | None = None
         for r in rows:
-            fname = html.escape(r["filename"])
-            sender = html.escape(r["from"])
-            mime = html.escape(r["mime"])
-            size = _human_size(r["size"])
-            when = _short_when(r["sent_at"])
-            file_href = f"/file/{r['id']}{qs_token}"
-            lines.append(
-                f'<tr>'
-                f'<td><input type="checkbox" name="ids" value="{r["id"]}" form="del-form"></td>'
-                f'<td><a href="{file_href}">{fname}</a></td>'
-                f'<td class="size">{size}</td>'
-                f'<td class="mime">{mime}</td>'
-                f'<td class="from">{sender}</td>'
-                f'<td class="when">{when}</td>'
-                f'</tr>'
+            if current is None or current["msg_id"] != r["msg_id"]:
+                current = {
+                    "msg_id": r["msg_id"],
+                    "from": r["from"],
+                    "sent_at": r["sent_at"],
+                    "body": r["msg_body"],
+                    "rows": [],
+                }
+                groups.append(current)
+            current["rows"].append(r)
+
+        sections = []
+        for g in groups:
+            raw_body = (g["body"] or "").strip()
+            header_text = raw_body.splitlines()[0] if raw_body else "(沒有訊息標題)"
+            if len(header_text) > 80:
+                header_text = header_text[:80] + "…"
+            sender = html.escape(g["from"])
+            when = _short_when(g["sent_at"])
+            count = len(g["rows"])
+            tr_lines = []
+            for r in g["rows"]:
+                fname = html.escape(r["filename"])
+                row_sender = html.escape(r["from"])
+                mime = html.escape(r["mime"])
+                size = _human_size(r["size"])
+                row_when = _short_when(r["sent_at"])
+                file_href = f"/file/{r['id']}{qs_token}"
+                tr_lines.append(
+                    f'<tr>'
+                    f'<td><input type="checkbox" name="ids" value="{r["id"]}" form="del-form"></td>'
+                    f'<td><a href="{file_href}">{fname}</a></td>'
+                    f'<td class="size">{size}</td>'
+                    f'<td class="mime">{mime}</td>'
+                    f'<td class="from">{row_sender}</td>'
+                    f'<td class="when">{row_when}</td>'
+                    f'</tr>'
+                )
+            sections.append(
+                f'<section class="group">'
+                f'<h2 class="group-head">'
+                f'<span class="group-title">{html.escape(header_text)}</span>'
+                f'<span class="group-meta">{count} 檔 · {sender} · {when}</span>'
+                f'</h2>'
+                f'<table>'
+                f'<thead><tr><th></th><th>檔名</th><th>大小</th><th>類型</th><th>From</th><th>時間</th></tr></thead>'
+                f'<tbody>{"".join(tr_lines)}</tbody>'
+                f'</table>'
+                f'</section>'
             )
+
         body = (
             f'<form id="del-form" method="post" action="/delete{qs_token}" '
             f'onsubmit="return confirm(\'刪除選取的附件？此動作會清空 hub blob（無其他引用時）+ DB row，不影響 sender 原檔。\');">'
             f'<button type="submit">🗑️ 刪除選取</button>'
             f'</form>'
-            f'<table>'
-            f'<thead><tr><th></th><th>檔名</th><th>大小</th><th>類型</th><th>From</th><th>時間</th></tr></thead>'
-            f'<tbody>{"".join(lines)}</tbody>'
-            f'</table>'
+            + "".join(sections)
         )
 
     return f"""<!doctype html>
@@ -316,6 +354,22 @@ def _render_list_html(rows: list[dict]) -> str:
     cursor: pointer;
     accent-color: var(--link);
   }}
+  section.group {{ margin: 14px 0 22px; }}
+  h2.group-head {{
+    font-size: 14px;
+    font-weight: 600;
+    margin: 0 0 8px;
+    padding: 8px 12px;
+    background: var(--head-bg);
+    border-radius: 8px;
+    display: flex;
+    gap: 6px 10px;
+    flex-wrap: wrap;
+    align-items: baseline;
+    line-height: 1.4;
+  }}
+  .group-title {{ white-space: pre-wrap; word-break: break-word; flex: 1 1 auto; min-width: 0; }}
+  .group-meta {{ color: var(--muted); font-size: 12px; font-weight: 400; white-space: nowrap; }}
 
   /* ---------- desktop / tablet (≥600px): table layout ---------- */
   @media (min-width: 600px) {{
