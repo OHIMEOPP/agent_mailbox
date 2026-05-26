@@ -56,7 +56,7 @@ def process_discord_inbound(content, author, author_id, channel, to_name_hint, d
 
     # === Trusted-user @prefix routing override ===
     if is_trusted:
-        for prefix in ('@koatag-frontend ', '@koatag ', '@stranger-conv '):
+        for prefix in ('@koatag-frontend ', '@koatag ', '@stranger-conv ', '@mailbox-dev '):
             if content.lower().startswith(prefix.lower()):
                 to_name = prefix[1:-1]
                 content = content[len(prefix):]
