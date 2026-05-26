@@ -84,25 +84,62 @@ def _count_attachments(conn: sqlite3.Connection, msg_ids: list) -> dict:
         return {}  # legacy DB without attachments table
 
 
+_MUTE_FILTER_PER_NAME = (
+    " AND NOT EXISTS (SELECT 1 FROM mutes "
+    "WHERE actor = ? AND muted_peer = messages.from_name)"
+)
+_MUTE_FILTER_WATCH_ALL = (
+    " AND NOT EXISTS (SELECT 1 FROM mutes "
+    "WHERE actor = messages.to_name AND muted_peer = messages.from_name)"
+)
+
+
+def _exec_with_mute_fallback(conn, base_sql: str, mute_clause: str,
+                             base_params: tuple, mute_params: tuple) -> list:
+    """Run the SQL with the mute NOT EXISTS clause; on legacy DBs that lack
+    the mutes table, retry without the clause so the watcher keeps working.
+    """
+    try:
+        return list(conn.execute(base_sql + mute_clause,
+                                 base_params + mute_params))
+    except sqlite3.OperationalError as e:
+        if "no such table" in str(e).lower() and "mutes" in str(e).lower():
+            return list(conn.execute(base_sql, base_params))
+        raise
+
+
 def fetch_unread(conn: sqlite3.Connection, name: str, since_id: int) -> list:
-    rows = list(conn.execute(
+    base_sql = (
         "SELECT id, from_name, sent_at, substr(body, 1, 200) "
-        "FROM messages WHERE to_name=? AND read_at IS NULL AND id > ? "
-        "ORDER BY id",
-        (name, since_id),
-    ))
+        "FROM messages WHERE to_name=? AND read_at IS NULL AND id > ?"
+    )
+    rows = _exec_with_mute_fallback(
+        conn, base_sql, _MUTE_FILTER_PER_NAME,
+        (name, since_id), (name,),
+    )
+    # ORDER BY id after WHERE+filter (couldn't put it inside helper because
+    # the mute clause sits between WHERE and ORDER). Cheap re-sort in memory
+    # since the per-tick row count is tiny.
+    rows.sort(key=lambda r: r[0])
     counts = _count_attachments(conn, [r[0] for r in rows])
     return [r + (counts.get(r[0], 0),) for r in rows]
 
 
 def fetch_unread_all(conn: sqlite3.Connection, since_id: int) -> list:
-    """Same as fetch_unread but across every to_name (supervisor mode)."""
-    rows = list(conn.execute(
+    """Same as fetch_unread but across every to_name (supervisor mode).
+
+    Mute filter uses each row's to_name as the actor — wiki muting koatag*
+    only hides those rows from wiki's view; supervisor sees others normally.
+    """
+    base_sql = (
         "SELECT id, from_name, to_name, sent_at, substr(body, 1, 200) "
-        "FROM messages WHERE read_at IS NULL AND id > ? "
-        "ORDER BY id",
-        (since_id,),
-    ))
+        "FROM messages WHERE read_at IS NULL AND id > ?"
+    )
+    rows = _exec_with_mute_fallback(
+        conn, base_sql, _MUTE_FILTER_WATCH_ALL,
+        (since_id,), (),
+    )
+    rows.sort(key=lambda r: r[0])
     counts = _count_attachments(conn, [r[0] for r in rows])
     return [r + (counts.get(r[0], 0),) for r in rows]
 
