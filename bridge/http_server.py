@@ -45,6 +45,7 @@ def make_handler(db_path):
                 channel=body.get('channel') or '',
                 to_name_hint=body.get('to_name'),
                 db_path=db_path,
+                attachments=body.get('attachments'),
             )
             return self._json(status, resp)
 

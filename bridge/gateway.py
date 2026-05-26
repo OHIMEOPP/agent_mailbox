@@ -73,6 +73,18 @@ def start_gateway(db_path):
                     return  # ignore self
                 if not isinstance(message.channel, discord.DMChannel):
                     return  # DMs only
+                # discord.py Attachment -> dict shape consumed by attachments.relay_*
+                atts = [
+                    {
+                        "id": str(a.id),
+                        "filename": a.filename,
+                        "url": a.url,
+                        "proxy_url": a.proxy_url,
+                        "content_type": a.content_type,
+                        "size": a.size,
+                    }
+                    for a in (message.attachments or [])
+                ]
                 status, resp = process_discord_inbound(
                     content=message.content,
                     author=message.author.name,
@@ -80,6 +92,7 @@ def start_gateway(db_path):
                     channel=str(message.channel.id),
                     to_name_hint=None,
                     db_path=db_path,
+                    attachments=atts,
                 )
                 if status >= 400:
                     sys.stdout.write(f"[gateway] on_message returned {status}: {resp}\n")
