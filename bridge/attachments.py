@@ -64,47 +64,66 @@ def _write_blob(data: bytes, atts_dir: Path) -> tuple[str, int]:
     return sha, len(data)
 
 
-def relay_discord_attachments(conn, msg_id: int, atts_dir: Path,
-                              discord_atts: list[dict]) -> list[dict]:
-    """For each Discord attachment dict, download + store blob + INSERT row.
+def fetch_and_blob(atts_dir: Path, discord_atts: list[dict],
+                   log_prefix: str = "") -> list[dict]:
+    """Download + blob-store all Discord attachments. NO DB I/O — the caller
+    INSERTs the rows once the parent message_id is known. Designed so the
+    DB write transaction stays short: network downloads + filesystem blob
+    writes happen BEFORE the sqlite connection opens.
+
+    Picks `url` (Discord's original CDN, works for every content_type) over
+    `proxy_url` (Discord's media proxy, image-only — returns 415 for
+    xlsx/pdf/etc). proxy_url is kept only as a last-resort fallback.
 
     Args:
-        conn: open sqlite3 Connection (caller owns commit/rollback)
-        msg_id: parent messages.id
-        atts_dir: <db_parent>/attachments
-        discord_atts: list of {filename, url, proxy_url, content_type, size}
-                      (the subset of Discord's attachment object we care about)
+        atts_dir: <db_parent>/attachments — content-addressed blob root.
+        discord_atts: list of {filename, url, proxy_url, content_type, size}.
+        log_prefix: optional tag for stdout lines (e.g. "msg-pending").
 
     Returns:
-        list of {id, filename, mime, size, sha256} for successfully stored
-        attachments. Failed ones are logged + skipped (best-effort relay —
-        partial success > rejecting the whole DM).
+        list of {filename, mime, size, sha256} for blobs successfully on disk.
+        Failed downloads are logged + skipped (best-effort relay).
     """
     stored = []
     for att in discord_atts:
         filename = att.get("filename") or f"attachment-{att.get('id', 'unknown')}"
-        # proxy_url is Discord's CDN-accelerated mirror, preferred over url
-        src = att.get("proxy_url") or att.get("url")
-        if not src:
-            sys.stdout.write(f"[attach] msg #{msg_id} skip {filename}: no url\n")
+        # `url` works for every attachment type. `proxy_url` is image-only
+        # (Discord's media proxy 415s on xlsx/pdf/etc), so it's the fallback.
+        candidates = [u for u in (att.get("url"), att.get("proxy_url")) if u]
+        if not candidates:
+            sys.stdout.write(f"[attach] {log_prefix}skip {filename}: no url\n")
             continue
-        try:
-            data = _download(src)
-        except RuntimeError as e:
-            sys.stdout.write(f"[attach] msg #{msg_id} skip {filename}: {e}\n")
+        data = None
+        last_err = None
+        for src in candidates:
+            try:
+                data = _download(src)
+                break
+            except RuntimeError as e:
+                last_err = e
+                continue
+        if data is None:
+            sys.stdout.write(f"[attach] {log_prefix}skip {filename}: {last_err}\n")
             continue
         sha, size = _write_blob(data, atts_dir)
         mime = att.get("content_type") or "application/octet-stream"
+        stored.append({
+            "filename": filename, "mime": mime,
+            "size": size, "sha256": sha,
+        })
+        sys.stdout.write(f"[attach] {log_prefix}stored {filename} "
+                         f"({size}B sha={sha[:8]}…)\n")
+    return stored
+
+
+def insert_attachment_rows(conn, msg_id: int, stored: list[dict]) -> list[dict]:
+    """Quick DB INSERT pass. Returns stored items with `id` populated."""
+    out = []
+    for s in stored:
         cur = conn.execute(
             "INSERT INTO attachments(message_id, filename, mime, size, sha256) "
             "VALUES (?, ?, ?, ?, ?)",
-            (msg_id, filename, mime, size, sha),
+            (msg_id, s["filename"], s["mime"], s["size"], s["sha256"]),
         )
-        att_id = cur.lastrowid
-        stored.append({
-            "id": att_id, "filename": filename, "mime": mime,
-            "size": size, "sha256": sha,
-        })
-        sys.stdout.write(f"[attach] msg #{msg_id} stored {filename} "
-                         f"({size}B sha={sha[:8]}…)\n")
-    return stored
+        out.append({"id": cur.lastrowid, **s})
+    return out

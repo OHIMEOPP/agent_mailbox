@@ -60,14 +60,22 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
-def _spawn_fake_cdn(port: int, payloads: dict[str, bytes]) -> threading.Thread:
-    """Tiny HTTP server: GET /<key> returns payloads[key]. Daemon thread."""
+def _spawn_fake_cdn(port: int, payloads: dict[str, bytes],
+                    error_keys: dict[str, int] | None = None) -> socketserver.TCPServer:
+    """Tiny HTTP server: GET /<key> returns payloads[key], or error_keys[key]
+    HTTP status. Used to simulate Discord media proxy 415 on non-image."""
+    error_keys = error_keys or {}
+
     class Handler(http.server.BaseHTTPRequestHandler):
         def log_message(self, *_a, **_kw):
             pass  # quiet
 
         def do_GET(self):
             key = self.path.lstrip("/")
+            if key in error_keys:
+                self.send_response(error_keys[key])
+                self.end_headers()
+                return
             if key not in payloads:
                 self.send_response(404)
                 self.end_headers()
@@ -113,10 +121,17 @@ def main() -> int:
     port = _free_port()
     img_bytes = b"\x89PNG\r\n\x1a\n" + b"fake-png-body" * 200
     txt_bytes = "image caption attached.txt 中文".encode("utf-8")
-    srv = _spawn_fake_cdn(port, {
-        "img.png": img_bytes,
-        "note.txt": txt_bytes,
-    })
+    srv = _spawn_fake_cdn(
+        port,
+        {
+            "img.png": img_bytes,
+            "note.txt": txt_bytes,
+            "data.xlsx": b"PK\x03\x04" + b"fake-xlsx" * 100,
+        },
+        # Simulates Discord media proxy returning 415 for non-image — we
+        # exercise the url fallback path (proxy_url 415 -> url 200).
+        error_keys={"proxy/data.xlsx": 415},
+    )
 
     failures: list[str] = []
     try:
@@ -230,6 +245,55 @@ def main() -> int:
         assert after == before, f"dedup failed: blobs {before} -> {after}"
         assert status == 200 and len(resp["attachments"]) == 1
         print(f"[smoke] dedup ok — blob count steady at {after}")
+
+        # --- Test 6: proxy_url 415 -> url fallback (the #1539 xlsx bug) ---
+        # Simulates Discord media proxy refusing non-image content: proxy_url
+        # returns 415 but url succeeds. We use url-first ordering so this
+        # should download cleanly from url on the first try.
+        xlsx_payload = b"PK\x03\x04" + b"fake-xlsx" * 100
+        xlsx_sha = hashlib.sha256(xlsx_payload).hexdigest()
+        atts_in6 = [
+            {"id": "600", "filename": "data.xlsx",
+             # proxy_url points to 415 endpoint; url points to working endpoint
+             "proxy_url": f"http://127.0.0.1:{port}/proxy/data.xlsx",
+             "url": f"http://127.0.0.1:{port}/data.xlsx",
+             "content_type": "application/vnd.openxmlformats-officedocument."
+                             "spreadsheetml.sheet",
+             "size": len(xlsx_payload)},
+        ]
+        status, resp = process_discord_inbound(
+            content="excel sheet",
+            author="tester", author_id="42", channel="999",
+            to_name_hint=None, db_path=str(db),
+            attachments=atts_in6,
+        )
+        assert status == 200, f"xlsx via url failed: {status} {resp}"
+        assert len(resp["attachments"]) == 1
+        assert resp["attachments"][0]["sha256"] == xlsx_sha
+        assert resp["attachments"][0]["filename"] == "data.xlsx"
+        print("[smoke] non-image via url ok (proxy_url 415 fallback path)")
+
+        # --- Test 7: only proxy_url available + it 415s => skip cleanly ---
+        atts_in7 = [
+            {"id": "700", "filename": "weird.xlsx",
+             "proxy_url": f"http://127.0.0.1:{port}/proxy/data.xlsx",
+             # no url field
+             "content_type": "application/octet-stream", "size": 1},
+        ]
+        status, resp = process_discord_inbound(
+            content="all-proxy attempt",
+            author="tester", author_id="42", channel="999",
+            to_name_hint=None, db_path=str(db),
+            attachments=atts_in7,
+        )
+        assert status == 200
+        assert resp["attachments"] == []
+        with sqlite3.connect(str(db)) as c:
+            c.row_factory = sqlite3.Row
+            row = c.execute("SELECT has_attachments FROM messages WHERE id=?",
+                            (resp["id"],)).fetchone()
+            assert row["has_attachments"] == 0
+        print("[smoke] proxy-only 415 cleanly skips + has_attachments=0")
 
         print(f"\n[smoke] ALL TESTS PASSED ({len(failures)} failures)")
         return 0 if not failures else 1

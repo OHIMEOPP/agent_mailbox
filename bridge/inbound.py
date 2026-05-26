@@ -10,7 +10,8 @@ gateway side can log + decide whether to ack.
 import sqlite3
 import sys
 
-from .attachments import attachments_dir_for, relay_discord_attachments
+from .attachments import (attachments_dir_for, fetch_and_blob,
+                          insert_attachment_rows)
 from .config import ALLOW_DENY_RE, OFFLINE_THRESHOLD_SECONDS, TRUSTED_USER
 from .heartbeat import agent_recently_active
 from .notify import notify_command_result, notify_offline, notify_stranger_pending
@@ -69,30 +70,33 @@ def process_discord_inbound(content, author, author_id, channel, to_name_hint, d
     else:
         from_name = 'user-discord'
 
+    # === Download + blob first (no DB lock held during multi-second network) ===
+    # Keeping the SQLite write txn open while we download from Discord CDN
+    # caused "disk I/O error" under contention with the watcher heartbeat
+    # writer (#1539). Network + filesystem I/O now happen BEFORE we touch
+    # the DB; the txn below is sub-ms.
+    blobs = []
+    if attachments:
+        blobs = fetch_and_blob(
+            attachments_dir_for(db_path), attachments,
+            log_prefix=f"{from_name} -> {to_name} ")
+
     # === INSERT ===
-    # has_attachments must be set on the messages row at INSERT time so that
-    # SSE/inbox readers (which gate the attachments JOIN on this column) see
-    # the parent + children atomically.
-    has_atts = 1 if attachments else 0
+    # has_attachments computed from blobs (post-download) — if all downloads
+    # failed we cleanly store 0 from the start, no rollback UPDATE needed.
+    has_atts = 1 if blobs else 0
     stored = []
     try:
-        conn = sqlite3.connect(db_path)
+        conn = sqlite3.connect(db_path, timeout=10.0)
+        conn.execute("PRAGMA busy_timeout = 5000")
         cur = conn.execute(
             'INSERT INTO messages (from_name, to_name, body, has_attachments) '
             'VALUES (?, ?, ?, ?)',
             (from_name, to_name, content, has_atts),
         )
         mid = cur.lastrowid
-        if attachments:
-            stored = relay_discord_attachments(
-                conn, mid, attachments_dir_for(db_path), attachments)
-            # Roll back has_attachments to 0 if every attachment download failed
-            # (rare — would only happen if Discord CDN is down for ALL files in
-            # the same message). Leaves the body text intact so user doesn't
-            # lose the caption.
-            if not stored:
-                conn.execute(
-                    'UPDATE messages SET has_attachments=0 WHERE id=?', (mid,))
+        if blobs:
+            stored = insert_attachment_rows(conn, mid, blobs)
         conn.commit()
         conn.close()
     except sqlite3.Error as e:
