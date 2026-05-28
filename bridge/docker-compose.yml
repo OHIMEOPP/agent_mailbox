@@ -101,6 +101,16 @@ services:
       - MAILBOX_BACKUP_KEEP_DAILY=${MAILBOX_BACKUP_KEEP_DAILY:-7}
       - MAILBOX_BACKUP_KEEP_WEEKLY=${MAILBOX_BACKUP_KEEP_WEEKLY:-4}
       - MAILBOX_BACKUP_KEEP_MONTHLY=${MAILBOX_BACKUP_KEEP_MONTHLY:-3}
+      # Watcher-monitor daemon — pings Discord when an agent watcher / the
+      # bridge gateway flips DEAD or recovers; daily roll-up at hour-local.
+      # Reachable bridge URL is the container DNS name on the shared net.
+      - MAILBOX_WATCHER_MONITOR_DISABLED=${MAILBOX_WATCHER_MONITOR_DISABLED:-}
+      - MAILBOX_WATCHER_MONITOR_TICK_SECONDS=${MAILBOX_WATCHER_MONITOR_TICK_SECONDS:-30}
+      - MAILBOX_WATCHER_DEAD_THRESHOLD_SECONDS=${MAILBOX_WATCHER_DEAD_THRESHOLD_SECONDS:-60}
+      - MAILBOX_WATCHER_TRACK_WINDOW_HOURS=${MAILBOX_WATCHER_TRACK_WINDOW_HOURS:-1}
+      - MAILBOX_WATCHER_BRIEFING_HOUR_LOCAL=${MAILBOX_WATCHER_BRIEFING_HOUR_LOCAL:-9}
+      - MAILBOX_WATCHER_NOTIFY_URL=${MAILBOX_WATCHER_NOTIFY_URL:-http://mailbox-bridge:1904/agent-notify}
+      - MAILBOX_WATCHER_BRIDGE_URL=${MAILBOX_WATCHER_BRIDGE_URL:-http://mailbox-bridge:1904/healthz}
       - MAILBOX_BACKUP_DISABLED=${MAILBOX_BACKUP_DISABLED:-}
     volumes:
       # mount the entry-point script + the shared `mailbox/` package (one

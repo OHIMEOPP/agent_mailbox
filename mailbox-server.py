@@ -60,6 +60,7 @@ from mailbox import reactions as mailbox_reactions
 from mailbox import scheduled as mailbox_scheduled
 from mailbox import snoozed as mailbox_snoozed
 from mailbox import sweep as mailbox_sweep
+from mailbox import watcher_monitor as mailbox_watcher_monitor
 from mailbox import webhooks as mailbox_webhooks
 
 SCHEDULED_TICK_SECONDS = mailbox_scheduled.SCHEDULED_TICK_SECONDS
@@ -1862,6 +1863,15 @@ def main():
         sched_thread.start()
         print(f"[mailbox-server] scheduled-send: deliver-tick={SCHEDULED_TICK_SECONDS}s",
               file=sys.stderr)
+
+    # Watcher-monitor daemon — paging notifications to Discord when an agent
+    # watcher goes dark or the bridge gateway flips. State + env knobs are
+    # owned by mailbox/watcher_monitor.py; this just wires the thread spin.
+    if mailbox_watcher_monitor.start_daemon(args.db):
+        print("[mailbox-server] watcher-monitor: started", file=sys.stderr)
+    else:
+        print("[mailbox-server] watcher-monitor: DISABLED via "
+              "MAILBOX_WATCHER_MONITOR_DISABLED", file=sys.stderr)
 
     try:
         httpd.serve_forever()

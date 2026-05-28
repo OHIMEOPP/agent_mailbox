@@ -579,6 +579,52 @@ if not urgent:
 - Out-of-range (>9 或 <0) → 400 / ValueError，validate via `mailbox_priority.parse_priority`
 - 跟 `claim` (visibility timeout) 自然 pair：worker `inbox(claimable_only=True, min_priority=5)` 抓最 urgent + 未被別人 claim 的
 
+## Watcher heartbeat monitor（自 2026-05-28）
+
+Mailbox-server 內建 daemon thread，自動偵測 watcher 死活 → push Discord DM。涵蓋兩個 surface：
+
+| 目標 | 來源 | 健康判定 |
+|---|---|---|
+| Agent watcher (wiki / koatag / mailbox-dev …) | `peers.last_seen_at` | <12s HEALTHY / 12-60s STALE / >60s DEAD |
+| Bridge Discord gateway | bridge `/healthz` JSON 的 `gateway.expected` + `gateway.online` | online=true → HEALTHY，expected=false → DISABLED，否則 DEAD |
+
+**只追近期活躍 peer** — `MAILBOX_WATCHER_TRACK_WINDOW_HOURS` (default 1h) 之內 heartbeat 過的才 track，避免 session 自然結束的 agent 一直被當「dead 該 page」。
+
+**Page 規則** — 只在「真壞 / 真好」transition 才 fire：
+- HEALTHY/STALE → DEAD → `status=fail`「<name> DEAD」
+- DEAD → HEALTHY/STALE → `status=done`「<name> recovered」
+- HEALTHY ↔ STALE flicker → 不 page（單 tick miss 是常態）
+- 第一次看到的 target（None → *）也不 page（避免 daemon restart spam）
+
+**每日 briefing** — `MAILBOX_WATCHER_BRIEFING_HOUR_LOCAL` (default 9，container TZ Asia/Taipei) 那小時內 fire 一次，列所有 tracked target 狀態。**Late-restart 不會重 page** — briefing window 只在該 hour ~ hour+1h 之間。
+
+**CLI on-demand**：
+```bash
+py tools/mailbox-watcher-status.py                          # 表格
+py tools/mailbox-watcher-status.py --json                   # machine-readable
+py tools/mailbox-watcher-status.py --strict                 # exit 1 if any DEAD
+py tools/mailbox-watcher-status.py --bridge http://x:1904/healthz --db /path
+```
+
+**Env vars**（mailbox-server container 端）：
+
+| Var | Default | Purpose |
+|---|---|---|
+| `MAILBOX_WATCHER_MONITOR_DISABLED` | (unset) | `1` = daemon 不起；CLI 仍可用 |
+| `MAILBOX_WATCHER_MONITOR_TICK_SECONDS` | 30 | poll cadence |
+| `MAILBOX_WATCHER_DEAD_THRESHOLD_SECONDS` | 60 | 多久沒 heartbeat 算 DEAD |
+| `MAILBOX_WATCHER_TRACK_WINDOW_HOURS` | 1 | 多久沒 heartbeat 就放棄追（避 spam） |
+| `MAILBOX_WATCHER_BRIEFING_HOUR_LOCAL` | 9 | daily briefing 小時（容器 TZ） |
+| `MAILBOX_WATCHER_NOTIFY_URL` | `http://mailbox-bridge:1904/agent-notify` | Discord DM 出口 |
+| `MAILBOX_WATCHER_BRIDGE_URL` | `http://mailbox-bridge:1904/healthz` | bridge 健康探測 |
+
+**Push schema**：用既有 `/agent-notify` (`{agent, task, status, detail}`)，`agent=watcher-monitor`，DM 一行 task + 一段 detail (kind, name, age, last_seen_at)。
+
+**設計約束**：
+- State 在 daemon 記憶體，restart 重新 baseline（不持久化）— 配合上述 first-observation 靜默 + briefing window 避 restart spam
+- 不寫 DB（read-only against peers table）— 不會跟 sweep / backup / send-path 衝
+- mailbox-server 自己掛了 daemon 也跟著掛 — 外部 watchdog 仍走 `tools/mailbox-doctor.py`
+
 ## Bridge / 周邊工具
 
 - `mailbox-discord-bridge.py` — Docker container `mailbox-bridge`（port 1904）。**Inbound only**：Discord DM → mailbox INSERT。Agent **不直接 call** 這個 port，是 Discord bot 自動推進來。看完整 e2e 流程圖：[Discord 整合：兩個 port，分工不對稱](#discord-整合兩個-port分工不對稱)
@@ -589,6 +635,7 @@ if not urgent:
 - `tools/mailbox-audit.py` — CLI，tail / filter / stats audit log（hub-only）
 - `tools/mailbox-webhooks.py` — CLI，register/list/delete/tail outbound webhooks（hub-only）
 - `tools/mailbox-rate-limit.py` — CLI，stats/top/reset/prune rate-limit buckets（hub-only）
+- `tools/mailbox-watcher-status.py` — CLI，on-demand snapshot watcher heartbeat 狀態（agent + bridge gateway）
 - `tools/mailbox-dump.py` — 撈 mailbox 歷史；wiki session 有 slash command `/mblog` 跟 `/觀看紀錄` 包好
 - `tools/mailbox-whitelist.py` — Discord 來源信任名單 CLI（trusted / approved / pending），see [discord-stranger-chat](https://github.com/OHIMEOPP/discord-stranger-chat) 設計
 
