@@ -49,6 +49,14 @@ DEFAULT_BRIEFING_HOUR_LOCAL = 9
 DEFAULT_NOTIFY_URL = "http://mailbox-bridge:1904/agent-notify"
 DEFAULT_BRIDGE_HEALTH_URL = "http://mailbox-bridge:1904/healthz"
 
+# Peer-name prefixes that are *producers*, not live watcher sessions. These
+# register a peers row as a side-effect of sending (e.g. folder-sync pushes a
+# ComfyUI image then stays silent for minutes), so liveness-monitoring them
+# floods Discord with bogus DEAD/recovery pages on every quiet gap. Excluded
+# from collect_peers. Override via MAILBOX_WATCHER_PEER_EXCLUDE_PREFIXES
+# (comma-separated).
+DEFAULT_PEER_EXCLUDE_PREFIXES = ("folder-sync@",)
+
 # Status vocabulary (also used by status_snapshot CLI output)
 HEALTHY = "HEALTHY"
 STALE = "STALE"
@@ -102,8 +110,11 @@ def _classify_peer_age(age_s: float | None,
 
 def collect_peers(db_path: Path, dead_threshold: float,
                   track_window_hours: float,
-                  now: datetime | None = None) -> dict:
-    """Read peers within `track_window_hours`; classify each."""
+                  now: datetime | None = None,
+                  exclude_prefixes: tuple = DEFAULT_PEER_EXCLUDE_PREFIXES) -> dict:
+    """Read peers within `track_window_hours`; classify each. Peers whose name
+    starts with any `exclude_prefixes` entry are skipped — they are bursty
+    producers (e.g. folder-sync), not liveness-monitored watcher sessions."""
     if now is None:
         now = datetime.now(timezone.utc)
     cutoff = (now - timedelta(hours=track_window_hours)).isoformat()
@@ -124,6 +135,8 @@ def collect_peers(db_path: Path, dead_threshold: float,
         return {}
     out = {}
     for name, last_seen in rows:
+        if exclude_prefixes and any(name.startswith(p) for p in exclude_prefixes):
+            continue
         age = _age_seconds(last_seen, now)
         out[f"peer:{name}"] = {
             "kind": "agent-watcher",
@@ -325,7 +338,8 @@ def _run_loop(args: dict, stop_event: threading.Event | None = None,
             curr = {}
             curr.update(collect_peers(
                 args["db_path"], args["dead_threshold"],
-                args["track_window"], now=now_utc))
+                args["track_window"], now=now_utc,
+                exclude_prefixes=args["exclude_prefixes"]))
             curr.update(collect_bridge(args["bridge_url"]))
 
             for key, prev_st, curr_st, target in diff_transitions(
@@ -370,6 +384,13 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_prefixes(name: str, default: tuple) -> tuple:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return tuple(default)
+    return tuple(p.strip() for p in raw.split(",") if p.strip())
+
+
 def start_daemon(db_path: Path) -> bool:
     """Spawn the monitor thread. Returns True if started, False if disabled
     via env (MAILBOX_WATCHER_MONITOR_DISABLED=1).
@@ -395,6 +416,9 @@ def start_daemon(db_path: Path) -> bool:
             "MAILBOX_WATCHER_NOTIFY_URL", DEFAULT_NOTIFY_URL),
         "bridge_url": os.environ.get(
             "MAILBOX_WATCHER_BRIDGE_URL", DEFAULT_BRIDGE_HEALTH_URL),
+        "exclude_prefixes": _env_prefixes(
+            "MAILBOX_WATCHER_PEER_EXCLUDE_PREFIXES",
+            DEFAULT_PEER_EXCLUDE_PREFIXES),
     }
     t = threading.Thread(target=_run_loop, args=(args,),
                          daemon=True, name="watcher-monitor")
