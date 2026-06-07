@@ -1,0 +1,5 @@
+# 機密與執行期產物，絕不進 git
+.secrets
+digest-out.md
+digest.log
+test-msg.md

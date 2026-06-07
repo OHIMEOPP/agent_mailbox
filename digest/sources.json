@@ -1,0 +1,76 @@
+{
+  "focus": "AI agent 技術、LLM 資訊（OpenAI / Anthropic Claude / Google Gemini / Meta Llama / Mistral / 開源模型）昨天的新聞與文章。國外熱門來源優先，閉源開源都要。",
+  "window_hours": 48,
+  "max_items": 18,
+  "sources": {
+    "官方 blog": [
+      "https://www.anthropic.com/news",
+      "https://openai.com/news/",
+      "https://deepmind.google/discover/blog/",
+      "https://ai.meta.com/blog/",
+      "https://mistral.ai/news/",
+      "https://huggingface.co/blog"
+    ],
+    "新聞 / 媒體": [
+      "https://techcrunch.com/category/artificial-intelligence/",
+      "https://www.theverge.com/ai-artificial-intelligence",
+      "https://venturebeat.com/category/ai/",
+      "https://arstechnica.com/ai/"
+    ],
+    "社群 / 聚合": [
+      "https://news.ycombinator.com/  (篩 AI/LLM 相關熱門)",
+      "https://www.reddit.com/r/LocalLLaMA/top/?t=day",
+      "https://www.reddit.com/r/MachineLearning/top/?t=day",
+      "https://simonwillison.net/"
+    ],
+    "研究 / agent": [
+      "https://huggingface.co/papers",
+      "https://arxiv.org/list/cs.CL/recent",
+      "https://blog.langchain.dev/"
+    ]
+  },
+  "official_by_slot": {
+    "早場": {
+      "label": "Anthropic / Claude 官方動態",
+      "sources": [
+        "https://www.anthropic.com/news",
+        "https://www.anthropic.com/research",
+        "https://docs.anthropic.com/en/release-notes/overview (API / Claude / Claude Code changelog)",
+        "https://www.anthropic.com/engineering",
+        "X/Twitter 官方：@AnthropicAI、@claudeai（能透過搜尋撈到就放，撈不到略過）"
+      ]
+    },
+    "晚場": {
+      "label": "OpenAI 官方動態",
+      "sources": [
+        "https://openai.com/news/",
+        "https://openai.com/blog",
+        "https://help.openai.com/en/articles/6825453-chatgpt-release-notes",
+        "https://platform.openai.com/docs/changelog",
+        "X/Twitter 官方：@OpenAI、@sama（能透過搜尋撈到就放，撈不到略過）"
+      ]
+    },
+    "_note": "每場 digest 最前面固定放對應廠商的官方動態區塊（即使不算『新聞』）。X/Twitter 有登入牆，WebFetch 常被擋，僅盡力而為。"
+  },
+  "search_queries_hint": [
+    "OpenAI announcement",
+    "Anthropic Claude release",
+    "open source LLM release this week",
+    "AI agent framework news",
+    "Google Gemini update",
+    "new LLM model benchmark",
+    "Meta Llama news",
+    "Mistral AI release",
+    "Hugging Face new model",
+    "AI agent autonomous tool use",
+    "LLM context window long-context",
+    "AI coding assistant copilot update",
+    "multimodal model vision release",
+    "MCP Model Context Protocol news",
+    "AI research paper LLM reasoning",
+    "AI funding acquisition startup",
+    "AI regulation policy news",
+    "DeepSeek Qwen Kimi Chinese LLM"
+  ],
+  "_note": "這份清單可自由增刪。run-digest 會把它交給 Claude 當研究指引；不是硬性逐站爬，而是 Claude 依此搜尋並挑最重要的。"
+}
