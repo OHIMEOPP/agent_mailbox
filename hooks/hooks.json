@@ -1,0 +1,15 @@
+{
+  "description": "SessionStart：偵測本專案是否 mailbox-enabled，是則解析 mailbox 身分 + 組好 watcher 啟動指令，透過 additionalContext 提示 agent 用 Monitor tool 起 watcher（取代手動 cold-start checklist）。非 mailbox 專案靜默跳過。",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "py -3 \"${CLAUDE_PLUGIN_ROOT}/hooks/ensure_watcher.py\" \"${CLAUDE_PLUGIN_ROOT}\""
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "name": "agent-mailbox",
+  "version": "0.1.0",
+  "description": "跨 Claude Code instance 的非同步訊息佇列。本 plugin 全域提供 mailbox MCP server（身分由各專案的 .mailbox-name 決定，CLAUDE_PROJECT_DIR 注入）+ SessionStart hook 自動提示 agent 用 Monitor tool 起 watcher（hub 本機 mode 或 spoke --remote mode 視 env 自動切）。跨裝置只要打得到 hub IP、spoke 設 CLAUDE_MAILBOX_REMOTE/TOKEN 即可通訊；SQLite server 只在 hub 一台本機跑。取代 per-project .mcp.json 註冊 + README 手動 cold-start checklist。",
+  "author": { "name": "JACK" },
+  "keywords": ["mailbox", "mcp", "watcher", "hooks", "agent-comms", "cross-device"],
+  "mcpServers": {
+    "mailbox": {
+      "command": "uv",
+      "args": ["run", "${CLAUDE_PLUGIN_ROOT}/server.py"],
+      "env": {
+        "CLAUDE_PROJECT_DIR": "${CLAUDE_PROJECT_DIR:-.}"
+      }
+    }
+  }
+}

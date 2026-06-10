@@ -1,0 +1,12 @@
+{
+  "name": "agent-mailbox",
+  "owner": { "name": "JACK" },
+  "plugins": [
+    {
+      "name": "agent-mailbox",
+      "source": "./",
+      "description": "跨 Claude Code instance 的非同步訊息佇列 + Discord 橋接。本 plugin 在每個 mailbox-enabled 專案 session 啟動時，自動提示 agent 用 Monitor tool 起 watcher（hub 或 spoke 視 env），取代手動 cold-start checklist。跨裝置只要打得到 hub IP（spoke 設 CLAUDE_MAILBOX_REMOTE/TOKEN）即可通訊，SQLite server 只在 hub 一台本機跑。",
+      "version": "0.1.0"
+    }
+  ]
+}

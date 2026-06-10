@@ -1,0 +1,4 @@
+# agent-mailbox plugin 用此檔決定本專案 mailbox 身分（first non-empty non-# line）。
+# 注意：本 dev repo 仍保留 project-scope .mcp.json（name=mailbox-dev）以便測試本地 server.py 改動，
+# 該 .mcp.json 會覆蓋 plugin。若哪天要讓 dev session 也走 plugin，刪掉 .mcp.json 的 mailbox 區塊即可，此檔接手。
+mailbox-dev

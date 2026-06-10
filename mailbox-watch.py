@@ -36,12 +36,14 @@ Why an OS subprocess (not /loop or ScheduleWakeup):
 """
 import argparse
 import json
+import os
 import urllib.error
 import urllib.request
 import io
 import sqlite3
 import sys
 import time
+from pathlib import Path
 
 # Force UTF-8 on stdout/stderr so emoji / CJK in previews don't crash on
 # Windows consoles defaulted to cp950 / cp1252.
@@ -52,7 +54,12 @@ sys.stderr = io.TextIOWrapper(
     sys.stderr.buffer, encoding="utf-8", errors="replace", line_buffering=True
 )
 
-DB = r'C:\Users\User\.claude\mailbox\mailbox.db'
+# Default DB path: honour CLAUDE_MAILBOX_DB, else ~/.claude/mailbox/mailbox.db
+# (same convention as server.py — keeps the plugin device-portable instead of
+# hardcoding one machine's user path).
+DB = os.environ.get('CLAUDE_MAILBOX_DB') or str(
+    Path.home() / '.claude' / 'mailbox' / 'mailbox.db'
+)
 
 
 def heartbeat(conn: sqlite3.Connection, name: str) -> None:
@@ -360,7 +367,6 @@ def main() -> int:
                         "falls back to env CLAUDE_MAILBOX_TOKEN if parent process set it)")
     args = p.parse_args()
 
-    import os
     if not args.remote:
         args.remote = os.environ.get('CLAUDE_MAILBOX_REMOTE', '').strip() or None
     if args.remote:

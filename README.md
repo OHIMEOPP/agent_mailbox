@@ -8,7 +8,40 @@
 
 ---
 
-## 🚀 Cold-start checklist（agent 視角：被 user 指示用 mailbox 時讀這段）
+## 🔌 Plugin 模式（`agent-mailbox`，2026-06-10 起，預設）
+
+Mailbox 已包成 Claude Code plugin。**MCP server + watcher 自動啟動** 都由 plugin 提供，不用再每個專案手寫 `.mcp.json`、也不用手動跑下面的 cold-start checklist。
+
+**安裝（每台裝置一次）**：
+```
+/plugin marketplace add OHIMEOPP/agent_mailbox
+/plugin install agent-mailbox@agent-mailbox
+```
+裝完**重啟 Claude Code** 才生效（plugin 的 MCP / hook 只在 session 啟動時載入）。
+
+**每個專案標一個身分**：在專案根放一個 `.mailbox-name` 檔，內容第一行（非 `#` 開頭）就是這個 instance 的名字：
+```
+# 本專案 mailbox 身分
+wiki
+```
+- 監軍/supervisor 專案（看全 inbox）另放 `.mailbox-watch-args` 檔，內容 `--watch-all`。
+- 沒有 `.mailbox-name` 的專案 → plugin 視為非 mailbox 專案，SessionStart hook 靜默跳過、不會 nudge。
+- 仍支援 `CLAUDE_MAILBOX_NAME` env override（優先序最高）。
+
+**身分解析優先序**（`server.py` 與 SessionStart hook 共用）：
+`CLAUDE_MAILBOX_NAME` env → 專案根 `.mailbox-name` → （server.py 再 fallback 專案資料夾名）。
+
+**跨裝置 / hub-spoke**：與 plugin 正交，照舊用 env 決定。Hub（跑 SQLite 的本機）不設 `CLAUDE_MAILBOX_REMOTE`；spoke 設 OS-level `CLAUDE_MAILBOX_REMOTE`(hub URL) + `CLAUDE_MAILBOX_TOKEN`，plugin MCP server 會繼承並自動 dispatch HTTP，SessionStart hook 也會自動把 watcher 指令切成 `--remote` 版。詳 [SETUP-CROSS-DEVICE.md](SETUP-CROSS-DEVICE.md)。
+
+**工具名變更**：plugin 提供的 MCP 工具會被命名空間化為 `mcp__plugin_agent-mailbox_mailbox__*`（不再是 project-scope 的 `mcp__mailbox__*`）。舊文件/memory 內 `mcp__mailbox__*` 字樣陸續更新中。
+
+> **dev repo 例外**：本 repo（claude-mailbox）自己仍保留 project-scope `.mcp.json`（name=`mailbox-dev`），讓開發時測試本地 `server.py` 改動會覆蓋 plugin。要讓 dev session 也走 plugin，刪掉該 `.mcp.json` 的 `mailbox` 區塊即可（`.mailbox-name` 已預埋接手）。
+
+---
+
+## 🚀 Cold-start checklist（**fallback** — plugin 未裝 / 除錯時才需手動）
+
+> Plugin 裝好後 watcher 由 SessionStart hook 自動 nudge，下面手動步驟只在 plugin 未啟用或除錯時用。
 
 ### ❓ Hub or spoke? 先回答這題（自 2026-05-22）
 

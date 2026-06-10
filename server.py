@@ -68,12 +68,51 @@ def _resolve_alias(conn, pattern: str) -> list[str]:
 
 # ---------- Configuration ----------
 
-NAME = os.environ.get("CLAUDE_MAILBOX_NAME")
-if not NAME:
+
+def _resolve_name() -> str:
+    """Resolve this instance's mailbox identity.
+
+    Priority (first hit wins):
+      1. CLAUDE_MAILBOX_NAME env — explicit override. Lets a project's
+         .mcp.json force a name; also the back-compat path for pre-plugin
+         per-project configs.
+      2. `.mailbox-name` file in the project root (CLAUDE_PROJECT_DIR, the
+         dir Claude Code was launched from; cwd as last resort). First
+         non-empty line is the name. This is the plugin mode: the mailbox
+         server is registered once globally and identity travels with the
+         project via this file.
+      3. Basename of the project dir — convenient default when no name is
+         pinned. WARNING: routing / Discord whitelist / heartbeat all key on
+         the name, so pin a `.mailbox-name` for any project whose desired
+         name differs from its folder name.
+    """
+    env_name = (os.environ.get("CLAUDE_MAILBOX_NAME") or "").strip()
+    if env_name:
+        return env_name
+
+    project_dir = (os.environ.get("CLAUDE_PROJECT_DIR") or "").strip() or os.getcwd()
+    try:
+        name_file = Path(project_dir) / ".mailbox-name"
+        if name_file.is_file():
+            for line in name_file.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    return line
+    except OSError:
+        pass
+
+    base = Path(project_dir).name.strip()
+    if base:
+        return base
+
     raise RuntimeError(
-        "CLAUDE_MAILBOX_NAME env var must be set in your .mcp.json "
-        "(e.g. 'wiki', 'koatag') so the mailbox knows your identity."
+        "Could not resolve a mailbox identity. Set CLAUDE_MAILBOX_NAME, or "
+        "add a `.mailbox-name` file (containing the instance name) to the "
+        "project root."
     )
+
+
+NAME = _resolve_name()
 
 REMOTE = os.environ.get("CLAUDE_MAILBOX_REMOTE", "").strip().rstrip("/") or None
 TOKEN = os.environ.get("CLAUDE_MAILBOX_TOKEN", "").strip() or None
