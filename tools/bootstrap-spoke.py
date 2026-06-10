@@ -203,7 +203,7 @@ def main() -> int:
           f"\" {name} --remote {hub.rstrip('/')} --token <TOKEN>")
     print(f"     {green('persistent:')} true")
     print(f"     {green('timeout_ms:')} 3600000")
-    print(f"  3. mcp__mailbox__whoami() should return mode=remote, hub={hub.rstrip('/')}")
+    print(f"  3. mcp__plugin_agent-mailbox_mailbox__whoami() should return mode=remote, hub={hub.rstrip('/')}")
     print()
     print(bold("Verify with:"))
     print(f"     curl {hub.rstrip('/')}/health")

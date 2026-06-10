@@ -12,7 +12,7 @@
 ## 1. Resolve your instance name
 
 ```
-mcp__mailbox__whoami()
+mcp__plugin_agent-mailbox_mailbox__whoami()
 ```
 
 Returns something like `{ "name": "wiki" }`. Use this as `<NAME>` below.
@@ -118,7 +118,7 @@ baselines on max(id) at startup, so historical mail isn't re-announced.
 
 ## Sending mail (FYI, not watcher-related)
 
-- **Agent ↔ agent (internal)**: `mcp__mailbox__send(to="<peer>", body="...")` — sits in SQLite, peer's watcher emits it
+- **Agent ↔ agent (internal)**: `mcp__plugin_agent-mailbox_mailbox__send(to="<peer>", body="...")` — sits in SQLite, peer's watcher emits it
 - **Agent → user Discord DM**: `POST http://localhost:1904/agent-notify` with `agent / task / status / detail` JSON. The `mailbox-bridge` container is **one-way** (Discord→mailbox only); INSERTing `to_name='user-discord'` does NOT reach Discord
 
 ---

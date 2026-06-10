@@ -33,7 +33,7 @@ wiki
 
 **跨裝置 / hub-spoke**：與 plugin 正交，照舊用 env 決定。Hub（跑 SQLite 的本機）不設 `CLAUDE_MAILBOX_REMOTE`；spoke 設 OS-level `CLAUDE_MAILBOX_REMOTE`(hub URL) + `CLAUDE_MAILBOX_TOKEN`，plugin MCP server 會繼承並自動 dispatch HTTP，SessionStart hook 也會自動把 watcher 指令切成 `--remote` 版。詳 [SETUP-CROSS-DEVICE.md](SETUP-CROSS-DEVICE.md)。
 
-**工具名變更**：plugin 提供的 MCP 工具會被命名空間化為 `mcp__plugin_agent-mailbox_mailbox__*`（不再是 project-scope 的 `mcp__mailbox__*`）。舊文件/memory 內 `mcp__mailbox__*` 字樣陸續更新中。
+**工具名**：plugin 提供的 MCP 工具命名空間化為 `mcp__plugin_agent-mailbox_mailbox__*`。（dev repo 保留 project-scope `.mcp.json` 的那台，因 project scope 覆蓋 plugin，工具名仍為舊的短前綴。）
 
 > **dev repo 例外**：本 repo（claude-mailbox）自己仍保留 project-scope `.mcp.json`（name=`mailbox-dev`），讓開發時測試本地 `server.py` 改動會覆蓋 plugin。要讓 dev session 也走 plugin，刪掉該 `.mcp.json` 的 `mailbox` 區塊即可（`.mailbox-name` 已預埋接手）。
 
@@ -72,7 +72,7 @@ wiki
    不存在 → server.py 第一次跑時會自動 mkdir + create；通常已存在。
    **Spoke 跳過此步**（spoke 不該有 local DB；若有 legacy DB 留著 orphan OK）。
 
-3. **問自己是誰**：呼叫 `mcp__mailbox__whoami()` 拿 `name` 欄位（如 `wiki` / `koatag` / `koatag-frontend` / `stranger-conv`）。
+3. **問自己是誰**：呼叫 `mcp__plugin_agent-mailbox_mailbox__whoami()` 拿 `name` 欄位（如 `wiki` / `koatag` / `koatag-frontend` / `stranger-conv`）。
    - **跨機**改採 `<role>@<hostname>` 格式（例：`wiki@LAPTOP-XYZ`，看 [SETUP-CROSS-DEVICE.md](SETUP-CROSS-DEVICE.md) §1.6）
 
 4. **啟動 watcher**：用 Monitor tool（preferred）— 完整模板看 [HOW-TO-START-WATCHER.md](HOW-TO-START-WATCHER.md)。
@@ -118,7 +118,7 @@ urllib.request.urlopen(req, timeout=8)
 走 mailbox MCP（peer 的 watcher 會即時喚醒對方）：
 
 ```python
-mcp__mailbox__send(to="koatag", body="<text>")
+mcp__plugin_agent-mailbox_mailbox__send(to="koatag", body="<text>")
 ```
 
 或 SQL INSERT 同表（一樣會被 peer watcher 看到）：
@@ -132,14 +132,14 @@ db.execute(
 ### 情境 D：「**有沒有新訊息**」/「看 inbox」
 
 ```python
-mcp__mailbox__inbox(unread_only=True)
+mcp__plugin_agent-mailbox_mailbox__inbox(unread_only=True)
 # 或：
-mcp__mailbox__inbox(unread_only=False, limit=20)
+mcp__plugin_agent-mailbox_mailbox__inbox(unread_only=False, limit=20)
 ```
 
 處理完**一定要 mark_read**（否則下次 session 重啟 watcher 會把舊 mail 重新喚醒）：
 ```python
-mcp__mailbox__mark_read(ids=[123, 124])
+mcp__plugin_agent-mailbox_mailbox__mark_read(ids=[123, 124])
 ```
 
 詳見 [HOW-TO-USE-MAILBOX.md](HOW-TO-USE-MAILBOX.md) §Receiving + §Marking as read。
@@ -298,7 +298,7 @@ Mailbox 可以順著訊息附帶檔案，hub ↔ spoke 之間用同一條 LAN/VP
 **API surface**：
 ```
 # 從 agent 內傳
-mcp__mailbox__send(to="wiki@LAPTOP", body="see attached zip",
+mcp__plugin_agent-mailbox_mailbox__send(to="wiki@LAPTOP", body="see attached zip",
                    files=["C:/snapshots/wiki-2026-05-23.zip"])
 
 # 對端收到
@@ -307,7 +307,7 @@ inbox()
 #     attachments: [{id: 7, filename: "wiki-2026-05-23.zip",
 #                    size: 4_521_887, sha256: "abc123..."}]}]
 
-mcp__mailbox__download(attachment_id=7, save_to="C:/tmp/wiki.zip")
+mcp__plugin_agent-mailbox_mailbox__download(attachment_id=7, save_to="C:/tmp/wiki.zip")
 # → {path: "C:/tmp/wiki.zip", size: 4521887, sha256: "abc123..."}
 ```
 
@@ -433,9 +433,9 @@ py tools/mailbox-audit.py --tail --json           # machine-readable
 
 ```python
 # MCP — ISO 8601 或 relative
-mcp__mailbox__send(to="wiki", body="step 3/5 done", expires_at="1h")
-mcp__mailbox__send(to="koatag", body="see you tomorrow", expires_at="24h")
-mcp__mailbox__send(to="hub", body="urgent",
+mcp__plugin_agent-mailbox_mailbox__send(to="wiki", body="step 3/5 done", expires_at="1h")
+mcp__plugin_agent-mailbox_mailbox__send(to="koatag", body="see you tomorrow", expires_at="24h")
+mcp__plugin_agent-mailbox_mailbox__send(to="hub", body="urgent",
                     expires_at="2026-05-25T00:00:00Z")
 ```
 
@@ -523,9 +523,9 @@ if not mailbox_webhooks.verify_signature(body, sig, MY_STORED_SECRET):
 對訊息加 emoji 反應 — 取代「我看到了」「收到」這種純 ack 短信，減少 mailbox 噪音。Discord/Slack 式輕量信號。
 
 ```python
-mcp__mailbox__react(message_id=123, emoji="✅")   # 同 actor 同 emoji 同 msg 只一筆
-mcp__mailbox__react(message_id=123, emoji="🔥")   # 加另一個
-mcp__mailbox__unreact(message_id=123, emoji="✅") # 撤回
+mcp__plugin_agent-mailbox_mailbox__react(message_id=123, emoji="✅")   # 同 actor 同 emoji 同 msg 只一筆
+mcp__plugin_agent-mailbox_mailbox__react(message_id=123, emoji="🔥")   # 加另一個
+mcp__plugin_agent-mailbox_mailbox__unreact(message_id=123, emoji="✅") # 撤回
 ```
 
 **inbox() 結果**裡每筆訊息多一個 `reactions: [{actor, emoji, created_at}]` 欄。Spoke 也通 — 走 REST `/react` `/unreact`。
@@ -586,13 +586,13 @@ py tools/mailbox-rate-limit.py --prune        # 砍 >1hr 老 bucket
 每封訊息可帶 integer `priority`（0..9，default 0）。Inbox query 自動 `ORDER BY priority DESC, id ASC` — high-priority 先冒出來，同 priority 走 FIFO。Worker 可以 `min_priority=5` 過濾只看 urgent。
 
 ```python
-mcp__mailbox__send(to="wiki", body="server is down", priority=9)
-mcp__mailbox__send(to="koatag", body="weekly summary")  # priority=0 default
+mcp__plugin_agent-mailbox_mailbox__send(to="wiki", body="server is down", priority=9)
+mcp__plugin_agent-mailbox_mailbox__send(to="koatag", body="weekly summary")  # priority=0 default
 
 # Worker pattern: drain urgent first, then backlog
-urgent = mcp__mailbox__inbox(min_priority=5)
+urgent = mcp__plugin_agent-mailbox_mailbox__inbox(min_priority=5)
 if not urgent:
-    backlog = mcp__mailbox__inbox()
+    backlog = mcp__plugin_agent-mailbox_mailbox__inbox()
 ```
 
 **REST `/inbox?min_priority=N`** + body `{"priority": N}` in `/send` / `/send-file`。
@@ -765,7 +765,7 @@ docker compose up -d
 
 ### Step 6 — 驗證
 
-開 Claude Code session 進有 `.mcp.json` 的 project → 看到 `mcp__mailbox__*` 工具 → README 的 🚀 Cold-start checklist 跑情境 A 起 watcher → 自我寄一封 test mail 驗證 stream 觸發。
+開 Claude Code session 進有 `.mcp.json` 的 project → 看到 `mcp__plugin_agent-mailbox_mailbox__*` 工具 → README 的 🚀 Cold-start checklist 跑情境 A 起 watcher → 自我寄一封 test mail 驗證 stream 觸發。
 
 ```python
 import sqlite3, datetime

@@ -29,6 +29,6 @@ metadata:
 
 ## 旁支發現
 
-**Mailbox bridge 是單向**（Discord → mailbox 有，mailbox → Discord 沒）。所以 `mcp__mailbox__send` / SQL INSERT `wiki → user-discord` 只進 SQLite，**不會到 Discord**。User Discord 端的所有訊息都靠 agent-notify。
+**Mailbox bridge 是單向**（Discord → mailbox 有，mailbox → Discord 沒）。所以 `mcp__plugin_agent-mailbox_mailbox__send` / SQL INSERT `wiki → user-discord` 只進 SQLite，**不會到 Discord**。User Discord 端的所有訊息都靠 agent-notify。
 
 要寄訊息給 user 一定走 agent-notify，不是 mailbox INSERT。Mailbox INSERT 純做 audit log。

@@ -247,7 +247,7 @@ So names on different machines look like:
 | Future tablet              | `wiki@TAB-ZEN` |
 | Tailscale VPS              | `wiki@vps-tokyo` |
 
-Sending mail: `mcp__mailbox__send(to="wiki@LAPTOP-XYZ789", body="...")` — unambiguous which machine's wiki.
+Sending mail: `mcp__plugin_agent-mailbox_mailbox__send(to="wiki@LAPTOP-XYZ789", body="...")` — unambiguous which machine's wiki.
 
 If you're sure a role only ever runs on one machine (e.g., `koatag-bridge`
 container only on hub), you *may* drop `@hostname` for that single role. But
@@ -291,7 +291,7 @@ create a local SQLite file. Verify by:
 
 ```python
 # In Claude Code, call:
-mcp__mailbox__whoami()
+mcp__plugin_agent-mailbox_mailbox__whoami()
 # Expected: {"name": "wiki@LAPTOP-XYZ789", "mode": "remote", "hub": "http://<HUB_IP>:1905"}
 ```
 
@@ -338,7 +338,7 @@ Expected first-line stderr:
 
 From the hub, send a mail (use the laptop's full `<role>@<hostname>`):
 ```python
-mcp__mailbox__send(to="wiki@LAPTOP-XYZ789", body="hello from hub")
+mcp__plugin_agent-mailbox_mailbox__send(to="wiki@LAPTOP-XYZ789", body="hello from hub")
 ```
 
 The laptop watcher should immediately emit one stdout line:
@@ -350,7 +350,7 @@ MAIL id=<N> from=<hub-name> sent=<ts> preview=hello from hub
 
 From the laptop, send back (use the hub's full name):
 ```python
-mcp__mailbox__send(to="wiki@DESKTOP-ABC123", body="hello from laptop")
+mcp__plugin_agent-mailbox_mailbox__send(to="wiki@DESKTOP-ABC123", body="hello from laptop")
 ```
 
 Hub-side wiki watcher sees it. Names always include `@hostname` to avoid
@@ -414,7 +414,7 @@ curl -H "Authorization: Bearer <TOKEN>" http://<HUB_IP>:1905/peers
 # Expected: JSON listing peers, no 401
 
 # 3. MCP whoami says remote
-# (in Claude Code) mcp__mailbox__whoami()
+# (in Claude Code) mcp__plugin_agent-mailbox_mailbox__whoami()
 # Expected: {"name": "laptop", "mode": "remote", "hub": "http://<HUB_IP>:1905"}
 
 # 4. No ghost DB on laptop
@@ -422,11 +422,11 @@ dir C:\Users\<your-user>\.claude\mailbox\
 # Expected: empty or no mailbox.db
 
 # 5. Watcher heartbeating
-# (in Claude Code on hub) mcp__mailbox__peers()
+# (in Claude Code on hub) mcp__plugin_agent-mailbox_mailbox__peers()
 # Expected: "laptop" entry with recent last_seen_at (within last minute)
 
 # 6. Round-trip mail
-# (on hub) mcp__mailbox__send(to="laptop", body="ping")
+# (on hub) mcp__plugin_agent-mailbox_mailbox__send(to="laptop", body="ping")
 # (on laptop) watcher emits MAIL line within ~2 seconds
 ```
 
@@ -473,13 +473,13 @@ Content-addressed under `<db-parent>/attachments/<sha256[:2]>/<sha256>` (so in d
 
 ```python
 # Hub agent:
-mcp__mailbox__send(to="wiki@LAPTOP-XYZ", body="snapshot zip",
+mcp__plugin_agent-mailbox_mailbox__send(to="wiki@LAPTOP-XYZ", body="snapshot zip",
                    files=["C:/tmp/snapshot.zip"])
 
 # Spoke agent later:
-inbox = mcp__mailbox__inbox()
+inbox = mcp__plugin_agent-mailbox_mailbox__inbox()
 # → [{id, from, body, attachments: [{id, filename, size, sha256}]}]
-mcp__mailbox__download(attachment_id=N, save_to="C:/tmp/snapshot.zip")
+mcp__plugin_agent-mailbox_mailbox__download(attachment_id=N, save_to="C:/tmp/snapshot.zip")
 # → verifies sha256 against server-reported hash before saving
 ```
 
@@ -886,7 +886,7 @@ Use `audit_last_at` to spot stuck servers — if it falls far behind wall-clock 
 | `audit_count` grows but disk barely moves | each row is ~150 bytes — even 1M rows is ~150 MB | not a problem; if it is, set `MAILBOX_AUDIT_DISABLED=1` and add to retention sweep |
 | `--action foo` rejected with rc=2 | `foo` not in the canonical action set | valid actions: `send / inbox / mark_read / download / whoami / peers` |
 | `/audit` returns 401 | missing `Authorization: Bearer <token>` header | same auth as all other REST endpoints (Phase 0) |
-| Spoke `mcp__mailbox__whoami()` doesn't show up in audit | spoke is in remote-mode and doesn't write local audit — the call hits the hub but `whoami` is not a REST endpoint | by design; whoami is identity introspection, not a state mutation, and the hub never sees it |
+| Spoke `mcp__plugin_agent-mailbox_mailbox__whoami()` doesn't show up in audit | spoke is in remote-mode and doesn't write local audit — the call hits the hub but `whoami` is not a REST endpoint | by design; whoami is identity introspection, not a state mutation, and the hub never sees it |
 
 ### What's NOT audited
 
@@ -917,9 +917,9 @@ Idempotent on existing DBs — `server.py` / `mailbox-server.py` add the column 
 
 ```python
 # MCP (server.py)
-mcp__mailbox__send(to="wiki", body="step 3/5", expires_at="1h")
-mcp__mailbox__send(to="koatag", body="x", expires_at="2026-05-25T00:00:00Z")
-mcp__mailbox__send(to="hub", body="permanent")  # expires_at=None → never expires
+mcp__plugin_agent-mailbox_mailbox__send(to="wiki", body="step 3/5", expires_at="1h")
+mcp__plugin_agent-mailbox_mailbox__send(to="koatag", body="x", expires_at="2026-05-25T00:00:00Z")
+mcp__plugin_agent-mailbox_mailbox__send(to="hub", body="permanent")  # expires_at=None → never expires
 
 # REST (mailbox-server.py)
 POST /send
@@ -1198,13 +1198,13 @@ DDL owned by `mailbox_reactions.init_schema()` — separate executescript block,
 ### MCP API (server.py)
 
 ```python
-mcp__mailbox__react(message_id=123, emoji="✅")
+mcp__plugin_agent-mailbox_mailbox__react(message_id=123, emoji="✅")
 # → {added: true, id: 7, created_at: "..."}
 
-mcp__mailbox__react(message_id=123, emoji="✅")
+mcp__plugin_agent-mailbox_mailbox__react(message_id=123, emoji="✅")
 # → {added: false, id: 7, ...}  -- idempotent, returns existing
 
-mcp__mailbox__unreact(message_id=123, emoji="✅")
+mcp__plugin_agent-mailbox_mailbox__unreact(message_id=123, emoji="✅")
 # → {removed: 1}
 ```
 

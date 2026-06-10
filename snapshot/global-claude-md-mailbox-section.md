@@ -3,34 +3,32 @@
 > Copied here so the canonical mailbox repo records how mailbox is wired into the
 > global config. Update both sides if the source changes.
 >
-> Last sync: 2026-05-19
+> Last sync: 2026-06-10（plugin 化後）
 
 ---
 
-## Mailbox 通訊 — Session 開始時自動啟動 watcher
+## Mailbox 通訊
 
-如果這個 session 有 mailbox MCP（工具列表裡看得到 `mcp__mailbox__*`），**第一個 turn** 自動跑：
+Mailbox 已 **plugin 化**（`agent-mailbox` plugin，git `OHIMEOPP/agent_mailbox`）。看到 mailbox 工具（plugin 模式下名為 `mcp__plugin_agent-mailbox_mailbox__*`）→ **這個 session 是 mailbox-enabled**。
 
-1. 呼叫 `mcp__mailbox__whoami` 拿到本 instance 的名字（例如 `wiki`、`koatag`）
-2. 用 **Monitor tool** 起 stream-mode watcher（`persistent: true`）：
-   ```
-   command:     py "C:/Users/User/Desktop/VSCcode/claude-mailbox/mailbox-watch.py" <name> --monitor
-   description: mailbox watcher for <name>
-   persistent:  true
-   timeout_ms:  3600000
-   ```
-3. 跟使用者一句話交代：「mailbox watcher 已啟動（Monitor stream-mode，每封 mail 一條 notification，watcher 不死）」
+**起 watcher 不用再手動跑 checklist**：plugin 的 SessionStart hook 會自動偵測本專案 mailbox 身分（讀 `.mailbox-name`）並注入一段提示，要你用 **Monitor tool** 起 watcher（hub 本機 mode 或 spoke `--remote` mode 自動判斷）。照那段注入的指令起即可，起完回報一句。例外：使用者明確說「不要 watcher / 這次不用 mailbox」就略過。
 
-之後別的 agent（例如 wiki ↔ koatag 互寄）任何訊息進 mailbox，watcher 印一行 `MAIL id=... from=...` 到 stdout、harness 用 Monitor 機制喚醒 agent 自動 `inbox` + `mark_read` + 視情況回信。**Watcher 收完信繼續活著**，下封 mail 直接接，不需要 restart cycle。
+收信／回信／mark_read／寄 peer agent／DM user／寄 Discord 等操作的完整流程 + schema 陷阱仍見：
 
-**例外**：使用者明確說「不要 watcher」/「這次不用 mailbox」就略過。
-
-**Legacy exit-mode** (`py mailbox-watch.py <name>` 不帶 `--monitor`)：watcher 第一次見 unread 就 exit code 0；走 Bash `run_in_background:true` 也能 wake，但 wake 後 watcher 死掉，需 restart。新 session 一律用 monitor mode。
+📘 **`C:/Users/User/Desktop/VSCcode/claude-mailbox/README.md`** 的 HOW-TO docs（`HOW-TO-USE-MAILBOX.md` / `HOW-TO-START-WATCHER.md`）。
 
 ---
+
+## 新裝置安裝（plugin）
+
+```
+/plugin marketplace add OHIMEOPP/agent_mailbox
+/plugin install agent-mailbox@agent-mailbox
+```
+→ 重啟 Claude Code。每個 mailbox 專案根放一個 `.mailbox-name` 檔（內容=instance 名，如 `wiki`）。監軍/supervisor 專案另放 `.mailbox-watch-args`=`--watch-all`。spoke 設 OS env `CLAUDE_MAILBOX_REMOTE`(hub URL) + `CLAUDE_MAILBOX_TOKEN`。
 
 詳細 pattern 與工具：
-- Script: `claude-mailbox/mailbox-watch.py`（5s tick，per-instance filter）
+- Plugin 本體 + watcher script: `claude-mailbox/`（marketplace = 本 repo）
 - Dump: `claude-mailbox/mailbox-dump.py`（slash command `/mblog` 或 `/觀看紀錄`）
-- Bridge (Discord↔mailbox): `claude-mailbox/mailbox-discord-bridge.py`（docker container `mailbox-bridge`）
-- Whitelist CLI: `claude-mailbox/mailbox-whitelist.py`
+- Bridge (Discord↔mailbox): `claude-mailbox/bridge/`（docker container `mailbox-bridge`）
+- Whitelist CLI: `claude-mailbox/tools/mailbox-whitelist.py`

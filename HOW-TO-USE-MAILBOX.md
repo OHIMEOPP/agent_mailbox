@@ -26,7 +26,7 @@ Once your Monitor watcher is up, every new unread mail addressed to your
 
 | `from_name` shape | Source | Reply channel |
 |---|---|---|
-| `wiki` / `koatag` / `koatag-frontend` | another Claude agent | `mcp__mailbox__send` |
+| `wiki` / `koatag` / `koatag-frontend` | another Claude agent | `mcp__plugin_agent-mailbox_mailbox__send` |
 | `user-discord (ohimeopp)` | trusted user via Discord DM | `POST :1901/agent-notify` (no channel) |
 | `user-discord (<other>) ch=<id>` | stranger via Discord DM | `POST :1901/agent-notify` **with** `channel: <id>` |
 | `test-self` | manual SQL insert (testing) | up to you |
@@ -41,7 +41,7 @@ row = db.execute("SELECT * FROM messages WHERE id = ?", (msg_id,)).fetchone()
 print(row['body'])
 ```
 
-Or use the MCP tool if available: `mcp__mailbox__inbox(unread_only=true)`.
+Or use the MCP tool if available: `mcp__plugin_agent-mailbox_mailbox__inbox(unread_only=true)`.
 
 ---
 
@@ -56,7 +56,7 @@ db.execute("UPDATE messages SET read_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') W
 db.commit()
 ```
 
-Or via MCP: `mcp__mailbox__mark_read(ids=[msg_id])`.
+Or via MCP: `mcp__plugin_agent-mailbox_mailbox__mark_read(ids=[msg_id])`.
 
 ---
 
@@ -67,7 +67,7 @@ Or via MCP: `mcp__mailbox__mark_read(ids=[msg_id])`.
 The agent's watcher will surface your message just like yours surfaces theirs.
 
 ```python
-mcp__mailbox__send(to="koatag", body="commit 0xdeadbeef is broken, see ...")
+mcp__plugin_agent-mailbox_mailbox__send(to="koatag", body="commit 0xdeadbeef is broken, see ...")
 ```
 
 Or SQL insert (same effect, no MCP needed):
@@ -143,10 +143,10 @@ body = {
 This is the `discord-stranger-chat` session flow. The trusted user's DM
 **omits** `channel` (defaults to the configured trusted channel).
 
-### ❌ Anti-pattern: replying via `mcp__mailbox__send` to `user-discord`
+### ❌ Anti-pattern: replying via `mcp__plugin_agent-mailbox_mailbox__send` to `user-discord`
 
 ```python
-mcp__mailbox__send(to="user-discord", body="reply text")  # ← WRONG
+mcp__plugin_agent-mailbox_mailbox__send(to="user-discord", body="reply text")  # ← WRONG
 ```
 
 This inserts a row into SQLite but the bridge container does not poll for
