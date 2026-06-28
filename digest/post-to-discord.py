@@ -79,19 +79,28 @@ def main():
         print("ERROR: .secrets 缺 DISCORD_BOT_TOKEN / DISCORD_CHANNEL_ID")
         sys.exit(2)
 
-    if len(sys.argv) >= 3 and sys.argv[1] == "--error":
-        post(token, channel, f"❌ **AI/LLM digest 失敗**\n{sys.argv[2]}")
+    # Optional ASCII flag --stock: route to the stock channel + switch the label.
+    # Default (no flag) is unchanged -> AI/LLM digest on DISCORD_CHANNEL_ID.
+    args = sys.argv[1:]
+    label = "AI/LLM digest"
+    if "--stock" in args:
+        label = "股市 digest"
+        channel = s.get("DISCORD_STOCK_CHANNEL_ID") or channel  # dedicated stock channel
+        args = [a for a in args if a != "--stock"]
+
+    if len(args) >= 2 and args[0] == "--error":
+        post(token, channel, f"❌ **{label} 失敗**\n{args[1]}")
         print("posted error notice")
         return
 
-    if len(sys.argv) < 2:
-        print("usage: post-to-discord.py <file> | --error <reason>")
+    if len(args) < 1:
+        print("usage: post-to-discord.py <file> [--stock] | --error <reason> [--stock]")
         sys.exit(2)
 
-    with open(sys.argv[1], encoding="utf-8") as f:
+    with open(args[0], encoding="utf-8") as f:
         text = f.read().strip()
     if not text:
-        post(token, channel, "❌ **AI/LLM digest 失敗**\ndigest 內容為空")
+        post(token, channel, f"❌ **{label} 失敗**\ndigest 內容為空")
         print("empty digest -> posted failure notice")
         return
 

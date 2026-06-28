@@ -1,0 +1,45 @@
+{
+  "focus": "美股隔夜（科技/半導體/AI/重要財報）+ 台股昨日盤後與今晨重大訊息中，最可能牽動『台股供應鏈受益股』的事件。核心是把『國際/美股事件 → 台股受益者』的供應鏈關聯與證據鏈攤開，不是純美國本土題材。",
+  "window_hours": 24,
+  "max_news": 12,
+  "max_picks": 15,
+  "sources": {
+    "美股 / 國際財經": [
+      "https://www.cnbc.com/markets/",
+      "https://www.reuters.com/markets/",
+      "https://www.marketwatch.com/",
+      "https://finance.yahoo.com/",
+      "https://www.bloomberg.com/markets"
+    ],
+    "半導體 / 科技供應鏈": [
+      "https://www.digitimes.com.tw/ (亞洲供應鏈權威，台廠連動關鍵)",
+      "https://www.tomshardware.com/",
+      "https://semiwiki.com/",
+      "https://www.anandtech.com/"
+    ],
+    "台股財經": [
+      "https://news.cnyes.com/news/cat/tw_stock (鉅亨網台股)",
+      "https://www.ctee.com.tw/ (工商時報)",
+      "https://money.udn.com/money/index (經濟日報)",
+      "https://www.moneydj.com/ (MoneyDJ)",
+      "https://mops.twse.com.tw/mops/web/index (公開資訊觀測站：法說/重大訊息)"
+    ]
+  },
+  "search_queries_hint": [
+    "美股 隔夜 收盤 半導體 AI",
+    "NVDA earnings AI server demand",
+    "台積電 ADR 美股 半導體",
+    "AI 伺服器 供應鏈 台股 受益",
+    "CoWoS 先進封裝 概念股",
+    "HBM 記憶體 美光 三星 台廠",
+    "蘋果 供應鏈 台廠 出貨",
+    "Tesla 電動車 台廠 供應鏈",
+    "散熱 液冷 資料中心 概念股",
+    "台股 法人 買超 外資 半導體",
+    "PCB ABF 載板 訂單",
+    "重大訊息 法說會 出貨 財報 台股",
+    "DigiTimes supply chain Taiwan",
+    "光通訊 矽光子 800G 概念股"
+  ],
+  "_note": "這份清單可自由增刪。run-stock-digest 會把它交給 Claude 當研究指引；不是硬性逐站爬，而是 Claude 依此搜尋、挑最重要的、並把『事件→台股受益股』的證據鏈整理出來。"
+}

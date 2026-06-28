@@ -18,6 +18,7 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="repla
 BRIDGE = "http://localhost:1904/agent-notify"
 AGENT = "wiki"
 TASK = "AI/LLM 每日 digest"
+STOCK_TASK = "每日股市 digest"  # selected by the ASCII --stock flag
 MAX = 1800  # Discord caps a message at 2000 chars; leave room for the bridge header.
 
 
@@ -53,28 +54,35 @@ def chunk(text, size):
 
 
 def main():
-    if len(sys.argv) >= 3 and sys.argv[1] == "--error":
-        post(TASK + " — 失敗", sys.argv[2], status="fail")
+    # Optional ASCII flag --stock switches the Discord title; default = AI/LLM digest.
+    args = sys.argv[1:]
+    task = TASK
+    if "--stock" in args:
+        task = STOCK_TASK
+        args = [a for a in args if a != "--stock"]
+
+    if len(args) >= 2 and args[0] == "--error":
+        post(task + " — 失敗", args[1], status="fail")
         print("posted error notice")
         return
 
-    if len(sys.argv) < 2:
-        print("usage: post-to-bridge.py <digest-file> | --error <reason>")
+    if len(args) < 1:
+        print("usage: post-to-bridge.py <digest-file> [--stock] | --error <reason> [--stock]")
         sys.exit(2)
 
-    with open(sys.argv[1], encoding="utf-8") as f:
+    with open(args[0], encoding="utf-8") as f:
         text = f.read().strip()
 
     if not text:
-        post(TASK + " — 失敗", "digest 內容為空", status="fail")
+        post(task + " — 失敗", "digest 內容為空", status="fail")
         print("empty digest -> posted failure notice")
         return
 
     parts = chunk(text, MAX)
     n = len(parts)
     for i, part in enumerate(parts, 1):
-        task = TASK if n == 1 else f"{TASK} ({i}/{n})"
-        code = post(task, part)
+        label = task if n == 1 else f"{task} ({i}/{n})"
+        code = post(label, part)
         print(f"part {i}/{n}: HTTP {code}")
 
 
