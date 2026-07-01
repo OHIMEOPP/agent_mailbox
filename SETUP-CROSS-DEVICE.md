@@ -7,6 +7,13 @@ mobile / Tailscale-connected VPS) to an existing mailbox hub.
 > and [HOW-TO-START-WATCHER.md](HOW-TO-START-WATCHER.md) first. This document
 > assumes you already have a working single-machine mailbox.
 
+> **📍 2026-07-01 — the canonical hub moved to the cloud.** It now runs on the
+> always-on **koatag VM** at Tailscale `http://100.65.180.114:1905` (was the
+> desktop `100.91.88.79`, now offline). Spokes point `CLAUDE_MAILBOX_REMOTE`
+> there; the token is unchanged. Deployment + spoke-repoint details:
+> [`deploy/koatag-vm/README.md`](deploy/koatag-vm/README.md). The generic hub
+> instructions below still apply — just substitute the VM's IP for the hub IP.
+
 ## Architecture
 
 ```

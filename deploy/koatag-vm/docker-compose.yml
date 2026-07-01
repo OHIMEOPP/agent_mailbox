@@ -1,0 +1,86 @@
+# Mailbox hub — koatag VM deployment (canonical hub since 2026-07-01).
+#
+# The hub moved off the desktop (Tailscale 100.91.88.79, now offline) onto the
+# always-on koatag GCP VM (Tailscale 100.65.180.114). Reached over Tailscale
+# only — NO public exposure, NO GCP firewall rule (published ports bind to the
+# tailscale0 IP). See README.md in this dir for the migration + spoke repoint.
+#
+# On the VM this lives at ~/mailbox/docker-compose.yml with:
+#   ~/mailbox/repo/   scp'd source (mailbox-server.py + mailbox/ + bridge/)
+#   ~/mailbox/.env    CLAUDE_MAILBOX_TOKEN=... (mode 600, NOT committed)
+#   ~/mailbox/data/   SQLite mailbox.db + attachments/ + backups/ (fresh 2026-07-01)
+#
+# Manage:
+#   cd ~/mailbox && docker compose up -d mailbox-server          # core (agent<->agent)
+#   cd ~/mailbox && docker compose --profile bridge up -d        # + Discord bridge (Phase 2)
+#   docker compose logs -f mailbox-server
+#
+# NOTE: repo paths here assume the source sits at ./repo/ next to this file.
+# On the VM that's ~/mailbox/repo (scp'd, not a git checkout) to avoid pulling
+# the private repo onto the box.
+
+services:
+  mailbox-server:
+    image: python:3.12-slim
+    container_name: mailbox-server
+    restart: always
+    ports:
+      # bind to the tailscale0 IP only — never the public NIC
+      - "100.65.180.114:1905:1905"
+    environment:
+      - TZ=Asia/Taipei
+      - PIP_CACHE_DIR=/cache/pip
+      - CLAUDE_MAILBOX_TOKEN=${CLAUDE_MAILBOX_TOKEN:?CLAUDE_MAILBOX_TOKEN required}
+      - MAILBOX_RETENTION_READ_DAYS=${MAILBOX_RETENTION_READ_DAYS:-7}
+      - MAILBOX_RETENTION_UNREAD_DAYS=${MAILBOX_RETENTION_UNREAD_DAYS:-14}
+      - MAILBOX_RETENTION_PEER_DAYS=${MAILBOX_RETENTION_PEER_DAYS:-30}
+    volumes:
+      - ./repo/mailbox-server.py:/app/mailbox-server.py:ro
+      - ./repo/mailbox:/app/mailbox:ro
+      - ./data:/data
+      - mailbox-server-pip-cache:/cache/pip
+    working_dir: /app
+    command:
+      - bash
+      - -c
+      - "pip install --quiet 'Pillow>=11,<13' && exec python mailbox-server.py --host 0.0.0.0 --port 1905 --db /data/mailbox.db"
+    networks:
+      - mailboxnet
+
+  mailbox-bridge:
+    image: python:3.12-slim
+    container_name: mailbox-bridge
+    restart: always
+    profiles: ["bridge"]          # not started by default; Phase 2
+    ports:
+      - "100.65.180.114:1904:1904"
+    environment:
+      - TZ=Asia/Taipei
+      - PIP_CACHE_DIR=/data/.pip-cache
+      # Same Discord bot as the VM's node-red (VTuber) + digests. REST is
+      # stateless (safe to share); the gateway websocket is the only singleton.
+      - DISCORD_BOT_TOKEN=${DISCORD_BOT_TOKEN:-}
+      - DISCORD_DEFAULT_CHANNEL=${DISCORD_DEFAULT_CHANNEL:-1284065900659740773}
+      - NOTIFY_URL=${NOTIFY_URL:-http://localhost:1904/agent-notify}
+    volumes:
+      - ./repo/bridge:/app/bridge:ro
+      - ./data:/data
+    working_dir: /app
+    command:
+      - bash
+      - -c
+      - "pip install --quiet 'discord.py>=2.7,<3' && exec python -m bridge --db /data/mailbox.db --bind 0.0.0.0 --port 1904"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; r=urllib.request.urlopen('http://localhost:1904/healthz',timeout=3); sys.exit(0 if r.status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
+    networks:
+      - mailboxnet
+
+volumes:
+  mailbox-server-pip-cache:
+
+networks:
+  mailboxnet:
