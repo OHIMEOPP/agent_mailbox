@@ -55,10 +55,23 @@ def process_discord_inbound(content, author, author_id, channel, to_name_hint, d
                           'count': count, 'error': err})
 
     # === Trusted-user @prefix routing override ===
+    # Map a DM prefix -> recipient mailbox name. Bare-name targets map to
+    # themselves; aliases (laptop) map to the full <role>@<hostname> name so the
+    # user doesn't have to type the hostname. Order matters: longer/more-specific
+    # prefixes first (e.g. @koatag-frontend before @koatag).
     if is_trusted:
-        for prefix in ('@koatag-frontend ', '@koatag ', '@stranger-conv ', '@mailbox-dev '):
+        route_prefixes = {
+            '@koatag-frontend ': 'koatag-frontend',
+            '@koatag ': 'koatag',
+            '@stranger-conv ': 'stranger-conv',
+            '@mailbox-dev ': 'mailbox-dev',
+            '@laptop ': 'wiki@LAPTOP-MQ1OGSN5',
+            '@wiki-laptop ': 'wiki@LAPTOP-MQ1OGSN5',
+            '@supporters ': 'supporters',
+        }
+        for prefix, target in route_prefixes.items():
             if content.lower().startswith(prefix.lower()):
-                to_name = prefix[1:-1]
+                to_name = target
                 content = content[len(prefix):]
                 break
 
