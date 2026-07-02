@@ -8,7 +8,9 @@ r"""
   - 上櫃：https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes (SecuritiesCompanyCode, Close)
 
 行為：
-  - 只處理第③部（「受益股清單」標題 ~ 結尾 ⚠ 行之間）的編號行 (^\d+\.)
+  - 處理第③部（「受益股清單」）＋第④部（「第二層受惠鏈」）＋第⑤部（「百元內銅板小股」）
+    ~ 結尾 ⚠ 行之間的編號行 (^\d+\.)
+  - ⑤ 部額外檢查：實際昨收 >100 元的，在價格後加「（>100，僅參考）」（LLM 挑錯低價股的提醒）
   - 找該行第一個 (代號)，在 ) 後插入 " <收盤>元"；查不到標 " N/A"
   - idempotent：若 ) 後已是 數字+元 / N/A 就跳過，不重複插
   - 抓不到資料（網路掛）：原檔不動、回傳 0（讓 digest 照常投遞，只是沒價）
@@ -88,13 +90,21 @@ def process(path):
         return 0
 
     in_section = False
+    in_copper = False   # ⑤ 百元內銅板小股：填價後若實價 >100 元加註記
     n_filled = 0
     out = []
     for line in lines:
-        if "受益股清單" in line:
+        if "百元內銅板小股" in line or "銅板小股" in line:
+            # ⑤ 專區：一樣回填股價，另外對 >100 元者加「（>100，僅參考）」
             in_section = True
+            in_copper = True
+        elif "受益股清單" in line or "第二層受惠鏈" in line:
+            # ③ 受益股清單 與 ④ 第二層受惠鏈（衛星/小型股）都要回填股價
+            in_section = True
+            in_copper = False
         elif line.lstrip().startswith("⚠"):
             in_section = False
+            in_copper = False
 
         if in_section and re.match(r"^\s*\d+\.", line):
             m = CODE_RE.search(line)
@@ -102,6 +112,12 @@ def process(path):
                 code = m.group(2)
                 price = table.get(code)
                 tag = f" {price}元" if price else " N/A"
+                if in_copper and price:
+                    try:
+                        if float(price) > 100:
+                            tag += "（>100，僅參考）"
+                    except ValueError:
+                        pass
                 line = line[:m.end()] + tag + line[m.end():]
                 if price:
                     n_filled += 1
