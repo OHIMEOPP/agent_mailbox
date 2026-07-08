@@ -1027,6 +1027,61 @@ def whoami() -> dict:
     return {"name": NAME, "mode": "local", "db_path": str(DB_PATH.absolute())}
 
 
+# ---------- Discord bridge: DM the real human owner ----------
+# Reaching the *user* (a real human on Discord) is a different channel from
+# reaching a peer agent. Peer agents get send(); the user's DM goes through the
+# bridge's /agent-notify endpoint (:1904). plugin send(to="user-discord") would
+# dead-letter, so this tool wraps the bridge call — any device can DM the user
+# without hand-crafting the HTTP request. Override host via env; default points
+# at the always-on VM bridge (desktop bridge is stopped; outbound DM goes to VM).
+NOTIFY_URL = os.environ.get(
+    "CLAUDE_MAILBOX_NOTIFY_URL",
+    "http://100.65.180.114:1904/agent-notify",
+).strip()
+
+
+@mcp.tool()
+def notify_user(text: str, title: str | None = None, status: str = "info") -> dict:
+    """DM the human owner on Discord via the mailbox bridge (:1904).
+
+    Reaches the *real user* — NOT a peer agent. Peer agents get send(); the
+    user's Discord DM is a separate channel that plugin send() does NOT reach
+    (it dead-letters). This wraps the bridge /agent-notify endpoint so any
+    device can DM the user without hand-crafting an HTTP call.
+
+    Args:
+        text:   message body (rendered as the DM detail). CJK/UTF-8 fine.
+        title:  optional short headline shown after the [name] tag.
+        status: info | done | fail | warn — leading icon. Default info.
+
+    Returns:
+        {ok: True, sent: <rendered content>}; raises RuntimeError on bridge error.
+    """
+    if not (text or title):
+        raise RuntimeError("notify_user: need text or title")
+    payload = {
+        "agent": NAME,
+        "task": (title or "").strip(),
+        "status": (status or "info").strip().lower(),
+        "detail": text or "",
+    }
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        NOTIFY_URL, data=data, method="POST",
+        headers={"Content-Type": "application/json; charset=utf-8"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            # Bridge returns text/plain (the rendered DM) on success — not JSON.
+            return {"ok": True, "sent": r.read().decode("utf-8", "replace")}
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(
+            f"notify_user → HTTP {e.code}: {e.read().decode('utf-8', 'replace')}")
+    except urllib.error.URLError as e:
+        raise RuntimeError(
+            f"notify_user bridge unreachable ({NOTIFY_URL}): {e.reason}")
+
+
 @mcp.tool()
 def react(message_id: int, emoji: str) -> dict:
     """Add a reaction (emoji) to a mailbox message.
