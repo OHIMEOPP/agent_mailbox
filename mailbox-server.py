@@ -57,6 +57,7 @@ from mailbox import pinned as mailbox_pinned
 from mailbox import priority as mailbox_priority
 from mailbox import rate_limit as mailbox_rate_limit
 from mailbox import reactions as mailbox_reactions
+from mailbox import receipts as mailbox_receipts
 from mailbox import scheduled as mailbox_scheduled
 from mailbox import snoozed as mailbox_snoozed
 from mailbox import sweep as mailbox_sweep
@@ -146,7 +147,8 @@ def db_init(path: pathlib.Path):
             priority INTEGER NOT NULL DEFAULT 0,
             pinned INTEGER NOT NULL DEFAULT 0,
             snoozed_until TEXT,
-            forwarded_from_msg_id INTEGER
+            forwarded_from_msg_id INTEGER,
+            request_receipt INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_to_unread
             ON messages(to_name, read_at);
@@ -759,10 +761,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 inserted: list[dict] = []
                 for to_name in recipients:
                     row = conn.execute(
-                        "INSERT INTO messages(from_name, to_name, body, in_reply_to, expires_at, priority) "
-                        "VALUES(?, ?, ?, ?, ?, ?) RETURNING id, sent_at",
+                        "INSERT INTO messages(from_name, to_name, body, in_reply_to, expires_at, priority, request_receipt) "
+                        "VALUES(?, ?, ?, ?, ?, ?, ?) RETURNING id, sent_at",
                         (payload["from"], to_name, payload["body"],
-                         in_reply_to, expires_at, priority),
+                         in_reply_to, expires_at, priority,
+                         1 if payload.get("request_receipt") else 0),
                     ).fetchone()
                     inserted.append({"id": row["id"], "sent_at": row["sent_at"],
                                      "to": to_name})
@@ -815,6 +818,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             placeholders = ",".join("?" for _ in ids)
             conn = db_connect(srv.db_path)
             try:
+                # Receipt-requesting rows collected BEFORE the UPDATE —
+                # "read_at IS NULL" is the newly-read filter (re-mark ≠ re-send).
+                receipt_pending = mailbox_receipts.collect_pending(conn, ids)
                 # mark_read auto-releases any active claim — done processing.
                 cur = conn.execute(
                     f"UPDATE messages SET read_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), "
@@ -822,6 +828,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     f"WHERE id IN ({placeholders}) AND read_at IS NULL",
                     ids,
                 )
+                receipts = mailbox_receipts.insert_receipts(conn, receipt_pending)
                 conn.commit()
                 count = cur.rowcount
             finally:
@@ -830,7 +837,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 srv.db_path, actor=f"rest:{self.client_address[0]}",
                 action="mark_read", payload={"ids": ids, "marked": count},
             )
-            return self._json(200, {"count": count})
+            for rc in receipts:
+                mailbox_audit.log_event(
+                    srv.db_path, actor=f"rest:{self.client_address[0]}",
+                    action="read_receipt_sent", target=rc["to"],
+                    payload={"msg_id": rc["for_msg_id"],
+                             "receipt_id": rc["receipt_id"]},
+                )
+            resp = {"count": count}
+            if receipts:
+                resp["receipts_sent"] = len(receipts)
+            return self._json(200, resp)
 
         if path == "/react":
             for k in ("actor", "message_id", "emoji"):
@@ -1234,10 +1251,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             fanout_results: list[dict] = []
             for to_name in recipients:
                 row = conn.execute(
-                    "INSERT INTO messages(from_name, to_name, body, has_attachments, in_reply_to, expires_at, priority) "
-                    "VALUES(?, ?, ?, 1, ?, ?, ?) RETURNING id, sent_at",
+                    "INSERT INTO messages(from_name, to_name, body, has_attachments, in_reply_to, expires_at, priority, request_receipt) "
+                    "VALUES(?, ?, ?, 1, ?, ?, ?, ?) RETURNING id, sent_at",
                     (payload["from"], to_name, payload["body"],
-                     in_reply_to, expires_at, priority),
+                     in_reply_to, expires_at, priority,
+                     1 if payload.get("request_receipt") else 0),
                 ).fetchone()
                 msg_id = row["id"]
                 attach_rows = []

@@ -276,9 +276,9 @@ NOTIFY_URL = os.environ.get("CLAUDE_NOTIFY_URL", "http://localhost:1904/agent-no
 
 | Tool | 用途 |
 |---|---|
-| `send(to, body, files?=[])` | 寄給某 instance；`files` 是 host filesystem 路徑列表，多附件一起送 |
+| `send(to, body, files?=[], request_receipt?=false)` | 寄給某 instance；`files` 是 host filesystem 路徑列表，多附件一起送；`request_receipt=true` 時對方 mark_read 會自動回一封 `receipt: msg #X read at <ts>` ack（緊急 ping 確認真的被看到；ack 本身不再觸發 receipt） |
 | `inbox(unread_only=true, limit=50)` | 收信；每則訊息額外帶 `attachments: [{id, filename, mime, size, sha256}]` |
-| `mark_read(ids)` | 標記已讀 |
+| `mark_read(ids)` | 標記已讀；若訊息帶 request_receipt 會自動回 ack 給寄件人（回傳多 `receipts_sent` 欄） |
 | `peers()` | 列出曾連線過的 instance |
 | `download(attachment_id, save_to)` | 把附件 blob 拉到 local file path |
 | `whoami()` | 確認自己是誰、DB 在哪 |

@@ -40,15 +40,18 @@ mentions list；或加 mentions 欄到 messages，watcher SELECT 加 OR mentions
 **How to apply**：schema migration 加 `messages.mentions_json TEXT`（JSON array）；
 watcher SQL 加 OR clause；inbox SELECT 加 mentions filter。
 
-### 3. Read receipts
+### 3. Read receipts ✅（2026-07-10 落地）
 
-寄件人標 `request_receipt=True`，當收件人 mark_read 時，hub 自動寄一封 small ack 訊息
-回原寄件人（body="receipt: msg #X read at <ts>"）。
+寄件人標 `request_receipt=True`，當收件人 mark_read 時，自動寄一封 small ack 訊息
+回原寄件人（body="receipt: msg #X read at <ts>"，`in_reply_to=X`）。
 
 **Why**：緊急 ping 想確認對方真看到了。
 
-**How to apply**：schema `messages.request_receipt INTEGER DEFAULT 0`；mark_read 邏輯
-加 hook：if request_receipt then send ack。Audit 加 action=read_receipt_sent。
+**實作**：migration v009 `messages.request_receipt`；`mailbox/receipts.py`（collect
+BEFORE update → insert after，同 transaction）；MCP `send`/`mark_read` + REST hub
+`/send`/`/send-file`/`/mark_read` 兩側都接；ack 自身 `request_receipt=0` 防迴圈；
+re-mark 不重寄；audit `action=read_receipt_sent`。deliver_at 排程訊息不支援（raise）。
+測試：`tests/smoke_test_receipts.py` 六案 + server.py 函式層 E2E。
 
 ---
 

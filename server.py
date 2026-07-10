@@ -37,6 +37,7 @@ from mailbox import mute as mailbox_mute
 from mailbox import pinned as mailbox_pinned
 from mailbox import priority as mailbox_priority
 from mailbox import reactions as mailbox_reactions
+from mailbox import receipts as mailbox_receipts
 from mailbox import scheduled as mailbox_scheduled
 from mailbox import snoozed as mailbox_snoozed
 from mcp.server.fastmcp import FastMCP
@@ -245,7 +246,8 @@ def _init_db() -> None:
                 priority INTEGER NOT NULL DEFAULT 0,
                 pinned INTEGER NOT NULL DEFAULT 0,
                 snoozed_until TEXT,
-                forwarded_from_msg_id INTEGER
+                forwarded_from_msg_id INTEGER,
+                request_receipt INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS idx_messages_to_unread
                 ON messages(to_name, read_at);
@@ -383,7 +385,8 @@ def send(to: str, body: str, files: list[str] | None = None,
          in_reply_to: int | None = None,
          expires_at: str | None = None,
          deliver_at: str | None = None,
-         priority: int = 0) -> dict:
+         priority: int = 0,
+         request_receipt: bool = False) -> dict:
     """Send a message (optionally with file attachments) to another Claude Code instance.
 
     Args:
@@ -412,6 +415,11 @@ def send(to: str, body: str, files: list[str] | None = None,
                Accepts ISO 8601 or relative shorthand. Default tick is 30s so
                minimum useful delay is ~30 seconds. NOT compatible with files=
                (raises) — schedule text-only for now.
+        request_receipt: if True, you get a small auto-ack message
+               ("receipt: msg #X read at <ts>", in_reply_to=X) the moment the
+               recipient mark_read's this message. Use for urgent pings where
+               you need to know it was actually seen. NOT compatible with
+               deliver_at (raises).
 
     Returns:
         Literal `to`: {id, sent_at, from, to, in_reply_to?, expires_at?, attachments?: [...]}
@@ -431,6 +439,11 @@ def send(to: str, body: str, files: list[str] | None = None,
             raise RuntimeError(
                 "deliver_at + files: not supported. Schedule a text message "
                 "or send files immediately."
+            )
+        if request_receipt:
+            raise RuntimeError(
+                "deliver_at + request_receipt: not supported. Send immediately "
+                "if you need a read receipt."
             )
         try:
             resolved_deliver_at = mailbox_scheduled.parse_deliver_at(deliver_at)
@@ -494,6 +507,8 @@ def send(to: str, body: str, files: list[str] | None = None,
                 body_payload["in_reply_to"] = in_reply_to
             if resolved_expires_at is not None:
                 body_payload["expires_at"] = resolved_expires_at
+            if request_receipt:
+                body_payload["request_receipt"] = True
             r = _remote_multipart(
                 "/send-file",
                 body_payload,
@@ -523,10 +538,10 @@ def send(to: str, body: str, files: list[str] | None = None,
             fanout_results: list[dict] = []
             for to_name in recipients:
                 row = c.execute(
-                    "INSERT INTO messages(from_name, to_name, body, has_attachments, in_reply_to, expires_at, priority) "
-                    "VALUES(?, ?, ?, 1, ?, ?, ?) RETURNING id, sent_at",
+                    "INSERT INTO messages(from_name, to_name, body, has_attachments, in_reply_to, expires_at, priority, request_receipt) "
+                    "VALUES(?, ?, ?, 1, ?, ?, ?, ?) RETURNING id, sent_at",
                     (NAME, to_name, body, in_reply_to, resolved_expires_at,
-                     validated_priority),
+                     validated_priority, 1 if request_receipt else 0),
                 ).fetchone()
                 msg_id = row["id"]
                 attach_rows = []
@@ -575,6 +590,8 @@ def send(to: str, body: str, files: list[str] | None = None,
             body_payload2["in_reply_to"] = in_reply_to
         if resolved_expires_at is not None:
             body_payload2["expires_at"] = resolved_expires_at
+        if request_receipt:
+            body_payload2["request_receipt"] = True
         r = _remote("POST", "/send", body_payload2)
         # Hub handles fanout — surface its shape back. Single recipient gets
         # {id, sent_at, ...}; pattern gets {fanout: true, messages: [...]}.
@@ -594,10 +611,10 @@ def send(to: str, body: str, files: list[str] | None = None,
         inserted: list[dict] = []
         for to_name in recipients:
             row = c.execute(
-                "INSERT INTO messages(from_name, to_name, body, in_reply_to, expires_at, priority) "
-                "VALUES(?, ?, ?, ?, ?, ?) RETURNING id, sent_at",
+                "INSERT INTO messages(from_name, to_name, body, in_reply_to, expires_at, priority, request_receipt) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?) RETURNING id, sent_at",
                 (NAME, to_name, body, in_reply_to, resolved_expires_at,
-                 validated_priority),
+                 validated_priority, 1 if request_receipt else 0),
             ).fetchone()
             inserted.append({"id": row["id"], "sent_at": row["sent_at"], "to": to_name})
 
@@ -753,17 +770,25 @@ def mark_read(ids: list[int]) -> dict:
         ids: list of message IDs to mark read
 
     Returns:
-        {marked: int}
+        {marked: int, receipts_sent?: int}
+        receipts_sent appears when any marked message had request_receipt set —
+        an auto-ack was mailed back to its sender (see send(request_receipt=)).
     """
     if not ids:
         return {"marked": 0}
 
     if REMOTE:
         r = _remote("POST", "/mark_read", {"ids": ids})
-        return {"marked": r["count"]}
+        out = {"marked": r["count"]}
+        if r.get("receipts_sent"):
+            out["receipts_sent"] = r["receipts_sent"]
+        return out
 
     qmarks = ",".join("?" * len(ids))
     with _connect() as c:
+        # Receipt-requesting rows must be collected BEFORE the UPDATE —
+        # "read_at IS NULL" is the newly-read filter (re-marking must not re-send).
+        receipt_pending = mailbox_receipts.collect_pending(c, list(ids), reader=NAME)
         # Also auto-release any claim — mark_read implies done processing.
         cur = c.execute(
             f"UPDATE messages SET read_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), "
@@ -771,11 +796,20 @@ def mark_read(ids: list[int]) -> dict:
             f"WHERE id IN ({qmarks}) AND to_name = ? AND read_at IS NULL",
             list(ids) + [NAME],
         )
+        receipts = mailbox_receipts.insert_receipts(c, receipt_pending)
     mailbox_audit.log_event(
         DB_PATH, actor=NAME, action="mark_read",
         payload={"ids": list(ids), "marked": cur.rowcount},
     )
-    return {"marked": cur.rowcount}
+    for rc in receipts:
+        mailbox_audit.log_event(
+            DB_PATH, actor=NAME, action="read_receipt_sent", target=rc["to"],
+            payload={"msg_id": rc["for_msg_id"], "receipt_id": rc["receipt_id"]},
+        )
+    out = {"marked": cur.rowcount}
+    if receipts:
+        out["receipts_sent"] = len(receipts)
+    return out
 
 
 @mcp.tool()

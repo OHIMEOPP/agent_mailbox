@@ -188,6 +188,21 @@ def _migration_v008_forwarded(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migration_v009_request_receipt(conn: sqlite3.Connection) -> None:
+    """messages.request_receipt — sender asks for an auto-ack on mark_read.
+
+    Added 2026-07-10 read receipts feature (BACKLOG #3). mark_read on a row
+    with request_receipt=1 inserts a small ack message back to from_name
+    (see mailbox/receipts.py). No index — the flag is only consulted for
+    rows already selected by id in mark_read.
+    """
+    if "request_receipt" not in _messages_columns(conn):
+        conn.execute(
+            "ALTER TABLE messages ADD COLUMN request_receipt "
+            "INTEGER NOT NULL DEFAULT 0"
+        )
+
+
 # Canonical migration list. Append only; never re-order or delete.
 # `version` must be sequential starting from 1.
 MIGRATIONS: list[tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
@@ -199,6 +214,7 @@ MIGRATIONS: list[tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (6, "messages_pinned_with_partial_index", _migration_v006_pinned),
     (7, "messages_snoozed_until_with_partial_index", _migration_v007_snoozed),
     (8, "messages_forwarded_from_msg_id_with_partial_index", _migration_v008_forwarded),
+    (9, "messages_request_receipt", _migration_v009_request_receipt),
 ]
 
 
