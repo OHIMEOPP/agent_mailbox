@@ -59,6 +59,9 @@ INTERNAL_PORT = int(os.environ.get("RELAY_PORT_INTERNAL", "80"))
 
 HUB_BASE = f"http://{HUB_VPN_IP}:{HUB_PORT}"
 HUB_HEADERS = {"Authorization": f"Bearer {HUB_TOKEN}"}
+# Hub caps /attachments at 500 and has no paging; at the cap, older files
+# are silently cut off, so the page shows a warning instead.
+LIST_LIMIT = 500
 
 
 # ---------------------------------------------------------------------------
@@ -93,7 +96,7 @@ async def handle_list(request: web.Request) -> web.Response:
     # Use dedicated /attachments endpoint (DESC by attachment id, newest first).
     # /inbox would order by message id ASC and paginate by message, so newly
     # arrived files don't surface until you bump limit very high.
-    url = f"{HUB_BASE}/attachments?to={MAILBOX_RECIPIENT}&limit=200"
+    url = f"{HUB_BASE}/attachments?to={MAILBOX_RECIPIENT}&limit={LIST_LIMIT}"
     try:
         async with session.get(url, headers=HUB_HEADERS, timeout=10) as r:
             if r.status != 200:
@@ -120,7 +123,7 @@ async def handle_list(request: web.Request) -> web.Response:
         })
 
     return web.Response(
-        text=_render_list_html(rows),
+        text=_render_list_html(rows, truncated=len(rows) >= LIST_LIMIT),
         content_type="text/html",
     )
 
@@ -441,7 +444,7 @@ def _normalize_body(body: str) -> str:
     return first_line
 
 
-def _render_list_html(rows: list[dict]) -> str:
+def _render_list_html(rows: list[dict], truncated: bool = False) -> str:
     qs_token = f"?token={RELAY_TOKEN}"
     if not rows:
         body = '<p class="empty">沒有附件。</p>'
@@ -491,7 +494,7 @@ def _render_list_html(rows: list[dict]) -> str:
                 # each) instead of sending the full original — phones loaded
                 # 50+ multi-MB PNGs in the original CSS-only build.
                 if (r["mime"] or "").startswith("image/"):
-                    thumb_src = f"/thumb/{r['id']}{qs_token}&w=200"
+                    thumb_src = f"/thumb/{r['id']}{qs_token}&w=400"
                     thumb_html = (
                         f'<a class="thumb-link" href="{file_href}">'
                         f'<img class="thumb" src="{thumb_src}" alt="" '
@@ -501,12 +504,14 @@ def _render_list_html(rows: list[dict]) -> str:
                     thumb_html = ""
                 tr_lines.append(
                     f'<tr>'
-                    f'<td><input type="checkbox" name="ids" value="{r["id"]}" form="bulk-form"></td>'
+                    f'<td><input type="checkbox" name="ids" value="{r["id"]}" data-name="{fname}" form="bulk-form"></td>'
                     f'<td class="name-cell">{thumb_html}<a href="{file_href}">{fname}</a></td>'
                     f'<td class="size">{size}</td>'
                     f'<td class="mime">{mime}</td>'
                     f'<td class="from">{row_sender}</td>'
                     f'<td class="when">{row_when}</td>'
+                    f'<td><button type="button" class="btn-del-one" '
+                    f'onclick="deleteOne(this, {r["id"]})">🗑</button></td>'
                     f'</tr>'
                 )
             # Default open if small group (≤5 files), collapsed otherwise to
@@ -527,10 +532,14 @@ def _render_list_html(rows: list[dict]) -> str:
                 f'<summary class="group-head">'
                 f'<span class="group-title">{html.escape(header_text)}</span>'
                 f'<span class="group-meta">{count} 檔 · {sender} · {when}</span>'
+                f'<span class="group-actions">'
+                f'<button type="button" class="group-select" '
+                f'onclick="event.preventDefault(); event.stopPropagation(); toggleGroup(this)">☑️ 選這組</button>'
                 f'{zip_link}'
+                f'</span>'
                 f'</summary>'
                 f'<table>'
-                f'<thead><tr><th></th><th>檔名</th><th>大小</th><th>類型</th><th>From</th><th>時間</th></tr></thead>'
+                f'<thead><tr><th></th><th>檔名</th><th>大小</th><th>類型</th><th>From</th><th>時間</th><th></th></tr></thead>'
                 f'<tbody>{"".join(tr_lines)}</tbody>'
                 f'</table>'
                 f'</details>'
@@ -543,7 +552,13 @@ def _render_list_html(rows: list[dict]) -> str:
         # download per checked id (200ms stagger so mobile browsers don't
         # dedupe the consecutive clicks). The per-group 📦 zip-link is
         # still available for cases where a single archive is preferable.
+        warn = (
+            f'<p class="truncated">⚠️ 只列出最新的 {LIST_LIMIT} 個檔案，'
+            f'更舊的沒有顯示，也不會被全選或下載到。清掉一些後重新整理就會出現。</p>'
+            if truncated else ''
+        )
         body = (
+            warn +
             f'<form id="bulk-form" method="post">'
             f'<button type="button" class="btn-selectall" '
             f'onclick="toggleAll()">☑️ 全選 / 全不選</button>'
@@ -618,6 +633,10 @@ def _render_list_html(rows: list[dict]) -> str:
   .btn-selectall {{ background: var(--muted); }}
   .btn-download {{ background: var(--link); }}
   .btn-delete {{ background: var(--danger); }}
+  .group-actions {{ flex-basis: 100%; display: flex; gap: 8px; align-items: center; }}
+  .group-select {{ background: var(--muted); color: #fff; border: none; border-radius: 6px; padding: 4px 10px; font-size: 13px; margin-right: 6px; cursor: pointer; }}
+  .truncated {{ background: var(--danger); color: #fff; padding: 10px 12px; border-radius: 8px; font-size: 14px; }}
+  .btn-del-one {{ background: none; border: none; font-size: 1.2em; padding: 4px 8px; cursor: pointer; }}
   .btn-selectall:active, .btn-download:active, .btn-delete:active {{ filter: brightness(0.9); }}
   .empty {{ color: var(--muted); text-align: center; padding: 40px 0; }}
   input[type="checkbox"] {{
@@ -678,8 +697,8 @@ def _render_list_html(rows: list[dict]) -> str:
   .zip-link:hover {{ filter: brightness(1.1); }}
   .zip-link:active {{ filter: brightness(0.9); color: var(--bg); }}
   img.thumb {{
-    max-width: 64px;
-    max-height: 64px;
+    max-width: 160px;
+    max-height: 160px;
     vertical-align: middle;
     margin-right: 8px;
     border-radius: 4px;
@@ -702,11 +721,12 @@ def _render_list_html(rows: list[dict]) -> str:
     table, tbody {{ display: block; width: 100%; }}
     thead {{ display: none; }}
     tr {{
+      position: relative;
       display: grid;
-      grid-template-columns: 32px 1fr auto;
+      grid-template-columns: minmax(0, 1fr) auto;
       grid-template-areas:
-        "check name name"
-        "check size when";
+        "name name"
+        "size when";
       gap: 2px 10px;
       align-items: center;
       border: 1px solid var(--border);
@@ -715,10 +735,15 @@ def _render_list_html(rows: list[dict]) -> str:
       margin-bottom: 10px;
     }}
     tr td {{ padding: 0; border: none; display: block; }}
-    tr td:nth-child(1) {{ grid-area: check; align-self: start; padding-top: 4px; }}
-    tr td:nth-child(2) {{ grid-area: name; font-size: 16px; line-height: 1.4; }}
+    /* checkbox + delete float over the thumbnail corners so the image can
+       use the full card width */
+    tr td:nth-child(1) {{ position: absolute; top: 20px; left: 20px; z-index: 1; }}
+    tr td:nth-child(7) {{ position: absolute; top: 20px; right: 20px; z-index: 1; }}
+    tr td:nth-child(7) .btn-del-one {{ background: rgba(0, 0, 0, 0.55); border-radius: 8px; padding: 6px 10px; }}
+    tr td:nth-child(2) {{ grid-area: name; font-size: 16px; line-height: 1.4; min-width: 0; overflow-wrap: anywhere; }}
     tr td:nth-child(2) a {{ display: inline-block; padding: 6px 0; min-height: 32px; }}
-    tr td:nth-child(2) img.thumb {{ max-width: 96px; max-height: 96px; display: block; margin: 0 0 6px; }}
+    tr td:nth-child(2) .thumb-link {{ display: block; padding: 0; }}
+    tr td:nth-child(2) img.thumb {{ width: 100%; max-width: 100%; max-height: none; height: auto; object-fit: contain; display: block; margin: 0 0 6px; }}
     tr td:nth-child(3) {{ grid-area: size; color: var(--muted); font-size: 12px; }}
     tr td:nth-child(6) {{ grid-area: when; color: var(--muted); font-size: 12px; text-align: right; white-space: nowrap; }}
     /* hide mime + from on phone (low signal, eat space) */
@@ -733,25 +758,80 @@ def _render_list_html(rows: list[dict]) -> str:
 {body}
 <script>
   const RELAY_TOKEN_Q = {json.dumps('?token=' + RELAY_TOKEN)};
+  // Only expanded groups: collapsed groups hide their files, and selecting
+  // unseen files would let download/delete act on images nobody looked at.
   function toggleAll() {{
-    const boxes = document.querySelectorAll('input[name="ids"]');
+    const boxes = document.querySelectorAll('details[open] input[name="ids"]');
     const allChecked = boxes.length > 0 && Array.from(boxes).every(b => b.checked);
     boxes.forEach(b => {{ b.checked = !allChecked; }});
   }}
-  function downloadSelected() {{
+  function toggleGroup(btn) {{
+    const boxes = btn.closest('details').querySelectorAll('input[name="ids"]');
+    const allChecked = boxes.length > 0 && Array.from(boxes).every(b => b.checked);
+    boxes.forEach(b => {{ b.checked = !allChecked; }});
+  }}
+  async function deleteOne(btn, id) {{
+    const row = btn.closest('tr');
+    const cb = row.querySelector('input[name="ids"]');
+    const name = cb ? cb.dataset.name : id;
+    if (!confirm('刪除 ' + name + '？刪了救不回來')) return;
+    const form = new URLSearchParams();
+    form.append('ids', id);
+    const resp = await fetch('/delete' + RELAY_TOKEN_Q, {{ method: 'POST', body: form }});
+    if (resp.ok) {{ row.remove(); }} else {{ alert('刪除失敗：HTTP ' + resp.status); }}
+  }}
+  function filenameFrom(resp, id) {{
+    const cd = resp.headers.get('Content-Disposition') || '';
+    const star = cd.match(/filename[*]=UTF-8''([^;]+)/i);
+    if (star) {{ try {{ return decodeURIComponent(star[1]); }} catch (e) {{}} }}
+    const plain = cd.match(/filename="?([^";]+)"?/i);
+    return plain ? plain[1] : 'file-' + id;
+  }}
+  // Download selected files one at a time (oldest first), then delete only
+  // the ones whose bytes fully arrived. A file is saved from an in-memory
+  // blob, so it is already on the phone before the delete request is sent.
+  async function downloadSelected() {{
     const checked = document.querySelectorAll('input[name="ids"]:checked');
     if (checked.length === 0) {{ alert('沒選任何檔案'); return; }}
-    Array.from(checked).forEach((c, idx) => {{
-      setTimeout(() => {{
+    // Upload order can differ from the filename serial (folder-sync uploads a
+    // file once it is stable), so sort by filename, numbers compared as numbers.
+    const ids = Array.from(checked)
+      .sort((a, b) => (a.dataset.name || '').localeCompare(b.dataset.name || '', undefined, {{ numeric: true }}))
+      .map(c => c.value);
+    const done = [];
+    const failed = [];
+    for (const id of ids) {{
+      try {{
+        const resp = await fetch('/file/' + id + RELAY_TOKEN_Q);
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        const blob = await resp.blob();
+        const expected = resp.headers.get('Content-Length');
+        if (expected && Number(expected) !== blob.size) throw new Error('size mismatch');
+        const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
-        a.href = '/file/' + c.value + RELAY_TOKEN_Q;
-        a.setAttribute('download', '');
-        a.rel = 'noopener';
+        a.href = url;
+        a.download = filenameFrom(resp, id);
         document.body.appendChild(a);
         a.click();
         a.remove();
-      }}, idx * 250);
-    }});
+        setTimeout(() => URL.revokeObjectURL(url), 10000);
+        done.push(id);
+      }} catch (e) {{
+        failed.push(id);
+      }}
+    }}
+    // The page cannot tell whether the phone actually saved each file (a
+    // blocked "multiple downloads" prompt or a cancelled save both look like
+    // success here), so the user confirms before anything is deleted.
+    if (done.length > 0 && confirm(done.length + ' 張已下載，請確認都存到手機了。要從清單刪除嗎？')) {{
+      const form = new URLSearchParams();
+      done.forEach(id => form.append('ids', id));
+      await fetch('/delete' + RELAY_TOKEN_Q, {{ method: 'POST', body: form }});
+    }}
+    if (failed.length > 0) {{
+      alert('有 ' + failed.length + ' 個檔案下載失敗，沒有刪除，可以再試一次');
+    }}
+    location.reload();
   }}
 </script>
 </body>
