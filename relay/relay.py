@@ -9,6 +9,7 @@ Endpoints (all phone-side requests gated by `?token=<RELAY_TOKEN>`):
   GET  /list          → HTML page listing attachments for MAILBOX_RECIPIENT
   GET  /file/<id>     → streaming proxy of hub /attachment/<id>
   GET  /thumb/<id>    → streaming proxy of hub /thumb/<id> (JPEG, cached on hub)
+  GET  /latest        → {"max_id": N} newest attachment id (list page polls it)
   GET  /zip/<ids>     → stream a zip of every attachment for one or more
                         comma-separated msg_ids (e.g. /zip/1090 or /zip/1117,1120)
   POST /delete        → form: ids=N&ids=M → DELETE each on hub → 303 → /list
@@ -173,6 +174,23 @@ async def handle_file(request: web.Request) -> web.StreamResponse:
         return resp
     finally:
         await upstream_ctx.__aexit__(None, None, None)
+
+
+async def handle_latest(request: web.Request) -> web.Response:
+    """Newest attachment id, polled by the list page to notice new files."""
+    if not _token_ok(request):
+        return _forbidden()
+    session = request.app["session"]
+    url = f"{HUB_BASE}/attachments?to={MAILBOX_RECIPIENT}&limit=1"
+    try:
+        async with session.get(url, headers=HUB_HEADERS, timeout=10) as r:
+            if r.status != 200:
+                return web.json_response({"error": f"upstream {r.status}"}, status=502)
+            data = await r.json()
+    except aiohttp.ClientError as e:
+        return web.json_response({"error": str(e)}, status=502)
+    items = data.get("attachments", [])
+    return web.json_response({"max_id": items[0]["id"] if items else 0})
 
 
 async def handle_thumb(request: web.Request) -> web.StreamResponse:
@@ -496,7 +514,8 @@ def _render_list_html(rows: list[dict], truncated: bool = False) -> str:
                 if (r["mime"] or "").startswith("image/"):
                     thumb_src = f"/thumb/{r['id']}{qs_token}&w=400"
                     thumb_html = (
-                        f'<a class="thumb-link" href="{file_href}">'
+                        f'<a class="thumb-link" href="{file_href}" data-id="{r['id']}" '
+                        f'onclick="return openViewer({r['id']})">'
                         f'<img class="thumb" src="{thumb_src}" alt="" '
                         f'loading="lazy"></a> '
                     )
@@ -548,9 +567,9 @@ def _render_list_html(rows: list[dict], truncated: bool = False) -> str:
         # Bulk-form keeps the delete submit (POST → server-side fan-out
         # delete via hub). "Download selected" used to also submit-zip but
         # user wanted individual files, not a single archive, so that
-        # button now runs client-side JS that triggers one /file/<id>
-        # download per checked id (200ms stagger so mobile browsers don't
-        # dedupe the consecutive clicks). The per-group 📦 zip-link is
+        # button now runs client-side JS that fetches each checked file in
+        # filename order, one at a time, then offers to delete the ones that
+        # arrived. The per-group 📦 zip-link is
         # still available for cases where a single archive is preferable.
         warn = (
             f'<p class="truncated">⚠️ 只列出最新的 {LIST_LIMIT} 個檔案，'
@@ -559,6 +578,8 @@ def _render_list_html(rows: list[dict], truncated: bool = False) -> str:
         )
         body = (
             warn +
+            f'<div class="toolbar">'
+            f'<div id="new-banner" hidden onclick="location.reload()">🆕 有新圖，點這裡更新</div>'
             f'<form id="bulk-form" method="post">'
             f'<button type="button" class="btn-selectall" '
             f'onclick="toggleAll()">☑️ 全選 / 全不選</button>'
@@ -569,6 +590,9 @@ def _render_list_html(rows: list[dict], truncated: bool = False) -> str:
             f'onclick="return confirm(\'刪除選取的附件？此動作會清空 hub blob（無其他引用時）+ DB row，不影響 sender 原檔。\');">'
             f'🗑️ 刪除選取</button>'
             f'</form>'
+            f'<div class="toolbar-info"><span id="sel-count">還沒選</span>'
+            f'<span id="status"></span></div>'
+            f'</div>'
             + "".join(sections)
         )
 
@@ -639,6 +663,23 @@ def _render_list_html(rows: list[dict], truncated: bool = False) -> str:
   .btn-del-one {{ background: none; border: none; font-size: 1.2em; padding: 4px 8px; cursor: pointer; }}
   .btn-selectall:active, .btn-download:active, .btn-delete:active {{ filter: brightness(0.9); }}
   .empty {{ color: var(--muted); text-align: center; padding: 40px 0; }}
+  .toolbar {{ position: sticky; top: 0; z-index: 10; background: var(--bg); margin: 0 -12px; padding: 4px 12px 8px; border-bottom: 1px solid var(--border); }}
+  .toolbar form {{ display: flex; flex-wrap: wrap; gap: 6px; }}
+  .toolbar button {{ margin: 0; padding: 8px 12px; min-height: 40px; font-size: 14px; flex: 1 1 auto; }}
+  .toolbar-info {{ display: flex; justify-content: space-between; gap: 8px; font-size: 13px; color: var(--muted); margin-top: 6px; }}
+  #status {{ color: var(--link); text-align: right; }}
+  #new-banner {{ background: var(--link); color: #fff; text-align: center; padding: 8px; border-radius: 8px; margin-bottom: 6px; cursor: pointer; font-size: 14px; }}
+  #new-banner[hidden] {{ display: none; }}
+  #viewer {{ position: fixed; inset: 0; z-index: 100; background: rgba(0, 0, 0, 0.92); display: flex; align-items: center; justify-content: center; touch-action: pan-y; }}
+  #viewer[hidden] {{ display: none; }}
+  #v-img {{ max-width: 100%; max-height: calc(100% - 70px); object-fit: contain; user-select: none; }}
+  .v-btn {{ position: absolute; background: rgba(255, 255, 255, 0.15); color: #fff; border: none; border-radius: 50%; width: 44px; height: 44px; min-height: 44px; padding: 0; margin: 0; font-size: 24px; line-height: 44px; }}
+  .v-close {{ top: 12px; right: 12px; }}
+  .v-prev {{ left: 8px; top: 50%; transform: translateY(-50%); }}
+  .v-next {{ right: 8px; top: 50%; transform: translateY(-50%); }}
+  .v-bar {{ position: absolute; bottom: 0; left: 0; right: 0; display: flex; gap: 10px; align-items: center; padding: 12px 16px; padding-bottom: max(12px, env(safe-area-inset-bottom)); color: #ddd; font-size: 13px; background: rgba(0, 0, 0, 0.6); }}
+  #v-name {{ flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+  #v-dl {{ color: #fff; background: var(--link); padding: 8px 12px; border-radius: 8px; white-space: nowrap; }}
   input[type="checkbox"] {{
     width: 22px;
     height: 22px;
@@ -754,21 +795,105 @@ def _render_list_html(rows: list[dict], truncated: bool = False) -> str:
 </head>
 <body>
 <h1>📦 {html.escape(MAILBOX_RECIPIENT)} 收到的附件</h1>
-<p class="meta">{len(rows)} 個檔案 · 點檔名下載 · 勾選後上方按鈕「下載」逐檔抓 / 「刪除」清除</p>
+<p class="meta">{len(rows)} 個檔案 · 點圖放大預覽、點檔名下載原圖 · 勾選後「下載選取」會照檔名順序逐張下載</p>
 {body}
+<div id="viewer" hidden>
+  <button type="button" class="v-btn v-close" onclick="closeViewer()">✕</button>
+  <button type="button" class="v-btn v-prev" onclick="stepViewer(-1)">‹</button>
+  <img id="v-img" alt="">
+  <button type="button" class="v-btn v-next" onclick="stepViewer(1)">›</button>
+  <div class="v-bar"><span id="v-name"></span><span id="v-pos"></span><a id="v-dl" download>⬇️ 下載原圖</a></div>
+</div>
 <script>
   const RELAY_TOKEN_Q = {json.dumps('?token=' + RELAY_TOKEN)};
+  let latestId = {max((r["id"] for r in rows), default=0)};
+  let busy = false;
+
+  // ---- selection count ----
+  function updateCount() {{
+    const el = document.getElementById('sel-count');
+    if (!el) return;
+    const n = document.querySelectorAll('input[name="ids"]:checked').length;
+    el.textContent = n ? '已選 ' + n + ' 張' : '還沒選';
+  }}
+  document.addEventListener('change', e => {{ if (e.target.name === 'ids') updateCount(); }});
+  function setStatus(text) {{
+    const el = document.getElementById('status');
+    if (el) el.textContent = text;
+  }}
+
+  // ---- image viewer (preview uses the 512px thumbnail, not the original) ----
+  let viewerIds = [];
+  let viewerIdx = 0;
+  function openViewer(id) {{
+    viewerIds = Array.from(document.querySelectorAll('a.thumb-link')).map(a => a.dataset.id);
+    viewerIdx = Math.max(0, viewerIds.indexOf(String(id)));
+    document.getElementById('viewer').hidden = false;
+    showViewer();
+    return false;
+  }}
+  function showViewer() {{
+    const id = viewerIds[viewerIdx];
+    const cb = document.querySelector('input[name="ids"][value="' + id + '"]');
+    document.getElementById('v-img').src = '/thumb/' + id + RELAY_TOKEN_Q + '&w=512';
+    document.getElementById('v-name').textContent = cb ? cb.dataset.name : '';
+    document.getElementById('v-pos').textContent = (viewerIdx + 1) + ' / ' + viewerIds.length;
+    document.getElementById('v-dl').href = '/file/' + id + RELAY_TOKEN_Q;
+  }}
+  function stepViewer(d) {{
+    if (viewerIds.length === 0) return;
+    viewerIdx = (viewerIdx + d + viewerIds.length) % viewerIds.length;
+    showViewer();
+  }}
+  function closeViewer() {{ document.getElementById('viewer').hidden = true; }}
+  document.addEventListener('keydown', e => {{
+    if (document.getElementById('viewer').hidden) return;
+    if (e.key === 'ArrowLeft') stepViewer(-1);
+    else if (e.key === 'ArrowRight') stepViewer(1);
+    else if (e.key === 'Escape') closeViewer();
+  }});
+  let touchX = null;
+  const viewerEl = document.getElementById('viewer');
+  viewerEl.addEventListener('touchstart', e => {{ touchX = e.changedTouches[0].clientX; }}, {{ passive: true }});
+  viewerEl.addEventListener('touchend', e => {{
+    if (touchX === null) return;
+    const dx = e.changedTouches[0].clientX - touchX;
+    touchX = null;
+    if (Math.abs(dx) > 50) stepViewer(dx < 0 ? 1 : -1);
+  }});
+  viewerEl.addEventListener('click', e => {{ if (e.target === viewerEl) closeViewer(); }});
+
+  // ---- new files: auto-refresh when it can't disturb anything, else banner ----
+  async function pollLatest() {{
+    try {{
+      const resp = await fetch('/latest' + RELAY_TOKEN_Q, {{ cache: 'no-store' }});
+      if (!resp.ok) return;
+      const data = await resp.json();
+      if (!(data.max_id > latestId)) return;
+      const hasSelection = document.querySelectorAll('input[name="ids"]:checked').length > 0;
+      const viewing = !document.getElementById('viewer').hidden;
+      if (!busy && !hasSelection && !viewing && window.scrollY < 80) {{
+        location.reload();
+      }} else {{
+        const banner = document.getElementById('new-banner');
+        if (banner) banner.hidden = false;
+      }}
+    }} catch (e) {{}}
+  }}
+  setInterval(pollLatest, 10000);
   // Only expanded groups: collapsed groups hide their files, and selecting
   // unseen files would let download/delete act on images nobody looked at.
   function toggleAll() {{
     const boxes = document.querySelectorAll('details[open] input[name="ids"]');
     const allChecked = boxes.length > 0 && Array.from(boxes).every(b => b.checked);
     boxes.forEach(b => {{ b.checked = !allChecked; }});
+    updateCount();
   }}
   function toggleGroup(btn) {{
     const boxes = btn.closest('details').querySelectorAll('input[name="ids"]');
     const allChecked = boxes.length > 0 && Array.from(boxes).every(b => b.checked);
     boxes.forEach(b => {{ b.checked = !allChecked; }});
+    updateCount();
   }}
   async function deleteOne(btn, id) {{
     const row = btn.closest('tr');
@@ -778,7 +903,7 @@ def _render_list_html(rows: list[dict], truncated: bool = False) -> str:
     const form = new URLSearchParams();
     form.append('ids', id);
     const resp = await fetch('/delete' + RELAY_TOKEN_Q, {{ method: 'POST', body: form }});
-    if (resp.ok) {{ row.remove(); }} else {{ alert('刪除失敗：HTTP ' + resp.status); }}
+    if (resp.ok) {{ row.remove(); updateCount(); }} else {{ alert('刪除失敗：HTTP ' + resp.status); }}
   }}
   function filenameFrom(resp, id) {{
     const cd = resp.headers.get('Content-Disposition') || '';
@@ -800,7 +925,9 @@ def _render_list_html(rows: list[dict], truncated: bool = False) -> str:
       .map(c => c.value);
     const done = [];
     const failed = [];
-    for (const id of ids) {{
+    busy = true;
+    for (const [i, id] of ids.entries()) {{
+      setStatus('下載中 ' + (i + 1) + '/' + ids.length);
       try {{
         const resp = await fetch('/file/' + id + RELAY_TOKEN_Q);
         if (!resp.ok) throw new Error('HTTP ' + resp.status);
@@ -828,6 +955,8 @@ def _render_list_html(rows: list[dict], truncated: bool = False) -> str:
       done.forEach(id => form.append('ids', id));
       await fetch('/delete' + RELAY_TOKEN_Q, {{ method: 'POST', body: form }});
     }}
+    setStatus('下載完成 ' + done.length + ' 張' + (failed.length ? '，失敗 ' + failed.length + ' 張' : ''));
+    busy = false;
     if (failed.length > 0) {{
       alert('有 ' + failed.length + ' 個檔案下載失敗，沒有刪除，可以再試一次');
     }}
@@ -863,6 +992,7 @@ def main() -> None:
     app.router.add_get("/list", handle_list)
     app.router.add_get(r"/file/{id:[0-9]+}", handle_file)
     app.router.add_get(r"/thumb/{id:[0-9]+}", handle_thumb)
+    app.router.add_get("/latest", handle_latest)
     app.router.add_get(r"/zip/{msg_ids:[0-9,]+}", handle_zip)
     app.router.add_post("/delete", handle_delete)
     app.on_startup.append(on_startup)
