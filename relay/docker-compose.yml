@@ -36,6 +36,8 @@ services:
       - HUB_TOKEN=${HUB_TOKEN:?HUB_TOKEN required — see .env.example}
       # Whose attachments to list on /list (default: wiki).
       - MAILBOX_RECIPIENT=${MAILBOX_RECIPIENT:-wiki}
+      # List images: thumb (small JPEG previews) or full (original files). Viewer always shows the original.
+      - RELAY_IMAGE_MODE=${RELAY_IMAGE_MODE:-thumb}
       # Cache pip downloads in mounted volume so container recreate is fast.
       - PIP_CACHE_DIR=/cache/pip
     volumes:

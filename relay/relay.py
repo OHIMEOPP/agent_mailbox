@@ -57,6 +57,9 @@ HUB_TOKEN = _required("HUB_TOKEN")
 MAILBOX_RECIPIENT = os.environ.get("MAILBOX_RECIPIENT", "wiki").strip()
 BIND = os.environ.get("RELAY_BIND", "0.0.0.0")
 INTERNAL_PORT = int(os.environ.get("RELAY_PORT_INTERNAL", "80"))
+# List images: "thumb" loads hub /thumb JPEGs, "full" loads the original /file.
+IMAGE_MODE = os.environ.get("RELAY_IMAGE_MODE", "thumb").strip().lower()
+FULL_IMAGE = IMAGE_MODE == "full"
 
 HUB_BASE = f"http://{HUB_VPN_IP}:{HUB_PORT}"
 HUB_HEADERS = {"Authorization": f"Bearer {HUB_TOKEN}"}
@@ -512,7 +515,7 @@ def _render_list_html(rows: list[dict], truncated: bool = False) -> str:
                 # each) instead of sending the full original — phones loaded
                 # 50+ multi-MB PNGs in the original CSS-only build.
                 if (r["mime"] or "").startswith("image/"):
-                    thumb_src = f"/thumb/{r['id']}{qs_token}&w=400"
+                    thumb_src = file_href if FULL_IMAGE else f"/thumb/{r['id']}{qs_token}&w=400"
                     thumb_html = (
                         f'<a class="thumb-link" href="{file_href}" data-id="{r['id']}" '
                         f'onclick="return openViewer({r['id']})">'
@@ -673,11 +676,11 @@ def _render_list_html(rows: list[dict], truncated: bool = False) -> str:
   #viewer {{ position: fixed; inset: 0; z-index: 100; background: rgba(0, 0, 0, 0.92); display: flex; align-items: center; justify-content: center; touch-action: pan-y; }}
   #viewer[hidden] {{ display: none; }}
   #v-img {{ max-width: 100%; max-height: calc(100% - 70px); object-fit: contain; user-select: none; }}
-  .v-btn {{ position: absolute; background: rgba(255, 255, 255, 0.15); color: #fff; border: none; border-radius: 50%; width: 44px; height: 44px; min-height: 44px; padding: 0; margin: 0; font-size: 24px; line-height: 44px; }}
+  .v-btn {{ position: absolute; z-index: 2; background: rgba(255, 255, 255, 0.15); color: #fff; border: none; border-radius: 50%; width: 44px; height: 44px; min-height: 44px; padding: 0; margin: 0; font-size: 24px; line-height: 44px; }}
   .v-close {{ top: 12px; right: 12px; }}
   .v-prev {{ left: 8px; top: 50%; transform: translateY(-50%); }}
   .v-next {{ right: 8px; top: 50%; transform: translateY(-50%); }}
-  .v-bar {{ position: absolute; bottom: 0; left: 0; right: 0; display: flex; gap: 10px; align-items: center; padding: 12px 16px; padding-bottom: max(12px, env(safe-area-inset-bottom)); color: #ddd; font-size: 13px; background: rgba(0, 0, 0, 0.6); }}
+  .v-bar {{ position: absolute; z-index: 2; bottom: 0; left: 0; right: 0; display: flex; gap: 10px; align-items: center; padding: 12px 16px; padding-bottom: max(12px, env(safe-area-inset-bottom)); color: #ddd; font-size: 13px; background: rgba(0, 0, 0, 0.6); }}
   #v-name {{ flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
   #v-dl {{ color: #fff; background: var(--link); padding: 8px 12px; border-radius: 8px; white-space: nowrap; }}
   input[type="checkbox"] {{
@@ -822,7 +825,7 @@ def _render_list_html(rows: list[dict], truncated: bool = False) -> str:
     if (el) el.textContent = text;
   }}
 
-  // ---- image viewer (preview uses the 512px thumbnail, not the original) ----
+  // ---- image viewer (thumbnail first, then the original) ----
   let viewerIds = [];
   let viewerIdx = 0;
   function openViewer(id) {{
@@ -835,14 +838,21 @@ def _render_list_html(rows: list[dict], truncated: bool = False) -> str:
   function showViewer() {{
     const id = viewerIds[viewerIdx];
     const cb = document.querySelector('input[name="ids"][value="' + id + '"]');
-    document.getElementById('v-img').src = '/thumb/' + id + RELAY_TOKEN_Q + '&w=512';
+    // Show the small thumbnail at once, then swap in the original when it has loaded.
+    const img = document.getElementById('v-img');
+    img.src = '/thumb/' + id + RELAY_TOKEN_Q + '&w=512';
+    const full = new Image();
+    full.onload = () => {{ if (viewerIds[viewerIdx] === id) img.src = full.src; }};
+    full.src = '/file/' + id + RELAY_TOKEN_Q;
     document.getElementById('v-name').textContent = cb ? cb.dataset.name : '';
     document.getElementById('v-pos').textContent = (viewerIdx + 1) + ' / ' + viewerIds.length;
     document.getElementById('v-dl').href = '/file/' + id + RELAY_TOKEN_Q;
   }}
   function stepViewer(d) {{
     if (viewerIds.length === 0) return;
-    viewerIdx = (viewerIdx + d + viewerIds.length) % viewerIds.length;
+    const next = viewerIdx + d;
+    if (next < 0 || next >= viewerIds.length) return;
+    viewerIdx = next;
     showViewer();
   }}
   function closeViewer() {{ document.getElementById('viewer').hidden = true; }}
@@ -859,9 +869,18 @@ def _render_list_html(rows: list[dict], truncated: bool = False) -> str:
     if (touchX === null) return;
     const dx = e.changedTouches[0].clientX - touchX;
     touchX = null;
-    if (Math.abs(dx) > 50) stepViewer(dx < 0 ? 1 : -1);
+    if (Math.abs(dx) > 50) {{
+      stepViewer(dx < 0 ? 1 : -1);
+      swiped = true;
+    }}
   }});
-  viewerEl.addEventListener('click', e => {{ if (e.target === viewerEl) closeViewer(); }});
+  // Tap the left half for the previous image, the right half for the next.
+  let swiped = false;
+  viewerEl.addEventListener('click', e => {{
+    if (swiped) {{ swiped = false; return; }}
+    if (e.target !== viewerEl && e.target.id !== 'v-img') return;
+    stepViewer(e.clientX < window.innerWidth / 2 ? -1 : 1);
+  }});
 
   // ---- new files: auto-refresh when it can't disturb anything, else banner ----
   async function pollLatest() {{
